@@ -1,0 +1,75 @@
+{
+  "name": "callgraph-viewer",
+  "displayName": "Call Graph Viewer",
+  "description": "C/C++ インタラクティブコールグラフビューア (LSP Call Hierarchy 使用)",
+  "version": "0.4.0",
+  "publisher": "your-publisher-id",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Visualization", "Programming Languages"],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "callgraph.showFileGraph",
+        "title": "Call Graph: このファイルのコールグラフを表示",
+        "icon": "$(type-hierarchy)"
+      },
+      {
+        "command": "callgraph.showFunctionGraph",
+        "title": "Call Graph: この関数を起点に表示 (BFS)",
+        "icon": "$(type-hierarchy-sub)"
+      },
+      {
+        "command": "callgraph.showWorkspaceGraph",
+        "title": "Call Graph: ワークスペースを横断解析",
+        "icon": "$(search)"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "callgraph.showFileGraph",
+          "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp",
+          "group": "9_callgraph@1"
+        },
+        {
+          "command": "callgraph.showFunctionGraph",
+          "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp",
+          "group": "9_callgraph@2"
+        },
+        {
+          "command": "callgraph.showWorkspaceGraph",
+          "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp",
+          "group": "9_callgraph@3"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "callgraph.showFileGraph",
+          "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp",
+          "group": "navigation@1"
+        },
+        {
+          "command": "callgraph.showWorkspaceGraph",
+          "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp",
+          "group": "navigation@2"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile":           "node esbuild.js",
+    "watch":             "node esbuild.js --watch",
+    "vscode:prepublish": "node esbuild.js --production"
+  },
+  "dependencies": {
+    "vis-network": "^9.1.9"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node":   "^20.0.0",
+    "esbuild":       "^0.20.0",
+    "typescript":    "^5.3.0"
+  }
+}
