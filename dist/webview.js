@@ -1,6 +1,21 @@
 // src/webview.js
+// ブラウザ側 JavaScript — VSCode WebView + スタンドアロン HTML 両対応
+//
+// 【修正】
+//  - onclick="..." インラインハンドラ廃止 → addEventListener に移行 (CSP fix)
+//  - acquireVsCodeApi を try-catch で囲む (スタンドアロン HTML モード対応)
+//  - ダブルクリックでのソースジャンプを廃止 → Ctrl+クリックに変更
+//    (シングルクリックのハイライトと競合しないため)
+//    ※ HTML エクスポートモードでは Ctrl+クリックは機能しない (alert 表示のみ)
+//  - HTML エクスポートボタン対応
+//  - INITIAL_GRAPH_DATA が定義されていれば自動レンダリング (スタンドアロンモード)
+
 (function () {
   'use strict';
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // VSCode API (WebView 内のみ有効。スタンドアロン HTML では no-op)
+  // ─────────────────────────────────────────────────────────────────────────
 
   var isVscode = false;
   var vscode;
@@ -20,17 +35,16 @@
   var nodes    = null;
   var edges    = null;
 
-  var nodeInfoMap          = {};   // id → { file, line, source, labelFull, labelShort }
+  var nodeInfoMap          = {};
   var defaultNodeColors    = {};
   var canvasFontSize       = DEFAULT_FONT_SIZE;
-  var showFullSig          = true; // 引数表示フラグ (チェックボックスと連動)
   var currentNode          = null;
   var currentHop           = null;
   var connectedEdgesOfNode = new Set();
   var currentSourceNodeId  = null;
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Extension → WebView メッセージ
+  // Extension → WebView メッセージ (VSCode webview モード)
   // ─────────────────────────────────────────────────────────────────────────
 
   window.addEventListener('message', function (e) {
@@ -61,6 +75,7 @@
   }
 
   function showErrorInView(msg) {
+    hideLoading();
     document.getElementById('network').innerHTML =
       '<div style="display:flex;align-items:center;justify-content:center;' +
       'height:100%;flex-direction:column;gap:12px;padding:40px;">' +
@@ -75,29 +90,13 @@
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // ラベル取得ヘルパー
-  // ─────────────────────────────────────────────────────────────────────────
-
-  /** 現在の showFullSig に応じたラベルを返す */
-  function getLabel(info) {
-    if (!info) return '';
-    return showFullSig ? info.labelFull : info.labelShort;
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
   // グラフ描画
   // ─────────────────────────────────────────────────────────────────────────
 
   function renderGraph(msg) {
     nodeInfoMap = {};
     msg.nodes.forEach(function (n) {
-      nodeInfoMap[n.id] = {
-        file:       n.file,
-        line:       n.line,
-        source:     n.source,
-        labelFull:  n.labelFull  || n.label,
-        labelShort: n.labelShort || n.label,
-      };
+      nodeInfoMap[n.id] = { file: n.file, line: n.line, source: n.source };
     });
 
     var inDeg = {};
@@ -105,9 +104,7 @@
 
     var visNodes = msg.nodes.map(function (n) {
       return {
-        id: n.id,
-        label: getLabel(nodeInfoMap[n.id]),
-        title: n.title, color: n.color,
+        id: n.id, label: n.label, title: n.title, color: n.color,
         size:        Math.min(12 + ((inDeg[n.id] || 0) * 3), 40),
         shape:       'dot',
         borderWidth: n.isCurrentFile ? 2 : 1,
@@ -184,10 +181,16 @@
       }
     );
 
+    // クリックイベント: Ctrl+クリックでソースへジャンプ、通常クリックでハイライト
     network.on('click', onNetworkClick);
+
+    // ダブルクリック: 背景クリック時のみリセット (ノード上はジャンプしない)
     network.on('doubleClick', function (params) {
-      if (params.nodes.length === 0) resetAll();
+      if (params.nodes.length === 0) {
+        resetAll();
+      }
     });
+
     network.on('hoverNode', function (p) {
       if (currentNode !== null) return;
       edges.update(network.getConnectedEdges(p.node).map(function (id) {
@@ -226,15 +229,17 @@
     if (isVscode) {
       vscode.postMessage({ type: 'openFile', file: info.file, line: info.line });
     } else {
+      // スタンドアロン HTML モード: ファイル情報をアラートで表示
       alert('ファイル: ' + info.file + '\n行番号: ' + info.line);
     }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // ノードクリック
+  // ノードクリック / 強調
   // ─────────────────────────────────────────────────────────────────────────
 
   function onNetworkClick(params) {
+    // ★ Ctrl+クリック: ノード上であればソースへジャンプ
     if (params.nodes.length > 0 &&
         params.event && params.event.srcEvent && params.event.srcEvent.ctrlKey) {
       openNodeSource(params.nodes[0]);
@@ -257,16 +262,20 @@
     });
 
     nodes.update(nodes.getIds().map(function (nid) {
-      if (nid === id)         return { id: nid, color: { background: '#00b894', border: '#00695c' }, font: makeFont('#003d33') };
+      if (nid === id) {
+        // 選択ノードは vis-network の自動色（水色）に任せる
+        var d = defaultNodeColors[nid] || {};
+        return { id: nid, color: d.color, font: makeFont(d.fontColor || '#2d3436') };
+      }
       if (outgoing.has(nid)) return { id: nid, color: { background: '#fab1a0', border: '#e17055' }, font: makeFont('#6d2b1a') };
-      if (incoming.has(nid)) return { id: nid, color: { background: '#74b9ff', border: '#0984e3' }, font: makeFont('#003580') };
+      if (incoming.has(nid)) return { id: nid, color: { background: '#00b894', border: '#00695c' }, font: makeFont('#003d33') };
       return { id: nid, color: { background: '#ececec', border: '#cccccc' }, font: makeFont('#bbbbbb') };
     }));
 
     edges.update(edges.getIds().map(function (eid) {
       if (!connectedEdgesOfNode.has(eid)) return { id: eid, color: { color: '#e8e8e8', opacity: 0.3 }, width: 1 };
       var e   = edges.get(eid);
-      var col = (e.from === id) ? '#e17055' : '#0984e3';
+      var col = (e.from === id) ? '#e17055' : '#00b894';
       return { id: eid, color: { color: col, opacity: 1.0 }, width: 2.5 };
     }));
 
@@ -274,24 +283,6 @@
     document.querySelectorAll('.hop-btn').forEach(function (b) { b.classList.remove('active'); });
 
     if (document.getElementById('src-toggle').checked) showSource(id);
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // 引数表示切り替え
-  // ─────────────────────────────────────────────────────────────────────────
-
-  document.getElementById('sig-toggle').addEventListener('change', function () {
-    showFullSig = this.checked;
-    applyLabelMode();
-  });
-
-  /** 全ノードのラベルを現在の showFullSig に合わせて更新する */
-  function applyLabelMode() {
-    if (!nodes) return;
-    nodes.update(nodes.getIds().map(function (id) {
-      var info = nodeInfoMap[id];
-      return { id: id, label: getLabel(info) };
-    }));
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -328,10 +319,10 @@
 
     nodes.update(nodes.getIds().map(function (id) {
       var d = defaultNodeColors[id] || {};
-      if (!visible.has(id))        return { id: id, color: { background: '#f0f0f0', border: '#e0e0e0' }, font: makeFont('#e0e0e0') };
-      if (id === currentNode)       return { id: id, color: { background: '#00b894', border: '#00695c' }, font: makeFont('#003d33') };
-      if (outgoing.has(id))         return { id: id, color: { background: '#fab1a0', border: '#e17055' }, font: makeFont('#6d2b1a') };
-      if (incoming.has(id))         return { id: id, color: { background: '#74b9ff', border: '#0984e3' }, font: makeFont('#003580') };
+      if (!visible.has(id))  return { id: id, color: { background: '#f0f0f0', border: '#e0e0e0' }, font: makeFont('#e0e0e0') };
+      if (id === currentNode) return { id: id, color: d.color, font: makeFont(d.fontColor || '#2d3436') }; // vis-network の自動色に任せる
+      if (outgoing.has(id))  return { id: id, color: { background: '#fab1a0', border: '#e17055' }, font: makeFont('#6d2b1a') };
+      if (incoming.has(id))  return { id: id, color: { background: '#00b894', border: '#00695c' }, font: makeFont('#003d33') };
       return { id: id, color: d.color, font: makeFont(d.fontColor || '#2d3436') };
     }));
 
@@ -340,7 +331,7 @@
       if (!visible.has(e.from) || !visible.has(e.to))
         return { id: id, color: { color: '#eeeeee', opacity: 0.2 }, width: 1 };
       if (connectedEdgesOfNode.has(id)) {
-        var col = (e.from === currentNode) ? '#e17055' : '#0984e3';
+        var col = (e.from === currentNode) ? '#e17055' : '#00b894';
         return { id: id, color: { color: col, opacity: 1.0 }, width: 2.5 };
       }
       return { id: id, color: { color: '#aaaaaa', opacity: 0.6 }, width: 1 };
@@ -377,12 +368,16 @@
 
     currentSourceNodeId = nodeId;
     var info     = nodeInfoMap[nodeId] || {};
-    var baseName = info.file ? info.file.replace(/\\/g, '/').split('/').pop() : '';
+    var n        = nodes ? nodes.get(nodeId) : null;
+    var baseName = info.file
+      ? info.file.replace(/\\/g, '/').split('/').pop()
+      : '';
 
-    document.getElementById('source-func-name').textContent = info.labelFull || nodeId;
+    document.getElementById('source-func-name').textContent = n ? n.label : nodeId;
     document.getElementById('source-file-info').textContent =
       baseName ? (baseName + ' : ' + info.line + '行目') : '';
-    document.getElementById('source-code').textContent = info.source || '(ソースが見つかりません)';
+    document.getElementById('source-code').textContent =
+      info.source || '(ソースが見つかりません)';
 
     placeholder.style.display = 'none';
     content.style.display     = 'flex';
@@ -393,10 +388,15 @@
     document.getElementById('source-panel').style.display = 'none';
   }
 
+  // ── ボタン: ソースパネルを閉じる (CSP fix: onclick 廃止 → addEventListener)
   document.getElementById('src-close-btn').addEventListener('click', closeSrcPanel);
+
+  // ── ボタン: ソースへジャンプ
   document.getElementById('goto-btn').addEventListener('click', function () {
     if (currentSourceNodeId) openNodeSource(currentSourceNodeId);
   });
+
+  // ── チェックボックス: ソースパネル表示
   document.getElementById('src-toggle').addEventListener('change', function () {
     if (!this.checked) {
       document.getElementById('source-panel').style.display = 'none';
@@ -406,14 +406,15 @@
   });
 
   // ─────────────────────────────────────────────────────────────────────────
-  // HTML エクスポート
+  // HTML エクスポートボタン
   // ─────────────────────────────────────────────────────────────────────────
 
   document.getElementById('export-btn').addEventListener('click', function () {
     if (isVscode) {
       vscode.postMessage({ type: 'exportHtml' });
     } else {
-      alert('このファイル自体がすでにスタンドアロン HTML です。');
+      alert('このボタンは VSCode 内でのみ使用できます。\n' +
+            'このファイル自体がすでにスタンドアロン HTML です。');
     }
   });
 
@@ -445,7 +446,7 @@
   });
 
   // ─────────────────────────────────────────────────────────────────────────
-  // 検索
+  // 検索ボックス
   // ─────────────────────────────────────────────────────────────────────────
 
   var searchBox = document.getElementById('search-box');
@@ -454,14 +455,7 @@
     var q = this.value.trim().toLowerCase();
     if (!q) { resetAll(); return; }
     var matchSet = new Set();
-    // labelFull / labelShort 両方で検索
-    Object.keys(nodeInfoMap).forEach(function (id) {
-      var info = nodeInfoMap[id];
-      if ((info.labelFull  || '').toLowerCase().indexOf(q) !== -1 ||
-          (info.labelShort || '').toLowerCase().indexOf(q) !== -1) {
-        matchSet.add(id);
-      }
-    });
+    nodes.forEach(function (n) { if (n.label.toLowerCase().indexOf(q) !== -1) matchSet.add(n.id); });
     nodes.update(nodes.getIds().map(function (id) {
       if (matchSet.has(id)) {
         var d = defaultNodeColors[id] || {};
@@ -473,13 +467,7 @@
   searchBox.addEventListener('keydown', function (e) {
     if (e.key === 'Enter' && nodes) {
       var q    = this.value.trim().toLowerCase();
-      var hits = nodes.get({
-        filter: function (n) {
-          var info = nodeInfoMap[n.id] || {};
-          return (info.labelFull  || '').toLowerCase().indexOf(q) !== -1 ||
-                 (info.labelShort || '').toLowerCase().indexOf(q) !== -1;
-        }
-      });
+      var hits = nodes.get({ filter: function (n) { return n.label.toLowerCase().indexOf(q) !== -1; } });
       if (hits.length) network.focus(hits[0].id, { scale: 1.5, animation: { duration: 400 } });
     }
     if (e.key === 'Escape') resetAll();
@@ -540,15 +528,14 @@
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // 起動
+  // 起動処理
   // ─────────────────────────────────────────────────────────────────────────
 
-  // 初期チェックボックス状態を showFullSig に同期
-  showFullSig = document.getElementById('sig-toggle').checked;
-
   if (typeof INITIAL_GRAPH_DATA !== 'undefined') {
+    // スタンドアロン HTML モード: 埋め込みデータを即レンダリング
     renderGraph(INITIAL_GRAPH_DATA);
   } else {
+    // VSCode WebView モード: 準備完了を通知
     vscode.postMessage({ type: 'ready' });
   }
 

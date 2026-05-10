@@ -1,9 +1,13 @@
 {
   "name": "callgraph-viewer",
   "displayName": "Call Graph Viewer",
-  "description": "C/C++ インタラクティブコールグラフビューア (LSP Call Hierarchy 使用)",
-  "version": "0.4.0",
+  "description": "C/C++ インタラクティブコールグラフビューア (LSP Call Hierarchy / GNU Global 対応)",
+  "version": "0.0.1",
   "publisher": "your-publisher-id",
+  "repository": {
+  "type": "git",
+  "url": "https://github.com/uta1214/call-map"
+  },
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Visualization", "Programming Languages"],
   "activationEvents": [],
@@ -56,6 +60,22 @@
           "group": "navigation@2"
         }
       ]
+    },
+    "configuration": {
+      "title": "Call Graph Viewer",
+      "properties": {
+        "callgraph.backend": {
+          "type": "string",
+          "enum": ["auto", "lsp", "gtags"],
+          "enumDescriptions": [
+            "gtags が利用可能なら自動選択、なければ LSP にフォールバック (推奨)",
+            "LSP (clangd / C/C++ 拡張) を使用 — 高精度・小規模向け",
+            "GNU Global (gtags) を使用 — 高速・大規模向け (gtags のインストールが必要)"
+          ],
+          "default": "auto",
+          "description": "コールグラフの解析バックエンドを選択します。"
+        }
+      }
     }
   },
   "scripts": {

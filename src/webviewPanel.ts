@@ -37,22 +37,17 @@ function buildGraphMsg(data: GraphData): object {
   return {
     type: 'graphData',
     nodes: data.nodes.map(n => ({
-      id:            n.id,
-      label:         n.labelShort,   // 初期表示は短い名前
-      labelFull:     n.labelFull,    // フルシグネチャ (webview 側で切り替え用)
-      labelShort:    n.labelShort,   // 関数名のみ
-      file:          n.file,
-      line:          n.line,
-      source:        n.source,
+      id: n.id, label: n.label, file: n.file, line: n.line, source: n.source,
       isCurrentFile: n.isCurrentFile,
-      color:  colorMap[n.file] ?? FILE_COLORS_BASE[FILE_COLORS_BASE.length - 1],
-      title:  `${n.labelShort}\n${path.basename(n.file)} : ${n.line}行`,
+      color: colorMap[n.file] ?? FILE_COLORS_BASE[FILE_COLORS_BASE.length - 1],
+      title: `${n.label}\n${path.basename(n.file)} : ${n.line}行`,
     })),
     edges: data.edges, fileLegend,
     buildTimeMs: data.buildTimeMs, errors: data.errors,
   };
 }
 
+/** スタンドアロン HTML を生成する純粋関数 */
 function generateStandaloneHtml(extensionUri: vscode.Uri, data: GraphData): string {
   const distDir   = vscode.Uri.joinPath(extensionUri, 'dist').fsPath;
   const visJs     = fs.readFileSync(path.join(distDir, 'vis-network.min.js'), 'utf-8');
@@ -107,6 +102,8 @@ export class CallGraphPanel {
     this._panel.webview.html = this._buildHtml();
   }
 
+  // ── 公開 API ────────────────────────────────────────────────────────────────
+
   public static createOrShow(extensionUri: vscode.Uri): CallGraphPanel {
     const column = vscode.window.activeTextEditor ? vscode.ViewColumn.Beside : vscode.ViewColumn.One;
     if (CallGraphPanel.currentPanel) { CallGraphPanel.currentPanel._panel.reveal(column); return CallGraphPanel.currentPanel; }
@@ -134,9 +131,13 @@ export class CallGraphPanel {
     this._postOrQueue({ type: 'error', message });
   }
 
+  /**
+   * 静的メソッド: webview パネルを開かずに HTML ファイルを保存する。
+   * HTMLモードのコマンドから直接呼ばれる。
+   */
   public static async exportHtmlFile(extensionUri: vscode.Uri, data: GraphData): Promise<void> {
-    const wsRoot     = vscode.workspace.workspaceFolders?.[0]?.uri;
-    const safeName   = data.fileName.replace(/[^\w.-]/g, '_');
+    const wsRoot    = vscode.workspace.workspaceFolders?.[0]?.uri;
+    const safeName  = data.fileName.replace(/[^\w.-]/g, '_');
     const defaultUri = wsRoot
       ? vscode.Uri.joinPath(wsRoot, `callgraph_${safeName}.html`)
       : vscode.Uri.file(path.join(process.env.HOME ?? '/tmp', `callgraph_${safeName}.html`));
@@ -198,7 +199,7 @@ export class CallGraphPanel {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HTML テンプレート
+// HTML テンプレート (WebView / スタンドアロン 共用)
 // ─────────────────────────────────────────────────────────────────────────────
 
 function htmlTemplate(nonce: string, scripts: string, cspSource: string): string {
@@ -259,7 +260,6 @@ div.vis-network div.vis-navigation div.vis-button.vis-zoomOut     { left: 122px 
 }
 .spinner { width: 36px; height: 36px; border: 3px solid #dfe6e9; border-top-color: #00b894; border-radius: 50%; animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
-.ctrl-label { cursor: pointer; display: flex; align-items: center; gap: 6px; font-size: 11px; color: #2d3436; margin-bottom: 4px; }
 </style>
 </head>
 <body>
@@ -268,19 +268,13 @@ div.vis-network div.vis-navigation div.vis-button.vis-zoomOut     { left: 122px 
 <div id="controls">
   <b style="font-size:13px;">📞 Call Graph</b>
   <div style="color:#636e72;font-size:11px;margin:2px 0 8px;">
-    <b style="color:#00b894;">●</b> 選択中 &nbsp;
+    <b style="color:#97c2fc;">●</b> 選択中 &nbsp;
     <b style="color:#e17055;">●</b> callee &nbsp;
-    <b style="color:#0984e3;">●</b> caller &nbsp;
+    <b style="color:#00b894;">●</b> caller &nbsp;
     <span style="color:#aaa;font-size:10px;">Ctrl+クリック→ジャンプ</span>
   </div>
   <input id="search-box" type="text" placeholder="🔍 関数名を検索">
-
-  <!-- 引数表示切り替え -->
-  <label class="ctrl-label">
-    <input id="sig-toggle" type="checkbox" checked style="cursor:pointer;"> 引数を表示
-  </label>
-
-  <label class="ctrl-label">
+  <label style="cursor:pointer;display:flex;align-items:center;gap:6px;font-size:11px;color:#2d3436;margin-bottom:4px;">
     <input id="src-toggle" type="checkbox" style="cursor:pointer;"> ソースコードパネルを表示
   </label>
   <div style="display:flex;align-items:center;gap:5px;font-size:11px;color:#636e72;margin-bottom:6px;">
