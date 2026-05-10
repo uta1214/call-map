@@ -2,8 +2,12 @@
   "name": "callgraph-viewer",
   "displayName": "Call Graph Viewer",
   "description": "C/C++ インタラクティブコールグラフビューア (LSP Call Hierarchy 使用)",
-  "version": "0.4.0",
+  "version": "0.0.1",
   "publisher": "your-publisher-id",
+  "repository": {
+  "type": "git",
+  "url": "https://github.com/uta1214/call-map"
+  },
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Visualization", "Programming Languages"],
   "activationEvents": [],

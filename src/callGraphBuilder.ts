@@ -1,5 +1,16 @@
 /**
  * callGraphBuilder.ts
+ *
+ * 【修正履歴】
+ *  - ワークスペース外 / ヘッダーファイルの除外
+ *  - ワークスペースフォルダ未設定時のフォールバック
+ *  - labelFull / labelShort 追加 (webview 側で引数表示切り替え用)
+ *  - makeNodeId でベース名を使いIDを統一 (パラメータ名有無の揺れを吸収)
+ *
+ *  - 【今回修正】clangd "Canceled" エラーへの対処
+ *    バッチ並列処理で clangd に同時リクエストが集中すると "Canceled" が返る。
+ *    BATCH_SIZE を 4→2 に削減し同時リクエスト数を減らす。
+ *    execWithRetry のリトライ回数を 3→6 回、待機時間を指数バックオフに変更。
  */
 
 import * as vscode from 'vscode';
@@ -7,9 +18,9 @@ import * as path   from 'path';
 
 export interface GraphNode {
   id:            string;
-  label:         string;   // 表示ラベル (labelShort と同値、webview 側で切り替え)
-  labelFull:     string;   // フルシグネチャ: "report_sum(const std::vector<int>&)"
-  labelShort:    string;   // 関数名のみ:    "report_sum"
+  label:         string;
+  labelFull:     string;
+  labelShort:    string;
   file:          string;
   line:          number;
   source:        string;
@@ -26,8 +37,9 @@ export interface GraphData {
   errors:      string[];
 }
 
-const BATCH_SIZE  = 4;
-const BATCH_DELAY = 30;
+// ★ clangd への同時リクエスト数を減らして Canceled を防ぐ
+const BATCH_SIZE  = 2;
+const BATCH_DELAY = 50;
 
 // ヘッダー (.h .hpp .hxx) を除外: 宣言と定義の二重ノードを防ぐ
 const CC_SOURCE_EXTENSIONS = new Set(['.c', '.cpp', '.cc', '.cxx', '.cu', '.cuh']);
@@ -59,7 +71,7 @@ function shouldIncludeCallee(uri: vscode.Uri, roots: string[]): boolean {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ノードID不一致対策 + ラベル処理
+// 名前正規化
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** "func(T1, T2)" → "func" */
@@ -69,72 +81,12 @@ function baseNameOf(name: string): string {
 }
 
 /**
- * callee に対応する既存ノードIDを検索し、あれば labelFull を更新する。
- *
- * 検索順:
- *  1. 完全一致 (fsPath + name + line)
- *  2. 同ファイル + ベース名
- *  3. ヘッダー経由の場合: ベース名のみ (.cpp 側ノードへフォールバック)
+ * ノードIDはベース名で作成する。
+ * documentSymbolProvider と CallHierarchy でパラメータ名の有無が異なっても
+ * 同じファイル + 同じ関数名 + 同じ行 → 同じID になる。
  */
-function findExistingCalleeId(
-  nodes: Map<string, GraphNode>,
-  to: vscode.CallHierarchyItem
-): string | null {
-  const exactId = makeNodeId(to.uri, to.name, to.selectionRange.start.line);
-  if (nodes.has(exactId)) {
-    maybeUpgradeLabelFull(nodes, exactId, to.name);
-    return exactId;
-  }
-
-  const base = baseNameOf(to.name);
-  const fp   = to.uri.fsPath;
-
-  for (const [id, node] of nodes) {
-    if (node.file === fp &&
-        (node.label === base || baseNameOf(node.label) === base)) {
-      maybeUpgradeLabelFull(nodes, id, to.name);
-      return id;
-    }
-  }
-
-  const ext = path.extname(fp).toLowerCase();
-  if (['.h', '.hpp', '.hxx'].includes(ext)) {
-    for (const [id, node] of nodes) {
-      if (node.label === base || baseNameOf(node.label) === base) {
-        maybeUpgradeLabelFull(nodes, id, to.name);
-        return id;
-      }
-    }
-  }
-
-  return null;
-}
-
-/**
- * clangd CallHierarchy からフルシグネチャが得られたとき、
- * 既存ノードの labelFull が短い名前のままであれば更新する。
- */
-function maybeUpgradeLabelFull(
-  nodes: Map<string, GraphNode>,
-  id: string,
-  fullName: string
-): void {
-  if (!fullName.includes('(')) return; // シグネチャなし → 更新不要
-  const node = nodes.get(id);
-  if (!node) return;
-  if (node.labelFull === node.labelShort) {
-    // まだ短い名前のまま → フルシグネチャで上書き
-    node.labelFull = fullName;
-    nodes.set(id, node);
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ユーティリティ
-// ─────────────────────────────────────────────────────────────────────────────
-
 function makeNodeId(uri: vscode.Uri, name: string, line: number): string {
-  return `${uri.fsPath}||${name}||${line}`;
+  return `${uri.fsPath}||${baseNameOf(name)}||${line}`;
 }
 
 function makeNode(
@@ -144,6 +96,20 @@ function makeNode(
   const short = baseNameOf(name);
   return { id, label: short, labelFull: name, labelShort: short, file, line, source, isCurrentFile };
 }
+
+function maybeUpgradeLabelFull(nodes: Map<string, GraphNode>, id: string, fullName: string): void {
+  if (!fullName.includes('(')) return;
+  const node = nodes.get(id);
+  if (!node) return;
+  if (!node.labelFull.includes('(')) {
+    node.labelFull = fullName;
+    nodes.set(id, node);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ユーティリティ
+// ─────────────────────────────────────────────────────────────────────────────
 
 function flattenFunctions(syms: vscode.DocumentSymbol[]): vscode.DocumentSymbol[] {
   const KINDS = new Set([vscode.SymbolKind.Function, vscode.SymbolKind.Method, vscode.SymbolKind.Constructor]);
@@ -178,13 +144,27 @@ function sliceSource(lines: string[], s: number, e: number): string {
 
 function delay(ms: number) { return new Promise<void>(r => setTimeout(r, ms)); }
 
+/**
+ * ★ 指数バックオフ付きリトライ。
+ *   clangd が "Canceled" を返す場合は最大 MAX_RETRY 回まで再試行する。
+ *   待機時間: 200ms → 400ms → 800ms → 1600ms → 3200ms
+ */
+const MAX_RETRY     = 6;
+const RETRY_BASE_MS = 200;
+
 async function execWithRetry<T>(command: string, ...args: unknown[]): Promise<T | undefined> {
-  for (let i = 0; i <= 2; i++) {
-    try { return await vscode.commands.executeCommand<T>(command, ...args); }
-    catch (err) {
+  for (let i = 0; i < MAX_RETRY; i++) {
+    try {
+      return await vscode.commands.executeCommand<T>(command, ...args);
+    } catch (err) {
       const msg = String(err);
-      if (msg.includes('not found')) throw err;
-      if (i < 2 && msg.includes('Canceled')) { await delay(100 * (i + 1)); continue; }
+      if (msg.includes('not found')) throw err;               // コマンド自体が存在しない → 即リトライ不要
+      if (msg.includes('Canceled')) {
+        if (i < MAX_RETRY - 1) {
+          await delay(RETRY_BASE_MS * Math.pow(2, i));        // 200, 400, 800, 1600, 3200 ms
+          continue;
+        }
+      }
       throw err;
     }
   }
@@ -232,12 +212,14 @@ export async function buildFileCallGraph(
 
   for (const f of functions) {
     const id = makeNodeId(document.uri, f.name, f.selectionRange.start.line);
-    nodes.set(id, makeNode(
-      id, f.name, document.uri.fsPath,
-      f.selectionRange.start.line + 1,
-      sliceSource(currentLines, f.range.start.line, f.range.end.line),
-      true
-    ));
+    if (!nodes.has(id)) {
+      nodes.set(id, makeNode(
+        id, f.name, document.uri.fsPath,
+        f.selectionRange.start.line + 1,
+        sliceSource(currentLines, f.range.start.line, f.range.end.line),
+        true
+      ));
+    }
   }
 
   const total = functions.length;
@@ -254,7 +236,6 @@ export async function buildFileCallGraph(
           'vscode.prepareCallHierarchy', document.uri, func.selectionRange.start);
         if (!items?.length) return;
 
-        // documentSymbolProvider の短い名前を CallHierarchy のフルシグネチャで補完
         const callerId = makeNodeId(document.uri, func.name, func.selectionRange.start.line);
         maybeUpgradeLabelFull(nodes, callerId, items[0].name);
 
@@ -264,10 +245,10 @@ export async function buildFileCallGraph(
 
         for (const call of outgoing) {
           const { to } = call;
-          let calleeId = findExistingCalleeId(nodes, to);
-          if (!calleeId) {
+          const calleeId = makeNodeId(to.uri, to.name, to.selectionRange.start.line);
+
+          if (!nodes.has(calleeId)) {
             if (!shouldIncludeCallee(to.uri, wsRoots)) continue;
-            calleeId = makeNodeId(to.uri, to.name, to.selectionRange.start.line);
             const ll = await openLines(to.uri, cache);
             nodes.set(calleeId, makeNode(
               calleeId, to.name, to.uri.fsPath,
@@ -275,6 +256,8 @@ export async function buildFileCallGraph(
               sliceSource(ll, to.range.start.line, to.range.end.line),
               false
             ));
+          } else {
+            maybeUpgradeLabelFull(nodes, calleeId, to.name);
           }
           edgeSet.add(`${callerId}|||${calleeId}`);
         }
@@ -339,10 +322,10 @@ export async function buildFunctionCallGraph(
         'vscode.provideOutgoingCalls', item);
       if (!outgoing?.length) continue;
       for (const call of outgoing) {
-        let calleeId = findExistingCalleeId(nodes, call.to);
-        if (!calleeId) {
-          if (!shouldIncludeCallee(call.to.uri, wsRoots)) continue;
-          calleeId = makeNodeId(call.to.uri, call.to.name, call.to.selectionRange.start.line);
+        if (!shouldIncludeCallee(call.to.uri, wsRoots)) continue;
+        const calleeId = makeNodeId(call.to.uri, call.to.name, call.to.selectionRange.start.line);
+        if (nodes.has(calleeId)) {
+          maybeUpgradeLabelFull(nodes, calleeId, call.to.name);
         }
         edgeSet.add(`${nodeId}|||${calleeId}`);
         if (!visited.has(calleeId)) queue.push([call.to, hop + 1]);
@@ -375,8 +358,6 @@ export async function buildWorkspaceCallGraph(
 
   for (let fi = 0; fi < uniqueUris.length; fi++) {
     const uri = uniqueUris[fi];
-
-    // ヘッダーファイルはノードの起点としてスキップ (callee として登場した場合は .cpp 側ノードへフォールバック)
     if (!hasCppSourceExtension(uri)) continue;
 
     progress?.report({
@@ -419,10 +400,10 @@ export async function buildWorkspaceCallGraph(
 
           for (const call of outgoing) {
             const { to } = call;
-            let calleeId = findExistingCalleeId(nodes, to);
-            if (!calleeId) {
+            const calleeId = makeNodeId(to.uri, to.name, to.selectionRange.start.line);
+
+            if (!nodes.has(calleeId)) {
               if (!shouldIncludeCallee(to.uri, wsRoots)) continue;
-              calleeId = makeNodeId(to.uri, to.name, to.selectionRange.start.line);
               const ll = await openLines(to.uri, cache);
               nodes.set(calleeId, makeNode(
                 calleeId, to.name, to.uri.fsPath,
@@ -430,6 +411,8 @@ export async function buildWorkspaceCallGraph(
                 sliceSource(ll, to.range.start.line, to.range.end.line),
                 false
               ));
+            } else {
+              maybeUpgradeLabelFull(nodes, calleeId, to.name);
             }
             edgeSet.add(`${callerId}|||${calleeId}`);
           }
