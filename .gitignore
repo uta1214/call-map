@@ -6,7 +6,7 @@ yarn-error.log*
 
 # ===== VSCode extension build =====
 out/
-*.vsix
+# *.vsix
 
 # ===== gtags generated files =====
 GTAGS
@@ -23,5 +23,5 @@ Thumbs.db
 
 # ===== misc =====
 *.log
-
+*.patch
 .vscodeignore
