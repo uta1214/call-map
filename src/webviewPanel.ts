@@ -1,11 +1,29 @@
 /**
  * webviewPanel.ts
+ *
+ * 【変更点 (main ← gtags マージ)】
+ *  - buildGraphMsg: labelFull をソースパネル用に維持し label をノード表示に使用
+ *  - HTML 凡例の色変更: 選択中 #00b894 → #97c2fc、caller #0984e3 → #00b894
+ *  - HTML から引数表示トグル (sig-toggle) を削除
+ *  - CSS の .ctrl-label クラスを削除してインラインスタイルに統一
+ *
+ * 【追加修正】
+ *  - _pendingMessage (単一) → _pendingMessages: object[] (配列) に変更。
+ *    ready 受信前に setLoading() → updateGraph() の順で呼ばれた場合に
+ *    loading メッセージが消えてしまう問題を修正。(⑤)
+ *  - exportHtmlFile: process.env.HOME → os.homedir() に変更。
+ *    Windows で HOME 未定義になる問題を修正。(⑦)
+ *  - htmlTemplate: スタンドアロン HTML にも CSP メタタグを付与。(⑧)
+ *    WebView 版: nonce ベース CSP (既存通り)
+ *    スタンドアロン版: script-src 'unsafe-inline' の CSP を追加
+ *  - deactivate() で dispose できるよう currentPanel を外部から参照可能にする。(⑨)
  */
 
 import * as vscode from 'vscode';
 import * as path   from 'path';
 import * as fs     from 'fs';
 import * as crypto from 'crypto';
+import * as os     from 'os';   // ★ ⑦: os.homedir() 用
 import { GraphData } from './callGraphBuilder';
 
 const FILE_COLORS_BASE = [
@@ -38,15 +56,14 @@ function buildGraphMsg(data: GraphData): object {
     type: 'graphData',
     nodes: data.nodes.map(n => ({
       id:            n.id,
-      label:         n.labelShort,   // 初期表示は短い名前
-      labelFull:     n.labelFull,    // フルシグネチャ (webview 側で切り替え用)
-      labelShort:    n.labelShort,   // 関数名のみ
+      label:         n.label,     // 表示用 (短縮名)
+      labelFull:     n.labelFull, // ソースパネル用 (フルシグネチャ)
       file:          n.file,
       line:          n.line,
       source:        n.source,
       isCurrentFile: n.isCurrentFile,
       color:  colorMap[n.file] ?? FILE_COLORS_BASE[FILE_COLORS_BASE.length - 1],
-      title:  `${n.labelShort}\n${path.basename(n.file)} : ${n.line}行`,
+      title:  `${n.label}\n${path.basename(n.file)} : ${n.line}行`,
     })),
     edges: data.edges, fileLegend,
     buildTimeMs: data.buildTimeMs, errors: data.errors,
@@ -59,11 +76,23 @@ function generateStandaloneHtml(extensionUri: vscode.Uri, data: GraphData): stri
   const webviewJs = fs.readFileSync(path.join(distDir, 'webview.js'), 'utf-8');
   const graphMsg  = buildGraphMsg(data);
 
-  return htmlTemplate('', [
-    `<script>var INITIAL_GRAPH_DATA = ${JSON.stringify(graphMsg)};</script>`,
-    `<script>${visJs}</script>`,
-    `<script>${webviewJs}</script>`,
-  ].join('\n'), '');
+  // ★ セキュリティ: JSON.stringify は </script> をエスケープしないため
+  //   ソースコード中に </script> が含まれると HTML が破壊される (XSS)。
+  //   Unicodeエスケープで < と > を無害化する。
+  const safeJson = JSON.stringify(graphMsg)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e');
+
+  // ★ ④: visJs / webviewJs をインラインで埋め込む際に </script> が含まれると
+  //   ブラウザの HTML パーサーがスクリプトブロックを早期終端してしまう。
+  //   </script → <\/script に変換して安全に埋め込む。
+  const escapeScript = (s: string): string => s.replace(/<\/script/gi, '<\\/script');
+
+  return htmlTemplate({ kind: 'standalone' }, [
+    `<script>var INITIAL_GRAPH_DATA = ${safeJson};</script>`,
+    `<script>${escapeScript(visJs)}</script>`,
+    `<script>${escapeScript(webviewJs)}</script>`,
+  ].join('\n'));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -76,8 +105,11 @@ export class CallGraphPanel {
   private readonly _panel:        vscode.WebviewPanel;
   private readonly _extensionUri: vscode.Uri;
   private readonly _disposables:  vscode.Disposable[] = [];
-  private _isReady         = false;
-  private _pendingMessage: object | null = null;
+  private _isReady          = false;
+  // ★ ⑤: 単一メッセージ保留 → キュー方式に変更。
+  //   setLoading() → updateGraph() の順で ready 前に呼ばれても
+  //   両メッセージが順番通りに届くようにする。
+  private _pendingMessages: object[] = [];
   private _lastGraphData:  GraphData | null = null;
 
   private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri) {
@@ -89,7 +121,11 @@ export class CallGraphPanel {
         switch (msg.type) {
           case 'ready':
             this._isReady = true;
-            if (this._pendingMessage) { this._panel.webview.postMessage(this._pendingMessage); this._pendingMessage = null; }
+            // ★ ⑤: キューに溜まったメッセージを順番に送信
+            for (const pending of this._pendingMessages) {
+              this._panel.webview.postMessage(pending);
+            }
+            this._pendingMessages = [];
             break;
           case 'openFile':
             if (msg.file && msg.line !== undefined) await this._openFileAtLine(msg.file, msg.line);
@@ -111,7 +147,7 @@ export class CallGraphPanel {
     const column = vscode.window.activeTextEditor ? vscode.ViewColumn.Beside : vscode.ViewColumn.One;
     if (CallGraphPanel.currentPanel) { CallGraphPanel.currentPanel._panel.reveal(column); return CallGraphPanel.currentPanel; }
     const panel = vscode.window.createWebviewPanel(
-      'callGraphViewer', 'Call Graph', column,
+      'callGraphViewer', 'Call Map', column,
       { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [extensionUri] }
     );
     CallGraphPanel.currentPanel = new CallGraphPanel(panel, extensionUri);
@@ -119,27 +155,28 @@ export class CallGraphPanel {
   }
 
   public setLoading(fileName: string): void {
-    this._panel.title = 'Call Graph — 解析中...';
+    this._panel.title = 'Call Map — 解析中...';
     this._postOrQueue({ type: 'loading', fileName });
   }
 
   public updateGraph(data: GraphData): void {
     this._lastGraphData = data;
-    this._panel.title   = `Call Graph — ${data.fileName}`;
+    this._panel.title   = `Call Map — ${data.fileName}`;
     this._postOrQueue(buildGraphMsg(data));
   }
 
   public showError(message: string): void {
-    this._panel.title = 'Call Graph — エラー';
+    this._panel.title = 'Call Map — エラー';
     this._postOrQueue({ type: 'error', message });
   }
 
   public static async exportHtmlFile(extensionUri: vscode.Uri, data: GraphData): Promise<void> {
-    const wsRoot     = vscode.workspace.workspaceFolders?.[0]?.uri;
-    const safeName   = data.fileName.replace(/[^\w.-]/g, '_');
+    const wsRoot    = vscode.workspace.workspaceFolders?.[0]?.uri;
+    const safeName  = data.fileName.replace(/[^\w.-]/g, '_');
+    // ★ ⑦: process.env.HOME → os.homedir() に変更 (Windows 対応)
     const defaultUri = wsRoot
       ? vscode.Uri.joinPath(wsRoot, `callgraph_${safeName}.html`)
-      : vscode.Uri.file(path.join(process.env.HOME ?? '/tmp', `callgraph_${safeName}.html`));
+      : vscode.Uri.file(path.join(os.homedir(), `callgraph_${safeName}.html`));
 
     const saveUri = await vscode.window.showSaveDialog({
       defaultUri,
@@ -167,10 +204,24 @@ export class CallGraphPanel {
 
   private _postOrQueue(msg: object): void {
     if (this._isReady) this._panel.webview.postMessage(msg);
-    else this._pendingMessage = msg;
+    // ★ ⑤: push で追加 (上書きしない)
+    else this._pendingMessages.push(msg);
   }
 
   private async _openFileAtLine(filePath: string, line: number): Promise<void> {
+    // ★ ⑤: webview メッセージ経由で任意パスが渡される可能性を防ぐ。
+    //   ワークスペースフォルダのいずれかの配下にあるファイルのみ許可する。
+    //   ワークスペースが未設定の場合は制限なし (単一ファイル編集モード)。
+    const wsRoots = (vscode.workspace.workspaceFolders ?? []).map(f => f.uri.fsPath);
+    const inWorkspace = wsRoots.length === 0
+      || wsRoots.some(r => filePath === r
+          || filePath.startsWith(r + path.sep)
+          || filePath.startsWith(r + '/'));
+    if (!inWorkspace) {
+      vscode.window.showErrorMessage(
+        `Call Map: ワークスペース外のファイルは開けません:\n${filePath}`);
+      return;
+    }
     try {
       const uri = vscode.Uri.file(filePath);
       const pos = new vscode.Position(Math.max(0, line - 1), 0);
@@ -187,25 +238,33 @@ export class CallGraphPanel {
     const distDir    = vscode.Uri.joinPath(this._extensionUri, 'dist');
     const visUri     = webview.asWebviewUri(vscode.Uri.joinPath(distDir, 'vis-network.min.js'));
     const webviewUri = webview.asWebviewUri(vscode.Uri.joinPath(distDir, 'webview.js'));
-    const csp        = webview.cspSource;
 
+    // ★ ⑥: 型安全な mode オブジェクトを渡す
     return htmlTemplate(
-      nonce,
-      `<script nonce="${nonce}" src="${visUri}"></script>\n<script nonce="${nonce}" src="${webviewUri}"></script>`,
-      csp
+      { kind: 'webview', nonce, cspSource: webview.cspSource },
+      `<script nonce="${nonce}" src="${visUri}"></script>\n<script nonce="${nonce}" src="${webviewUri}"></script>`
     );
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HTML テンプレート
+// HTML テンプレート (WebView / スタンドアロン 共用)
 // ─────────────────────────────────────────────────────────────────────────────
 
-function htmlTemplate(nonce: string, scripts: string, cspSource: string): string {
-  const cspMeta = nonce
+/**
+ * ★ ⑥: モード判定を文字列比較から判別可能な共用体型に変更。
+ *   nonce が空文字列だった場合に誤って standalone 扱いになるバグを型レベルで排除する。
+ */
+type HtmlTemplateMode =
+  | { kind: 'webview';    nonce: string; cspSource: string }
+  | { kind: 'standalone' };
+
+function htmlTemplate(mode: HtmlTemplateMode, scripts: string): string {
+  const cspMeta = mode.kind === 'webview'
     ? `<meta http-equiv="Content-Security-Policy"
-         content="default-src 'none'; script-src 'nonce-${nonce}' ${cspSource}; style-src 'unsafe-inline';">`
-    : '';
+         content="default-src 'none'; script-src 'nonce-${mode.nonce}' ${mode.cspSource}; style-src 'unsafe-inline';">`
+    : `<meta http-equiv="Content-Security-Policy"
+         content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline';">`;
 
   return `<!DOCTYPE html>
 <html lang="ja">
@@ -259,28 +318,22 @@ div.vis-network div.vis-navigation div.vis-button.vis-zoomOut     { left: 122px 
 }
 .spinner { width: 36px; height: 36px; border: 3px solid #dfe6e9; border-top-color: #00b894; border-radius: 50%; animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
-.ctrl-label { cursor: pointer; display: flex; align-items: center; gap: 6px; font-size: 11px; color: #2d3436; margin-bottom: 4px; }
 </style>
 </head>
 <body>
 <div id="network"></div>
 
 <div id="controls">
-  <b style="font-size:13px;">📞 Call Graph</b>
+  <b style="font-size:13px;">📞 Call Map</b>
   <div style="color:#636e72;font-size:11px;margin:2px 0 8px;">
-    <b style="color:#00b894;">●</b> 選択中 &nbsp;
+    <b style="color:#97c2fc;">●</b> 選択中 &nbsp;
     <b style="color:#e17055;">●</b> callee &nbsp;
-    <b style="color:#0984e3;">●</b> caller &nbsp;
+    <b style="color:#00b894;">●</b> caller &nbsp;
     <span style="color:#aaa;font-size:10px;">Ctrl+クリック→ジャンプ</span>
   </div>
   <input id="search-box" type="text" placeholder="🔍 関数名を検索">
 
-  <!-- 引数表示切り替え -->
-  <label class="ctrl-label">
-    <input id="sig-toggle" type="checkbox" checked style="cursor:pointer;"> 引数を表示
-  </label>
-
-  <label class="ctrl-label">
+  <label style="cursor:pointer;display:flex;align-items:center;gap:6px;font-size:11px;color:#2d3436;margin-bottom:4px;">
     <input id="src-toggle" type="checkbox" style="cursor:pointer;"> ソースコードパネルを表示
   </label>
   <div style="display:flex;align-items:center;gap:5px;font-size:11px;color:#636e72;margin-bottom:6px;">
