@@ -3,7 +3,7 @@
   "displayName": "Call Map",
   "publisher": "uta-orange-1214",
   "description": "Interactive C/C++ call graph viewer using LSP Call Hierarchy or GNU GLOBAL (gtags). / LSP または GNU GLOBAL (gtags) を使った C/C++ インタラクティブコールグラフビューア。",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "repository": {
     "type": "git",
     "url": "https://github.com/uta1214/call-map"
