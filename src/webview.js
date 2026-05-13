@@ -1,4 +1,12 @@
 // src/webview.js
+//
+// 【変更点 (main ← gtags マージ)】
+//  - caller ノード色: #74b9ff / #0984e3 → #00b894 / #00695c
+//  - caller エッジ色: #0984e3 → #00b894
+//  - 引数表示トグル (sig-toggle) 関連コードを削除
+//    → showFullSig 変数 / getLabel() / applyLabelMode() を削除
+//  - nodeInfoMap は label / labelFull のみ保持 (labelShort は GraphNode から削除済み)
+//
 (function () {
   'use strict';
 
@@ -16,16 +24,20 @@
   // ─────────────────────────────────────────────────────────────────────────
 
   var DEFAULT_FONT_SIZE = 11;
+
+  // ★ 修正②: hierarchical レイアウトのノード数上限。
+  //   vis-network の hierarchical + sortMethod:'directed' はトポロジカルソートを
+  //   内部で行うため、この閾値を超えると計算が破綻して全ノードが (0,0) に集まり
+  //   白紙グラフになる。閾値を超えた場合は physics ベースのレイアウトにフォールバック。
+  var HIERARCHICAL_THRESHOLD = 150;
   var network  = null;
   var nodes    = null;
   var edges    = null;
 
-  var nodeInfoMap          = {};   // id → { file, line, source, labelFull, labelShort }
+  var nodeInfoMap          = {};   // id → { file, line, source, label, labelFull }
   var defaultNodeColors    = {};
   var canvasFontSize       = DEFAULT_FONT_SIZE;
-  var showFullSig          = true; // 引数表示フラグ (チェックボックスと連動)
   var currentNode          = null;
-  var currentHop           = null;
   var connectedEdgesOfNode = new Set();
   var currentSourceNodeId  = null;
 
@@ -37,7 +49,7 @@
     var msg = e.data;
     switch (msg.type) {
       case 'loading':   showLoading(msg.fileName);        break;
-      case 'graphData': hideLoading(); renderGraph(msg);  break;
+      case 'graphData': renderGraph(msg);               break;
       case 'error':     hideLoading(); showErrorInView(msg.message); break;
     }
   });
@@ -70,18 +82,8 @@
       'font-family:monospace;font-size:12px;line-height:1.7;">' +
       escapeHtml(msg) + '</pre>' +
       '<p style="font-size:11px;color:#b2bec3;font-family:monospace;">' +
-      'clangd または C/C++ 拡張機能が有効か確認してください</p>' +
+      'clangd / gtags が有効か確認してください</p>' +
       '</div>';
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // ラベル取得ヘルパー
-  // ─────────────────────────────────────────────────────────────────────────
-
-  /** 現在の showFullSig に応じたラベルを返す */
-  function getLabel(info) {
-    if (!info) return '';
-    return showFullSig ? info.labelFull : info.labelShort;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -91,12 +93,13 @@
   function renderGraph(msg) {
     nodeInfoMap = {};
     msg.nodes.forEach(function (n) {
+      // labelFull はソースパネルの関数名表示用、label はグラフ上の表示用
       nodeInfoMap[n.id] = {
-        file:       n.file,
-        line:       n.line,
-        source:     n.source,
-        labelFull:  n.labelFull  || n.label,
-        labelShort: n.labelShort || n.label,
+        file:      n.file,
+        line:      n.line,
+        source:    n.source,
+        label:     n.label,
+        labelFull: n.labelFull || n.label,
       };
     });
 
@@ -105,9 +108,10 @@
 
     var visNodes = msg.nodes.map(function (n) {
       return {
-        id: n.id,
-        label: getLabel(nodeInfoMap[n.id]),
-        title: n.title, color: n.color,
+        id:          n.id,
+        label:       n.label,   // ノード上の表示は常に短縮名
+        title:       n.title,
+        color:       n.color,
         size:        Math.min(12 + ((inDeg[n.id] || 0) * 3), 40),
         shape:       'dot',
         borderWidth: n.isCurrentFile ? 2 : 1,
@@ -125,13 +129,28 @@
       };
     });
 
+    // ★ 修正①: clear の順序は必ず edges → nodes。
+    //   nodes を先に消すとエッジが存在しないノードを参照する状態になり
+    //   vis-network が内部エラーで描画を中断するため白紙になる。
+    // ★ 修正②: ノード数に応じてレイアウトを切り替える。
+    //   hierarchical は大量ノードで破綻するため閾値を超えたら無効化する。
     if (network) {
-      nodes.clear(); nodes.add(visNodes);
+      var useHierarchical = visNodes.length <= HIERARCHICAL_THRESHOLD;
+      network.setOptions({ layout: { hierarchical: { enabled: useHierarchical } } });
       edges.clear(); edges.add(visEdges);
+      nodes.clear(); nodes.add(visNodes);
+      if (!useHierarchical) {
+        document.getElementById('loading-overlay').style.display = 'flex';
+        network.once('stabilizationIterationsDone', function () {
+          network.fit();
+          hideLoading();
+        });
+        network.stabilize(200);
+      }
     } else {
       nodes = new vis.DataSet(visNodes);
       edges = new vis.DataSet(visEdges);
-      initNetwork();
+      initNetwork(visNodes.length);
     }
 
     defaultNodeColors = {};
@@ -146,25 +165,49 @@
 
     var errNote = (msg.errors && msg.errors.length > 0)
       ? ' (警告: ' + msg.errors.length + '件)' : '';
+    var layoutNote = visNodes.length > HIERARCHICAL_THRESHOLD
+      ? ' [physics]' : ' [hierarchical]';
     document.getElementById('build-info').textContent =
       'ノード: ' + msg.nodes.length + ' / エッジ: ' + msg.edges.length +
-      ' / ' + msg.buildTimeMs + 'ms' + errNote;
+      ' / ' + msg.buildTimeMs + 'ms' + layoutNote + errNote;
 
     resetAll();
+
+    // ★ hierarchical モードは同期描画なのでここで即座にローディングを消す。
+    //   physics モードは initNetwork 内の stabilizationIterationsDone で消す。
+    if (visNodes.length <= HIERARCHICAL_THRESHOLD) {
+      hideLoading();
+    }
   }
 
-  function initNetwork() {
-    network = new vis.Network(
-      document.getElementById('network'),
-      { nodes: nodes, edges: edges },
-      {
-        layout: {
+  function initNetwork(nodeCount) {
+    // ★ 修正②: ノード数が閾値以下なら hierarchical、超えたら physics フォールバック
+    var useHierarchical = nodeCount <= HIERARCHICAL_THRESHOLD;
+
+    var layoutOpt = useHierarchical
+      ? {
           hierarchical: {
             enabled: true, direction: 'LR', sortMethod: 'directed',
             levelSeparation: 220, nodeSpacing: 70, treeSpacing: 130,
             blockShifting: true, edgeMinimization: true, parentCentralization: true
           }
-        },
+        }
+      : { hierarchical: { enabled: false } };
+
+    var physicsOpt = useHierarchical
+      ? { enabled: false }
+      : {
+          enabled: true,
+          solver: 'forceAtlas2Based',
+          forceAtlas2Based: { gravitationalConstant: -80, springLength: 120, springConstant: 0.08 },
+          stabilization: { iterations: 200, fit: true },
+        };
+
+    network = new vis.Network(
+      document.getElementById('network'),
+      { nodes: nodes, edges: edges },
+      {
+        layout: layoutOpt,
         nodes: {
           shape: 'dot', borderWidth: 2,
           shadow: { enabled: true, size: 4, x: 2, y: 2, color: 'rgba(0,0,0,0.08)' },
@@ -180,7 +223,7 @@
           hover: true, tooltipDelay: 80, navigationButtons: true,
           keyboard: false, zoomView: false
         },
-        physics: { enabled: false }
+        physics: physicsOpt,
       }
     );
 
@@ -200,6 +243,19 @@
         return { id: id, color: { color: '#aaaaaa', opacity: 0.8 }, width: 1 };
       }));
     });
+
+    // ★ 修正②: physics フォールバック時はスタビライズ中にローディングを表示する
+    if (!useHierarchical) {
+      document.getElementById('loading-overlay').style.display = 'flex';
+      network.on('stabilizationProgress', function (params) {
+        document.getElementById('loading-msg').textContent =
+          'レイアウト計算中... ' + Math.round(params.iterations / params.total * 100) + '%';
+      });
+      network.once('stabilizationIterationsDone', function () {
+        network.fit();
+        hideLoading();
+      });
+    }
 
     network.body.container.addEventListener('wheel', function (e) {
       e.preventDefault(); e.stopPropagation();
@@ -246,7 +302,6 @@
     if (id === currentNode) { resetAll(); return; }
 
     currentNode          = id;
-    currentHop           = null;
     connectedEdgesOfNode = new Set(network.getConnectedEdges(id));
 
     var outgoing = new Set();
@@ -257,16 +312,18 @@
     });
 
     nodes.update(nodes.getIds().map(function (nid) {
-      if (nid === id)         return { id: nid, color: { background: '#00b894', border: '#00695c' }, font: makeFont('#003d33') };
+      if (nid === id)         return { id: nid, color: { background: '#97c2fc', border: '#5a9fd4' }, font: makeFont('#1a3d5c') };
       if (outgoing.has(nid)) return { id: nid, color: { background: '#fab1a0', border: '#e17055' }, font: makeFont('#6d2b1a') };
-      if (incoming.has(nid)) return { id: nid, color: { background: '#74b9ff', border: '#0984e3' }, font: makeFont('#003580') };
+      // ★ caller 色変更: #74b9ff / #0984e3 → #00b894 / #00695c
+      if (incoming.has(nid)) return { id: nid, color: { background: '#00b894', border: '#00695c' }, font: makeFont('#003d33') };
       return { id: nid, color: { background: '#ececec', border: '#cccccc' }, font: makeFont('#bbbbbb') };
     }));
 
     edges.update(edges.getIds().map(function (eid) {
       if (!connectedEdgesOfNode.has(eid)) return { id: eid, color: { color: '#e8e8e8', opacity: 0.3 }, width: 1 };
       var e   = edges.get(eid);
-      var col = (e.from === id) ? '#e17055' : '#0984e3';
+      // ★ caller エッジ色変更: #0984e3 → #00b894
+      var col = (e.from === id) ? '#e17055' : '#00b894';
       return { id: eid, color: { color: col, opacity: 1.0 }, width: 2.5 };
     }));
 
@@ -274,24 +331,6 @@
     document.querySelectorAll('.hop-btn').forEach(function (b) { b.classList.remove('active'); });
 
     if (document.getElementById('src-toggle').checked) showSource(id);
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // 引数表示切り替え
-  // ─────────────────────────────────────────────────────────────────────────
-
-  document.getElementById('sig-toggle').addEventListener('change', function () {
-    showFullSig = this.checked;
-    applyLabelMode();
-  });
-
-  /** 全ノードのラベルを現在の showFullSig に合わせて更新する */
-  function applyLabelMode() {
-    if (!nodes) return;
-    nodes.update(nodes.getIds().map(function (id) {
-      var info = nodeInfoMap[id];
-      return { id: id, label: getLabel(info) };
-    }));
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -314,8 +353,8 @@
     return visited;
   }
 
-  window.applyHopFilter = function (maxHops) {
-    currentHop = maxHops;
+  // ★ グローバル公開不要: ボタンのイベントリスナーは下で直接セット済み
+  function applyHopFilter(maxHops) {
     if (currentNode === null) return;
 
     var visible  = (maxHops === null) ? new Set(nodes.getIds()) : getNodesWithinHops(currentNode, maxHops);
@@ -329,9 +368,10 @@
     nodes.update(nodes.getIds().map(function (id) {
       var d = defaultNodeColors[id] || {};
       if (!visible.has(id))        return { id: id, color: { background: '#f0f0f0', border: '#e0e0e0' }, font: makeFont('#e0e0e0') };
-      if (id === currentNode)       return { id: id, color: { background: '#00b894', border: '#00695c' }, font: makeFont('#003d33') };
+      if (id === currentNode)       return { id: id, color: { background: '#97c2fc', border: '#5a9fd4' }, font: makeFont('#1a3d5c') };
       if (outgoing.has(id))         return { id: id, color: { background: '#fab1a0', border: '#e17055' }, font: makeFont('#6d2b1a') };
-      if (incoming.has(id))         return { id: id, color: { background: '#74b9ff', border: '#0984e3' }, font: makeFont('#003580') };
+      // ★ caller 色変更: #74b9ff / #0984e3 → #00b894 / #00695c
+      if (incoming.has(id))         return { id: id, color: { background: '#00b894', border: '#00695c' }, font: makeFont('#003d33') };
       return { id: id, color: d.color, font: makeFont(d.fontColor || '#2d3436') };
     }));
 
@@ -340,7 +380,8 @@
       if (!visible.has(e.from) || !visible.has(e.to))
         return { id: id, color: { color: '#eeeeee', opacity: 0.2 }, width: 1 };
       if (connectedEdgesOfNode.has(id)) {
-        var col = (e.from === currentNode) ? '#e17055' : '#0984e3';
+        // ★ caller エッジ色変更: #0984e3 → #00b894
+        var col = (e.from === currentNode) ? '#e17055' : '#00b894';
         return { id: id, color: { color: col, opacity: 1.0 }, width: 2.5 };
       }
       return { id: id, color: { color: '#aaaaaa', opacity: 0.6 }, width: 1 };
@@ -349,12 +390,12 @@
     document.querySelectorAll('.hop-btn').forEach(function (btn) {
       btn.classList.toggle('active', btn.dataset.hop === String(maxHops));
     });
-  };
+  }
 
   document.querySelectorAll('.hop-btn').forEach(function (btn) {
     btn.addEventListener('click', function () {
       var v = btn.dataset.hop === 'null' ? null : parseInt(btn.dataset.hop, 10);
-      window.applyHopFilter(v);
+      applyHopFilter(v);
     });
   });
 
@@ -379,7 +420,8 @@
     var info     = nodeInfoMap[nodeId] || {};
     var baseName = info.file ? info.file.replace(/\\/g, '/').split('/').pop() : '';
 
-    document.getElementById('source-func-name').textContent = info.labelFull || nodeId;
+    // ソースパネルの関数名にはフルシグネチャ (labelFull) を使用する
+    document.getElementById('source-func-name').textContent = info.labelFull || info.label || nodeId;
     document.getElementById('source-file-info').textContent =
       baseName ? (baseName + ' : ' + info.line + '行目') : '';
     document.getElementById('source-code').textContent = info.source || '(ソースが見つかりません)';
@@ -454,11 +496,11 @@
     var q = this.value.trim().toLowerCase();
     if (!q) { resetAll(); return; }
     var matchSet = new Set();
-    // labelFull / labelShort 両方で検索
+    // label (短縮名) と labelFull (フルシグネチャ) 両方で検索
     Object.keys(nodeInfoMap).forEach(function (id) {
       var info = nodeInfoMap[id];
-      if ((info.labelFull  || '').toLowerCase().indexOf(q) !== -1 ||
-          (info.labelShort || '').toLowerCase().indexOf(q) !== -1) {
+      if ((info.label     || '').toLowerCase().indexOf(q) !== -1 ||
+          (info.labelFull || '').toLowerCase().indexOf(q) !== -1) {
         matchSet.add(id);
       }
     });
@@ -476,8 +518,8 @@
       var hits = nodes.get({
         filter: function (n) {
           var info = nodeInfoMap[n.id] || {};
-          return (info.labelFull  || '').toLowerCase().indexOf(q) !== -1 ||
-                 (info.labelShort || '').toLowerCase().indexOf(q) !== -1;
+          return (info.label     || '').toLowerCase().indexOf(q) !== -1 ||
+                 (info.labelFull || '').toLowerCase().indexOf(q) !== -1;
         }
       });
       if (hits.length) network.focus(hits[0].id, { scale: 1.5, animation: { duration: 400 } });
@@ -490,7 +532,7 @@
   // ─────────────────────────────────────────────────────────────────────────
 
   function resetAll() {
-    currentNode = null; currentHop = null;
+    currentNode = null;
     connectedEdgesOfNode = new Set();
     if (network) network.unselectAll();
     if (nodes) {
@@ -542,9 +584,6 @@
   // ─────────────────────────────────────────────────────────────────────────
   // 起動
   // ─────────────────────────────────────────────────────────────────────────
-
-  // 初期チェックボックス状態を showFullSig に同期
-  showFullSig = document.getElementById('sig-toggle').checked;
 
   if (typeof INITIAL_GRAPH_DATA !== 'undefined') {
     renderGraph(INITIAL_GRAPH_DATA);
