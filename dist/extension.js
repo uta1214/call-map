@@ -1,14 +1,1891 @@
-"use strict";var Ne=Object.create;var K=Object.defineProperty;var Ie=Object.getOwnPropertyDescriptor;var ze=Object.getOwnPropertyNames;var Le=Object.getPrototypeOf,Oe=Object.prototype.hasOwnProperty;var Ae=(t,e)=>{for(var n in e)K(t,n,{get:e[n],enumerable:!0})},ve=(t,e,n,s)=>{if(e&&typeof e=="object"||typeof e=="function")for(let i of ze(e))!Oe.call(t,i)&&i!==n&&K(t,i,{get:()=>e[i],enumerable:!(s=Ie(e,i))||s.enumerable});return t};var _=(t,e,n)=>(n=t!=null?Ne(Le(t)):{},ve(e||!t||!t.__esModule?K(n,"default",{value:t,enumerable:!0}):n,t)),He=t=>ve(K({},"__esModule",{value:!0}),t);var ot={};Ae(ot,{activate:()=>st,deactivate:()=>it});module.exports=He(ot);var P=_(require("vscode")),Re=_(require("path"));var x=_(require("vscode")),R=_(require("path")),ee=_(require("fs")),we=_(require("crypto")),xe=_(require("os")),Y=[{background:"#ffeaa7",border:"#fdcb6e"},{background:"#fab1a0",border:"#e17055"},{background:"#a29bfe",border:"#6c5ce7"},{background:"#81ecec",border:"#00cec9"},{background:"#55efc4",border:"#00b894"},{background:"#fd79a8",border:"#e84393"},{background:"#74b9ff",border:"#0984e3"},{background:"#dfe6e9",border:"#b2bec3"}];function je(t){let e={};return t.forEach((n,s)=>{e[n]=s<Y.length?Y[s]:{background:`hsl(${Math.round(s*360/t.length%360)},65%,80%)`,border:`hsl(${Math.round(s*360/t.length%360)},65%,55%)`}}),e}function ye(t){let e=[...new Set(t.nodes.map(i=>i.file))].sort(),n=je(e),s=e.map(i=>({file:i,color:n[i].background,border:n[i].border}));return{type:"graphData",nodes:t.nodes.map(i=>({id:i.id,label:i.label,labelFull:i.labelFull,file:i.file,line:i.line,source:i.source,isCurrentFile:i.isCurrentFile,color:n[i.file]??Y[Y.length-1],title:`${i.label}
-${R.basename(i.file)} : ${i.line}\u884C`})),edges:t.edges,fileLegend:s,buildTimeMs:t.buildTimeMs,errors:t.errors}}function We(t,e){let n=x.Uri.joinPath(t,"dist").fsPath,s=ee.readFileSync(R.join(n,"vis-network.min.js"),"utf-8"),i=ee.readFileSync(R.join(n,"webview.js"),"utf-8"),o=ye(e),r=JSON.stringify(o).replace(/</g,"\\u003c").replace(/>/g,"\\u003e"),a=p=>p.replace(/<\/script/gi,"<\\/script");return Ce({kind:"standalone"},[`<script>var INITIAL_GRAPH_DATA = ${r};</script>`,`<script>${a(s)}</script>`,`<script>${a(i)}</script>`].join(`
-`))}var O=class t{constructor(e,n){this._disposables=[];this._isReady=!1;this._pendingMessages=[];this._lastGraphData=null;this._panel=e,this._extensionUri=n,this._panel.webview.onDidReceiveMessage(async s=>{switch(s.type){case"ready":this._isReady=!0;for(let i of this._pendingMessages)this._panel.webview.postMessage(i);this._pendingMessages=[];break;case"openFile":s.file&&s.line!==void 0&&await this._openFileAtLine(s.file,s.line);break;case"exportHtml":this._lastGraphData?await t.exportHtmlFile(this._extensionUri,this._lastGraphData):x.window.showWarningMessage("\u30A8\u30AF\u30B9\u30DD\u30FC\u30C8\u3059\u308B\u30B0\u30E9\u30D5\u304C\u3042\u308A\u307E\u305B\u3093\u3002");break}},null,this._disposables),this._panel.onDidDispose(()=>this.dispose(),null,this._disposables),this._panel.webview.html=this._buildHtml()}static createOrShow(e){let n=x.window.activeTextEditor?x.ViewColumn.Beside:x.ViewColumn.One;if(t.currentPanel)return t.currentPanel._panel.reveal(n),t.currentPanel;let s=x.window.createWebviewPanel("callGraphViewer","Call Map",n,{enableScripts:!0,retainContextWhenHidden:!0,localResourceRoots:[e]});return t.currentPanel=new t(s,e),t.currentPanel}setLoading(e){this._panel.title="Call Map \u2014 \u89E3\u6790\u4E2D...",this._postOrQueue({type:"loading",fileName:e})}updateGraph(e){this._lastGraphData=e,this._panel.title=`Call Map \u2014 ${e.fileName}`,this._postOrQueue(ye(e))}showError(e){this._panel.title="Call Map \u2014 \u30A8\u30E9\u30FC",this._postOrQueue({type:"error",message:e})}static async exportHtmlFile(e,n){let s=x.workspace.workspaceFolders?.[0]?.uri,i=n.fileName.replace(/[^\w.-]/g,"_"),o=s?x.Uri.joinPath(s,`callgraph_${i}.html`):x.Uri.file(R.join(xe.homedir(),`callgraph_${i}.html`)),r=await x.window.showSaveDialog({defaultUri:o,filters:{"HTML \u30D5\u30A1\u30A4\u30EB":["html"]}});if(r)try{let a=We(e,n);await x.workspace.fs.writeFile(r,Buffer.from(a,"utf-8")),await x.window.showInformationMessage(`\u4FDD\u5B58\u5B8C\u4E86: ${R.basename(r.fsPath)}`,"\u30D6\u30E9\u30A6\u30B6\u3067\u958B\u304F")==="\u30D6\u30E9\u30A6\u30B6\u3067\u958B\u304F"&&await x.env.openExternal(r)}catch(a){x.window.showErrorMessage(`\u4FDD\u5B58\u306B\u5931\u6557\u3057\u307E\u3057\u305F: ${a}`)}}dispose(){t.currentPanel=void 0,this._panel.dispose(),this._disposables.forEach(e=>e.dispose())}_postOrQueue(e){this._isReady?this._panel.webview.postMessage(e):this._pendingMessages.push(e)}async _openFileAtLine(e,n){let s=(x.workspace.workspaceFolders??[]).map(o=>o.uri.fsPath);if(!(s.length===0||s.some(o=>e===o||e.startsWith(o+R.sep)||e.startsWith(o+"/")))){x.window.showErrorMessage(`Call Map: \u30EF\u30FC\u30AF\u30B9\u30DA\u30FC\u30B9\u5916\u306E\u30D5\u30A1\u30A4\u30EB\u306F\u958B\u3051\u307E\u305B\u3093:
-${e}`);return}try{let o=x.Uri.file(e),r=new x.Position(Math.max(0,n-1),0),a=await x.workspace.openTextDocument(o);await x.window.showTextDocument(a,{selection:new x.Range(r,r),viewColumn:x.ViewColumn.One})}catch{x.window.showErrorMessage(`\u30D5\u30A1\u30A4\u30EB\u3092\u958B\u3051\u307E\u305B\u3093\u3067\u3057\u305F: ${e}`)}}_buildHtml(){let e=we.randomBytes(16).toString("hex"),n=this._panel.webview,s=x.Uri.joinPath(this._extensionUri,"dist"),i=n.asWebviewUri(x.Uri.joinPath(s,"vis-network.min.js")),o=n.asWebviewUri(x.Uri.joinPath(s,"webview.js"));return Ce({kind:"webview",nonce:e,cspSource:n.cspSource},`<script nonce="${e}" src="${i}"></script>
-<script nonce="${e}" src="${o}"></script>`)}};function Ce(t,e){return`<!DOCTYPE html>
-<html lang="ja">
+"use strict";
+var __create = Object.create;
+var __defProp = Object.defineProperty;
+var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __getProtoOf = Object.getPrototypeOf;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+var __copyProps = (to, from, except, desc) => {
+  if (from && typeof from === "object" || typeof from === "function") {
+    for (let key of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(to, key) && key !== except)
+        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+  }
+  return to;
+};
+var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__getProtoOf(mod)) : {}, __copyProps(
+  // If the importer is in node compatibility mode or this is not an ESM
+  // file that has been converted to a CommonJS file using a Babel-
+  // compatible transform (i.e. "__esModule" has not been set), then set
+  // "default" to the CommonJS "module.exports" for node compatibility.
+  isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
+  mod
+));
+var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
+
+// src/extension.ts
+var extension_exports = {};
+__export(extension_exports, {
+  activate: () => activate,
+  deactivate: () => deactivate
+});
+module.exports = __toCommonJS(extension_exports);
+var vscode3 = __toESM(require("vscode"));
+var path3 = __toESM(require("path"));
+
+// src/webviewPanel.ts
+var vscode2 = __toESM(require("vscode"));
+var path2 = __toESM(require("path"));
+var fs2 = __toESM(require("fs"));
+var crypto = __toESM(require("crypto"));
+var os = __toESM(require("os"));
+
+// src/callGraphBuilder.ts
+var vscode = __toESM(require("vscode"));
+var path = __toESM(require("path"));
+var fs = __toESM(require("fs"));
+var import_child_process = require("child_process");
+var import_util = require("util");
+var execFileAsync = (0, import_util.promisify)(import_child_process.execFile);
+var BATCH_SIZE = 6;
+var BATCH_DELAY_INIT = 20;
+var BATCH_DELAY_MIN = 0;
+var BATCH_DELAY_MAX = 150;
+var CC_SOURCE_EXTENSIONS = /* @__PURE__ */ new Set([".c", ".cpp", ".cc", ".cxx", ".cu", ".cuh"]);
+var CC_ALL_GLOB = "**/*.{c,cpp,cc,cxx,cu,cuh,h,hpp,hxx}";
+var EXCLUDE_GLOB = "{**/node_modules/**,**/build/**,**/dist/**,**/out/**,**/.git/**}";
+var GLOBAL_RX_BATCH = 100;
+var GLOBAL_RX_PARALLEL = 4;
+var GTAGS_UPDATE_TTL = 3e4;
+var gtagsUpdateCache = /* @__PURE__ */ new Map();
+var MAX_CACHE_ENTRIES = 20;
+var CACHE_TTL_MS = 5 * 6e4;
+var graphDataCache = /* @__PURE__ */ new Map();
+function setGraphCache(key, entry) {
+  if (graphDataCache.size >= MAX_CACHE_ENTRIES) {
+    let oldestKey = "";
+    let oldestTs = Infinity;
+    for (const [k, v] of graphDataCache) {
+      if (v.timestamp < oldestTs) {
+        oldestTs = v.timestamp;
+        oldestKey = k;
+      }
+    }
+    if (oldestKey)
+      graphDataCache.delete(oldestKey);
+  }
+  graphDataCache.set(key, entry);
+}
+function invalidateCache(filePath) {
+  if (!filePath) {
+    graphDataCache.clear();
+    return;
+  }
+  const norm = normalizeFsPath(filePath);
+  for (const key of graphDataCache.keys()) {
+    if (key.includes(norm) || key.includes(filePath))
+      graphDataCache.delete(key);
+  }
+}
+function normalizeFsPath(p) {
+  const normalized = path.normalize(p);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+function findScopeMapEntry(scopeMap, filePath) {
+  let entry = scopeMap.get(filePath);
+  if (entry)
+    return entry;
+  const norm = normalizeFsPath(filePath);
+  entry = scopeMap.get(norm);
+  if (entry)
+    return entry;
+  if (process.platform !== "linux") {
+    const lower = norm.toLowerCase();
+    for (const [k, v] of scopeMap) {
+      if (normalizeFsPath(k).toLowerCase() === lower)
+        return v;
+    }
+  }
+  try {
+    const real = fs.realpathSync(filePath);
+    entry = scopeMap.get(real);
+    if (entry)
+      return entry;
+    const realNorm = normalizeFsPath(real);
+    for (const [k, v] of scopeMap) {
+      if (normalizeFsPath(k) === realNorm)
+        return v;
+    }
+  } catch {
+  }
+  return void 0;
+}
+function splitEdges(edgeSet) {
+  return Array.from(edgeSet).map((key) => {
+    const sep3 = key.indexOf("|||");
+    return { from: key.slice(0, sep3), to: key.slice(sep3 + 3) };
+  });
+}
+function delay(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+var Pct = class {
+  constructor(p) {
+    this.p = p;
+    this.cur = 0;
+  }
+  to(val) {
+    const v = Math.min(100, Math.max(0, Math.round(val)));
+    const delta = v - this.cur;
+    if (delta > 0) {
+      this.p?.report({ message: `${v}%`, increment: delta });
+      this.cur = v;
+    }
+  }
+  range(start, end, pos, total) {
+    this.to(start + (end - start) * pos / Math.max(1, total));
+  }
+  /** touched.size - pending.length ≈ 処理済み件数 */
+  bfsQ(start, end, touched, pending) {
+    const total = touched.size;
+    const done = Math.max(0, total - pending.length);
+    this.to(total === 0 ? end : start + (end - start) * done / total);
+  }
+};
+function getWorkspaceRoots(fallbackUri) {
+  const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
+  if (folders.length === 0 && fallbackUri)
+    return [path.dirname(fallbackUri.fsPath)];
+  return folders;
+}
+function getWorkspaceRootForFile(fileUri) {
+  const filePath = fileUri.fsPath;
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  for (const folder of folders) {
+    const root = folder.uri.fsPath;
+    if (filePath === root || filePath.startsWith(root + path.sep) || filePath.startsWith(root + "/")) {
+      return root;
+    }
+  }
+  return folders[0]?.uri.fsPath ?? path.dirname(filePath);
+}
+async function gtagsAvailable() {
+  try {
+    await execFileAsync("gtags", ["--version"]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function resolveBackend(backend) {
+  if (backend === "lsp")
+    return "lsp";
+  if (backend === "gtags")
+    return "gtags";
+  return await gtagsAvailable() ? "gtags" : "lsp";
+}
+function hasCppSourceExtension(uri) {
+  return CC_SOURCE_EXTENSIONS.has(path.extname(uri.fsPath).toLowerCase());
+}
+function isInWorkspace(uri, roots) {
+  if (roots.length === 0)
+    return true;
+  const p = uri.fsPath;
+  return roots.some((r) => p === r || p.startsWith(r + path.sep) || p.startsWith(r + "/"));
+}
+function shouldIncludeCallee(uri, roots) {
+  return isInWorkspace(uri, roots) && hasCppSourceExtension(uri);
+}
+function makeNodeId(uri, name, line) {
+  return `${uri.fsPath}||${baseNameOf(name)}||${line}`;
+}
+function baseNameOf(name) {
+  const idx = name.indexOf("(");
+  return idx >= 0 ? name.slice(0, idx).trim() : name;
+}
+function findExistingCalleeId(nodes, to) {
+  const exactId = makeNodeId(to.uri, to.name, to.selectionRange.start.line);
+  if (nodes.has(exactId))
+    return exactId;
+  const base = baseNameOf(to.name);
+  const fp = to.uri.fsPath;
+  for (const [id, node] of nodes) {
+    if (node.file === fp && (node.label === base || baseNameOf(node.label) === base))
+      return id;
+  }
+  const ext = path.extname(fp).toLowerCase();
+  if ([".h", ".hpp", ".hxx"].includes(ext)) {
+    for (const [id, node] of nodes) {
+      if (node.label === base || baseNameOf(node.label) === base)
+        return id;
+    }
+  }
+  return null;
+}
+function flattenFunctions(syms) {
+  const KINDS = /* @__PURE__ */ new Set([vscode.SymbolKind.Function, vscode.SymbolKind.Method, vscode.SymbolKind.Constructor]);
+  const seen = /* @__PURE__ */ new Set();
+  const result = [];
+  function walk(arr) {
+    for (const s of arr) {
+      if (KINDS.has(s.kind)) {
+        const key = `${s.selectionRange.start.line}:${baseNameOf(s.name)}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          result.push(s);
+        }
+      }
+      if (s.children?.length)
+        walk(s.children);
+    }
+  }
+  walk(syms);
+  return result;
+}
+var MAX_SOURCE_LINES = 200;
+function checkCancellation(token) {
+  if (token?.isCancellationRequested)
+    throw new vscode.CancellationError();
+}
+var MAX_RETRY = 6;
+var RETRY_BASE_MS = 200;
+async function execWithRetry(command, token, ...args) {
+  for (let i = 0; i < MAX_RETRY; i++) {
+    checkCancellation(token);
+    try {
+      return await vscode.commands.executeCommand(command, ...args);
+    } catch (err) {
+      const msg = String(err);
+      if (msg.includes("not found"))
+        throw err;
+      if (i < MAX_RETRY - 1) {
+        await delay(RETRY_BASE_MS * Math.pow(2, i));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+async function buildFileCallGraphLsp(document, progress, token) {
+  const t0 = Date.now();
+  const errs = [];
+  const wsRoots = getWorkspaceRoots(document.uri);
+  const pct = new Pct(progress);
+  pct.to(0);
+  checkCancellation(token);
+  const rawSyms = await vscode.commands.executeCommand(
+    "vscode.executeDocumentSymbolProvider",
+    document.uri
+  );
+  if (!rawSyms?.length)
+    throw new Error(
+      "No symbols found.\n\n[Checklist]\n  1. Is clangd or C/C++ extension enabled?\n  2. Has the index finished building?\n  3. (clangd) Does compile_commands.json exist?"
+    );
+  const functions = flattenFunctions(rawSyms);
+  if (!functions.length)
+    throw new Error("No function symbols found in this file.");
+  const nodes = /* @__PURE__ */ new Map();
+  const edgeSet = /* @__PURE__ */ new Set();
+  for (const f of functions) {
+    const id = makeNodeId(document.uri, f.name, f.selectionRange.start.line);
+    nodes.set(id, {
+      id,
+      label: baseNameOf(f.name),
+      labelFull: f.name,
+      file: document.uri.fsPath,
+      line: f.selectionRange.start.line + 1,
+      scopeEnd: f.range.end.line + 1,
+      // ⑥ lazy source 用
+      isCurrentFile: true
+    });
+  }
+  pct.to(5);
+  {
+    const downVisited = /* @__PURE__ */ new Set();
+    const downQueue = [];
+    let adaptiveDelay = BATCH_DELAY_INIT;
+    const coreItemsMap = /* @__PURE__ */ new Map();
+    for (let i = 0; i < functions.length; i += BATCH_SIZE) {
+      checkCancellation(token);
+      await Promise.all(functions.slice(i, i + BATCH_SIZE).map(async (f) => {
+        const coreId = makeNodeId(document.uri, f.name, f.selectionRange.start.line);
+        try {
+          const items = await execWithRetry(
+            "vscode.prepareCallHierarchy",
+            token,
+            document.uri,
+            f.selectionRange.start
+          );
+          if (!items?.length)
+            return;
+          coreItemsMap.set(coreId, items[0]);
+          downQueue.push([items[0], coreId]);
+          downVisited.add(coreId);
+        } catch (err) {
+          if (err instanceof vscode.CancellationError)
+            throw err;
+          errs.push(`(callee-prep) ${f.name}: ${String(err)}`);
+        }
+      }));
+      pct.range(5, 20, Math.min(i + BATCH_SIZE, functions.length), functions.length);
+    }
+    while (downQueue.length > 0) {
+      checkCancellation(token);
+      const batch = downQueue.splice(0, BATCH_SIZE);
+      const processingIds = /* @__PURE__ */ new Set();
+      let errorsInBatch = 0;
+      await Promise.all(batch.map(async ([callerItem, callerId]) => {
+        try {
+          const outgoing = await execWithRetry(
+            "vscode.provideOutgoingCalls",
+            token,
+            callerItem
+          );
+          if (!outgoing?.length)
+            return;
+          for (const call of outgoing) {
+            const { to } = call;
+            let calleeId = findExistingCalleeId(nodes, to);
+            if (!calleeId) {
+              if (!shouldIncludeCallee(to.uri, wsRoots))
+                continue;
+              calleeId = makeNodeId(to.uri, to.name, to.selectionRange.start.line);
+              if (!nodes.has(calleeId) && !processingIds.has(calleeId)) {
+                processingIds.add(calleeId);
+                nodes.set(calleeId, {
+                  id: calleeId,
+                  label: baseNameOf(to.name),
+                  labelFull: to.name,
+                  file: to.uri.fsPath,
+                  line: to.selectionRange.start.line + 1,
+                  scopeEnd: to.range.end.line + 1,
+                  isCurrentFile: to.uri.fsPath === document.uri.fsPath
+                });
+              }
+            }
+            edgeSet.add(`${callerId}|||${calleeId}`);
+            if (!downVisited.has(calleeId)) {
+              downVisited.add(calleeId);
+              downQueue.push([to, calleeId]);
+            }
+          }
+        } catch (err) {
+          if (err instanceof vscode.CancellationError)
+            throw err;
+          errorsInBatch++;
+          errs.push(`${callerItem.name}: ${String(err)}`);
+        }
+      }));
+      if (errorsInBatch > 0) {
+        adaptiveDelay = Math.min(Math.round(adaptiveDelay * 1.5) + 10, BATCH_DELAY_MAX);
+      } else {
+        adaptiveDelay = Math.max(Math.round(adaptiveDelay * 0.85) - 2, BATCH_DELAY_MIN);
+      }
+      pct.bfsQ(20, 55, downVisited, downQueue);
+      if (adaptiveDelay > 0 && downQueue.length > 0)
+        await delay(adaptiveDelay);
+    }
+    pct.to(55);
+    {
+      const upVisited = /* @__PURE__ */ new Set();
+      const upQueue = [];
+      for (const [coreId, item] of coreItemsMap) {
+        upQueue.push([item, coreId]);
+        upVisited.add(coreId);
+      }
+      let upAdaptiveDelay = BATCH_DELAY_INIT;
+      while (upQueue.length > 0) {
+        checkCancellation(token);
+        const batch = upQueue.splice(0, BATCH_SIZE);
+        let errorsInBatch = 0;
+        await Promise.all(batch.map(async ([calleeItem, calleeId]) => {
+          try {
+            const incoming = await execWithRetry(
+              "vscode.provideIncomingCalls",
+              token,
+              calleeItem
+            );
+            if (!incoming?.length)
+              return;
+            for (const call of incoming) {
+              let callerId = findExistingCalleeId(nodes, call.from);
+              if (!callerId) {
+                if (!isInWorkspace(call.from.uri, wsRoots))
+                  continue;
+                callerId = makeNodeId(call.from.uri, call.from.name, call.from.selectionRange.start.line);
+              }
+              if (!nodes.has(callerId)) {
+                nodes.set(callerId, {
+                  id: callerId,
+                  label: baseNameOf(call.from.name),
+                  labelFull: call.from.name,
+                  file: call.from.uri.fsPath,
+                  line: call.from.selectionRange.start.line + 1,
+                  scopeEnd: call.from.range.end.line + 1,
+                  isCurrentFile: call.from.uri.fsPath === document.uri.fsPath
+                });
+              }
+              edgeSet.add(`${callerId}|||${calleeId}`);
+              if (!upVisited.has(callerId)) {
+                upVisited.add(callerId);
+                upQueue.push([call.from, callerId]);
+              }
+            }
+          } catch (err) {
+            if (err instanceof vscode.CancellationError)
+              throw err;
+            errorsInBatch++;
+            errs.push(`(incoming) ${calleeItem.name}: ${String(err)}`);
+          }
+        }));
+        if (errorsInBatch > 0) {
+          upAdaptiveDelay = Math.min(Math.round(upAdaptiveDelay * 1.5) + 10, BATCH_DELAY_MAX);
+        } else {
+          upAdaptiveDelay = Math.max(Math.round(upAdaptiveDelay * 0.85) - 2, BATCH_DELAY_MIN);
+        }
+        pct.bfsQ(55, 100, upVisited, upQueue);
+        if (upAdaptiveDelay > 0 && upQueue.length > 0)
+          await delay(upAdaptiveDelay);
+      }
+    }
+  }
+  return {
+    nodes: Array.from(nodes.values()),
+    edges: splitEdges(edgeSet),
+    fileName: path.basename(document.uri.fsPath),
+    buildTimeMs: Date.now() - t0,
+    errors: errs
+  };
+}
+async function buildFunctionCallGraphLsp(document, position, maxHops = 4, progress, token) {
+  const t0 = Date.now();
+  const errs = [];
+  const wsRoots = getWorkspaceRoots(document.uri);
+  const pct = new Pct(progress);
+  pct.to(0);
+  checkCancellation(token);
+  const startItems = await execWithRetry(
+    "vscode.prepareCallHierarchy",
+    token,
+    document.uri,
+    position
+  );
+  if (!startItems?.length)
+    throw new Error(
+      "No function found at cursor position.\nPlace the cursor on a function name and try again."
+    );
+  const nodes = /* @__PURE__ */ new Map();
+  const edgeSet = /* @__PURE__ */ new Set();
+  const visited = /* @__PURE__ */ new Set();
+  const startNodeId = makeNodeId(startItems[0].uri, startItems[0].name, startItems[0].selectionRange.start.line);
+  const queued = /* @__PURE__ */ new Set([startNodeId]);
+  const queue = [[startItems[0], 0]];
+  while (queue.length > 0) {
+    checkCancellation(token);
+    const [item, hop] = queue.shift();
+    const nodeId = makeNodeId(item.uri, item.name, item.selectionRange.start.line);
+    if (visited.has(nodeId))
+      continue;
+    visited.add(nodeId);
+    if (!nodes.has(nodeId)) {
+      nodes.set(nodeId, {
+        id: nodeId,
+        label: baseNameOf(item.name),
+        labelFull: item.name,
+        file: item.uri.fsPath,
+        line: item.selectionRange.start.line + 1,
+        scopeEnd: item.range.end.line + 1,
+        isCurrentFile: item.uri.fsPath === document.uri.fsPath
+      });
+    }
+    if (hop >= maxHops)
+      continue;
+    try {
+      const outgoing = await execWithRetry(
+        "vscode.provideOutgoingCalls",
+        token,
+        item
+      );
+      if (!outgoing?.length)
+        continue;
+      for (const call of outgoing) {
+        let calleeId = findExistingCalleeId(nodes, call.to);
+        if (!calleeId) {
+          if (!isInWorkspace(call.to.uri, wsRoots))
+            continue;
+          calleeId = makeNodeId(call.to.uri, call.to.name, call.to.selectionRange.start.line);
+        }
+        edgeSet.add(`${nodeId}|||${calleeId}`);
+        if (!queued.has(calleeId)) {
+          queued.add(calleeId);
+          queue.push([call.to, hop + 1]);
+        }
+      }
+    } catch (err) {
+      if (err instanceof vscode.CancellationError)
+        throw err;
+      errs.push(`${item.name}: ${String(err)}`);
+    }
+    pct.bfsQ(5, 50, queued, queue);
+  }
+  pct.to(50);
+  {
+    const upQueued = /* @__PURE__ */ new Set([startNodeId]);
+    const upQueue = [[startItems[0], 0]];
+    while (upQueue.length > 0) {
+      checkCancellation(token);
+      const [calleeItem, hop] = upQueue.shift();
+      const calleeId = makeNodeId(calleeItem.uri, calleeItem.name, calleeItem.selectionRange.start.line);
+      if (hop >= maxHops)
+        continue;
+      try {
+        const incoming = await execWithRetry(
+          "vscode.provideIncomingCalls",
+          token,
+          calleeItem
+        );
+        if (!incoming?.length)
+          continue;
+        for (const call of incoming) {
+          let callerId = findExistingCalleeId(nodes, call.from);
+          if (!callerId) {
+            if (!isInWorkspace(call.from.uri, wsRoots))
+              continue;
+            callerId = makeNodeId(call.from.uri, call.from.name, call.from.selectionRange.start.line);
+          }
+          if (!nodes.has(callerId)) {
+            nodes.set(callerId, {
+              id: callerId,
+              label: baseNameOf(call.from.name),
+              labelFull: call.from.name,
+              file: call.from.uri.fsPath,
+              line: call.from.selectionRange.start.line + 1,
+              scopeEnd: call.from.range.end.line + 1,
+              isCurrentFile: call.from.uri.fsPath === document.uri.fsPath
+            });
+          }
+          edgeSet.add(`${callerId}|||${calleeId}`);
+          if (!upQueued.has(callerId)) {
+            upQueued.add(callerId);
+            upQueue.push([call.from, hop + 1]);
+          }
+        }
+      } catch (err) {
+        if (err instanceof vscode.CancellationError)
+          throw err;
+        errs.push(`(incoming) ${calleeItem.name}: ${String(err)}`);
+      }
+      pct.bfsQ(50, 100, upQueued, upQueue);
+    }
+  }
+  return {
+    nodes: Array.from(nodes.values()),
+    edges: splitEdges(edgeSet),
+    fileName: `\u2195 ${baseNameOf(startItems[0].name)} (${path.basename(document.uri.fsPath)})`,
+    buildTimeMs: Date.now() - t0,
+    errors: errs
+  };
+}
+async function buildWorkspaceCallGraphLsp(uris, progress, token) {
+  const t0 = Date.now();
+  const errs = [];
+  const uniqueUris = Array.from(new Map(uris.map((u) => [u.fsPath, u])).values()).filter((u) => hasCppSourceExtension(u));
+  const wsRoots = getWorkspaceRoots(uniqueUris[0]);
+  const nodes = /* @__PURE__ */ new Map();
+  const edgeSet = /* @__PURE__ */ new Set();
+  const pct = new Pct(progress);
+  const fileEntries = [];
+  await Promise.all(uniqueUris.map(async (uri, idx) => {
+    checkCancellation(token);
+    let rawSyms;
+    try {
+      rawSyms = await vscode.commands.executeCommand(
+        "vscode.executeDocumentSymbolProvider",
+        uri
+      );
+    } catch {
+      return;
+    }
+    if (!rawSyms?.length)
+      return;
+    const functions = flattenFunctions(rawSyms);
+    for (const f of functions) {
+      const id = makeNodeId(uri, f.name, f.selectionRange.start.line);
+      if (!nodes.has(id)) {
+        nodes.set(id, {
+          id,
+          label: baseNameOf(f.name),
+          labelFull: f.name,
+          file: uri.fsPath,
+          line: f.selectionRange.start.line + 1,
+          scopeEnd: f.range.end.line + 1,
+          isCurrentFile: false
+        });
+      }
+    }
+    pct.range(0, 40, idx + 1, uniqueUris.length);
+    fileEntries.push({ uri, functions });
+  }));
+  for (let fi = 0; fi < fileEntries.length; fi++) {
+    checkCancellation(token);
+    const { uri, functions } = fileEntries[fi];
+    pct.range(40, 100, fi + 1, fileEntries.length);
+    let adaptiveDelay = BATCH_DELAY_INIT;
+    for (let i = 0; i < functions.length; i += BATCH_SIZE) {
+      checkCancellation(token);
+      const processingIds = /* @__PURE__ */ new Set();
+      let errorsInBatch = 0;
+      await Promise.all(functions.slice(i, i + BATCH_SIZE).map(async (func) => {
+        try {
+          const items = await execWithRetry(
+            "vscode.prepareCallHierarchy",
+            token,
+            uri,
+            func.selectionRange.start
+          );
+          if (!items?.length)
+            return;
+          const outgoing = await execWithRetry(
+            "vscode.provideOutgoingCalls",
+            token,
+            items[0]
+          );
+          if (!outgoing?.length)
+            return;
+          const callerId = makeNodeId(uri, func.name, func.selectionRange.start.line);
+          for (const call of outgoing) {
+            const { to } = call;
+            let calleeId = findExistingCalleeId(nodes, to);
+            if (!calleeId) {
+              if (!shouldIncludeCallee(to.uri, wsRoots))
+                continue;
+              calleeId = makeNodeId(to.uri, to.name, to.selectionRange.start.line);
+              if (!nodes.has(calleeId) && !processingIds.has(calleeId)) {
+                processingIds.add(calleeId);
+                if (!nodes.has(calleeId)) {
+                  nodes.set(calleeId, {
+                    id: calleeId,
+                    label: baseNameOf(to.name),
+                    labelFull: to.name,
+                    file: to.uri.fsPath,
+                    line: to.selectionRange.start.line + 1,
+                    scopeEnd: to.range.end.line + 1,
+                    isCurrentFile: false
+                  });
+                }
+              }
+            }
+            edgeSet.add(`${callerId}|||${calleeId}`);
+          }
+        } catch (err) {
+          if (err instanceof vscode.CancellationError)
+            throw err;
+          errorsInBatch++;
+          errs.push(`${path.basename(uri.fsPath)}::${func.name}: ${String(err)}`);
+        }
+      }));
+      if (errorsInBatch > 0) {
+        adaptiveDelay = Math.min(Math.round(adaptiveDelay * 1.5) + 10, BATCH_DELAY_MAX);
+      } else {
+        adaptiveDelay = Math.max(Math.round(adaptiveDelay * 0.85) - 2, BATCH_DELAY_MIN);
+      }
+      if (adaptiveDelay > 0 && i + BATCH_SIZE < functions.length)
+        await delay(adaptiveDelay);
+    }
+  }
+  const label = uniqueUris.length === 1 ? path.basename(uniqueUris[0].fsPath) : `${uniqueUris.length} files`;
+  return {
+    nodes: Array.from(nodes.values()),
+    edges: splitEdges(edgeSet),
+    fileName: label,
+    buildTimeMs: Date.now() - t0,
+    errors: errs
+  };
+}
+function isLikelyFuncDef(line) {
+  const s = line.trim();
+  if (!s || s.startsWith("#") || s.startsWith("}"))
+    return false;
+  if (s.includes("typedef") || !s.includes("(") || s.endsWith(";"))
+    return false;
+  if (/=\s*(0|delete|default)\s*[;,]?\s*$/.test(s))
+    return false;
+  return true;
+}
+function spawnErrorMessage(cmd, err) {
+  const msg = String(err);
+  if (msg.includes("ENOTDIR")) {
+    return `[gtags] Failed to launch ${cmd} (ENOTDIR).
+Your PATH may contain Windows-style paths (e.g. C:\\Windows\\System32) in WSL.
+Fix: add "export PATH=$(echo $PATH | tr ':' '\\n' | grep -v '^/mnt/' | tr '\\n' ':')" to ~/.bashrc`;
+  }
+  if (msg.includes("ENOENT")) {
+    return `[gtags] ${cmd} not found. Check that the gtags/global install directory is in your PATH.`;
+  }
+  return `[gtags] Failed to launch ${cmd}: ${msg}`;
+}
+async function ensureGtagsDb(wsRoot) {
+  const now = Date.now();
+  if (fs.existsSync(path.join(wsRoot, "GTAGS"))) {
+    const last = gtagsUpdateCache.get(wsRoot) ?? 0;
+    if (now - last < GTAGS_UPDATE_TTL)
+      return void 0;
+    try {
+      await execFileAsync("global", ["-u"], { cwd: wsRoot, timeout: 12e4 });
+      gtagsUpdateCache.set(wsRoot, now);
+    } catch (updateErr) {
+      try {
+        await execFileAsync("gtags", ["--accept-dotfiles"], { cwd: wsRoot, timeout: 12e4 });
+        gtagsUpdateCache.set(wsRoot, now);
+      } catch (rebuildErr) {
+        return spawnErrorMessage("global -u / gtags rebuild", rebuildErr);
+      }
+    }
+  } else {
+    await execFileAsync("gtags", ["--accept-dotfiles"], { cwd: wsRoot, timeout: 12e4 });
+    gtagsUpdateCache.set(wsRoot, now);
+  }
+  return void 0;
+}
+function sanitizeToWsRoot(rawPath, wsRoot) {
+  const fp = path.isAbsolute(rawPath) ? rawPath : path.resolve(wsRoot, rawPath);
+  const wsRootSlash = wsRoot.endsWith(path.sep) ? wsRoot : wsRoot + path.sep;
+  if (!(fp.startsWith(wsRootSlash) || fp === wsRoot))
+    return null;
+  try {
+    const realFp = fs.realpathSync(fp);
+    const realRoot = fs.realpathSync(wsRoot);
+    const realSlash = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep;
+    if (!(realFp.startsWith(realSlash) || realFp === realRoot))
+      return null;
+  } catch {
+    return null;
+  }
+  return fp;
+}
+async function runGlobalF(absFile, wsRoot) {
+  try {
+    const relFile = path.relative(wsRoot, absFile);
+    const { stdout } = await execFileAsync("global", ["-f", relFile], {
+      cwd: wsRoot,
+      maxBuffer: 10 * 1024 * 1024
+    });
+    return stdout.split("\n").flatMap((line) => {
+      const parts = line.split(/\s+/);
+      if (parts.length < 3)
+        return [];
+      const name = parts[0];
+      const lineno = parseInt(parts[1], 10);
+      if (!name || isNaN(lineno))
+        return [];
+      const fp = sanitizeToWsRoot(parts[2], wsRoot);
+      if (!fp)
+        return [];
+      return [{ name, line: lineno, file: fp }];
+    });
+  } catch {
+    return [];
+  }
+}
+function readFileLinesCached(filePath, cache) {
+  if (cache.has(filePath))
+    return cache.get(filePath);
+  try {
+    const lines = fs.readFileSync(filePath, "utf-8").split("\n");
+    cache.set(filePath, lines);
+    return lines;
+  } catch {
+    cache.set(filePath, []);
+    return [];
+  }
+}
+async function runGlobalXAll(wsRoot) {
+  const { stdout } = await execFileAsync("global", ["-x", "-e", "."], {
+    cwd: wsRoot,
+    maxBuffer: 200 * 1024 * 1024,
+    timeout: 12e4
+  });
+  return stdout.split("\n").flatMap((raw) => {
+    const trimmed = raw.trimEnd();
+    if (!trimmed)
+      return [];
+    const m = trimmed.match(/^(\S+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+    if (!m)
+      return [];
+    const [, name, lineStr, fileStr, sourceLine] = m;
+    const line = parseInt(lineStr, 10);
+    if (isNaN(line))
+      return [];
+    const file = sanitizeToWsRoot(fileStr, wsRoot);
+    if (!file)
+      return [];
+    return [{ name, line, file, sourceLine }];
+  });
+}
+async function collectGtags(files, wsRoot) {
+  const lineCache = /* @__PURE__ */ new Map();
+  let rawEntries;
+  try {
+    rawEntries = await runGlobalXAll(wsRoot);
+  } catch {
+    const perFileResults = [];
+    const CONCURRENT = Math.min(16, Math.max(1, files.length));
+    for (let i = 0; i < files.length; i += CONCURRENT) {
+      const results = await Promise.all(
+        files.slice(i, i + CONCURRENT).map((f) => runGlobalF(f, wsRoot))
+      );
+      for (const entries of results)
+        perFileResults.push(...entries);
+    }
+    rawEntries = perFileResults.map((e) => ({ ...e, sourceLine: "" }));
+  }
+  const rawMap = /* @__PURE__ */ new Map();
+  for (const e of rawEntries) {
+    if (!rawMap.has(e.name))
+      rawMap.set(e.name, []);
+    rawMap.get(e.name).push(e);
+  }
+  const tags = /* @__PURE__ */ new Map();
+  const ambiguousNames = [];
+  for (const [name, candidates] of rawMap) {
+    const distinctFiles = new Set(candidates.map((c) => c.file));
+    if (distinctFiles.size > 1)
+      ambiguousNames.push(name);
+    const entries = candidates.map((cand) => {
+      let sourceLine = cand.sourceLine;
+      if (!sourceLine) {
+        const ll = readFileLinesCached(cand.file, lineCache);
+        sourceLine = ll[cand.line - 1]?.trimEnd() ?? "";
+      }
+      return { name, file: cand.file, line: cand.line, sourceLine, isFunc: isLikelyFuncDef(sourceLine) };
+    });
+    tags.set(name, entries);
+  }
+  return { tags, lineCache, ambiguousNames };
+}
+function buildGtagsScopeMap(tags) {
+  const fileMap = /* @__PURE__ */ new Map();
+  for (const [name, entries] of tags) {
+    for (const info of entries) {
+      if (!info.isFunc)
+        continue;
+      if (!fileMap.has(info.file))
+        fileMap.set(info.file, []);
+      fileMap.get(info.file).push({ name, line: info.line });
+    }
+  }
+  const scopeMap = /* @__PURE__ */ new Map();
+  for (const [fp, entries] of fileMap) {
+    entries.sort((a, b) => a.line - b.line);
+    const list = entries.map((e, i) => ({
+      name: e.name,
+      start: e.line,
+      end: i + 1 < entries.length ? entries[i + 1].line - 1 : Number.MAX_SAFE_INTEGER
+    }));
+    const byName = /* @__PURE__ */ new Map();
+    for (const s of list) {
+      if (!byName.has(s.name))
+        byName.set(s.name, s);
+    }
+    scopeMap.set(fp, { list, byName });
+  }
+  return scopeMap;
+}
+function extractCallsFromLines(lines, start, end, knownTags, selfName) {
+  const callees = /* @__PURE__ */ new Set();
+  const re = /\b([A-Za-z_]\w*)\s*\(/g;
+  let inBlockComment = false;
+  let rawDelimiter = "";
+  for (let i = start - 1; i < Math.min(end, lines.length); i++) {
+    const line = lines[i];
+    let processed = "";
+    let j = 0;
+    while (j < line.length) {
+      if (rawDelimiter) {
+        const endIdx = line.indexOf(rawDelimiter, j);
+        if (endIdx === -1) {
+          j = line.length;
+        } else {
+          j = endIdx + rawDelimiter.length;
+          rawDelimiter = "";
+        }
+        continue;
+      }
+      if (inBlockComment) {
+        const endIdx = line.indexOf("*/", j);
+        if (endIdx === -1) {
+          j = line.length;
+        } else {
+          inBlockComment = false;
+          j = endIdx + 2;
+        }
+        continue;
+      }
+      const ch = line[j];
+      const ch2 = j + 1 < line.length ? line[j] + line[j + 1] : "";
+      if (ch === "R" && j + 1 < line.length && line[j + 1] === '"') {
+        j += 2;
+        const parenIdx = line.indexOf("(", j);
+        if (parenIdx === -1) {
+          processed += ch;
+          j--;
+        } else {
+          const delim = line.slice(j, parenIdx);
+          const terminator = ")" + delim + '"';
+          j = parenIdx + 1;
+          const endIdx = line.indexOf(terminator, j);
+          if (endIdx !== -1) {
+            j = endIdx + terminator.length;
+          } else {
+            rawDelimiter = terminator;
+            j = line.length;
+          }
+        }
+        continue;
+      }
+      if (ch === '"') {
+        j++;
+        while (j < line.length) {
+          if (line[j] === "\\") {
+            j += 2;
+          } else if (line[j] === '"') {
+            j++;
+            break;
+          } else {
+            j++;
+          }
+        }
+      } else if (ch === "'") {
+        j++;
+        while (j < line.length) {
+          if (line[j] === "\\") {
+            j += 2;
+          } else if (line[j] === "'") {
+            j++;
+            break;
+          } else {
+            j++;
+          }
+        }
+      } else if (ch2 === "//") {
+        j = line.length;
+      } else if (ch2 === "/*") {
+        inBlockComment = true;
+        j += 2;
+      } else {
+        processed += ch;
+        j++;
+      }
+    }
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(processed)) !== null) {
+      const callee = m[1];
+      if (callee !== selfName && knownTags.has(callee))
+        callees.add(callee);
+    }
+  }
+  return callees;
+}
+function resolveCalleeScope(scopeMap, file, name, line) {
+  const entry = scopeMap.get(file);
+  if (!entry)
+    return void 0;
+  return findScopeAtLine(entry.list, line) ?? entry.byName.get(name);
+}
+function makeGtagsNodeId(file, name, line) {
+  return `${file}||${name}||${line}`;
+}
+function parseGtagsNodeId(id) {
+  const lastSep = id.lastIndexOf("||");
+  const line = parseInt(id.slice(lastSep + 2), 10);
+  const rest = id.slice(0, lastSep);
+  const nameSep = rest.lastIndexOf("||");
+  return { file: rest.slice(0, nameSep), name: rest.slice(nameSep + 2), line };
+}
+function resolveCallee(candidates, callerFile) {
+  if (!candidates?.length)
+    return void 0;
+  return candidates.find((c) => c.file === callerFile && c.isFunc) ?? candidates.find((c) => c.isFunc) ?? candidates[0];
+}
+function escapeRegexForGlobal(name) {
+  return name.replace(/[.+*?^${}()|[\]\\]/g, "\\$&");
+}
+function findScopeAtLine(list, refLine) {
+  let lo = 0, hi = list.length - 1;
+  while (lo <= hi) {
+    const mid = lo + hi >> 1;
+    const s = list[mid];
+    if (refLine < s.start)
+      hi = mid - 1;
+    else if (refLine > s.end)
+      lo = mid + 1;
+    else
+      return s;
+  }
+  return void 0;
+}
+async function buildEdgesGlobalRx(callerFiles, tags, scopeMap, wsRoot, token, pct, startPct = 20, endPct = 75) {
+  const edgeSet = /* @__PURE__ */ new Set();
+  const funcNames = Array.from(tags.entries()).filter(([, entries]) => entries.some((e) => e.isFunc)).map(([name]) => name);
+  const batchArrays = [];
+  for (let i = 0; i < funcNames.length; i += GLOBAL_RX_BATCH) {
+    batchArrays.push(funcNames.slice(i, i + GLOBAL_RX_BATCH));
+  }
+  const totalGroups = Math.ceil(batchArrays.length / GLOBAL_RX_PARALLEL);
+  for (let gi = 0; gi < batchArrays.length; gi += GLOBAL_RX_PARALLEL) {
+    checkCancellation(token);
+    pct?.range(startPct, endPct, Math.floor(gi / GLOBAL_RX_PARALLEL), totalGroups);
+    await Promise.all(batchArrays.slice(gi, gi + GLOBAL_RX_PARALLEL).map(async (batch) => {
+      const pattern = batch.map(escapeRegexForGlobal).join("|");
+      let stdout = "";
+      try {
+        ({ stdout } = await execFileAsync("global", ["-rx", "-e", pattern], {
+          cwd: wsRoot,
+          maxBuffer: 50 * 1024 * 1024,
+          timeout: 6e4
+        }));
+      } catch {
+        return;
+      }
+      for (const rawLine of stdout.split("\n")) {
+        const parts = rawLine.trim().split(/\s+/);
+        if (parts.length < 3)
+          continue;
+        const calleeName = parts[0];
+        const refLine = parseInt(parts[1], 10);
+        if (!calleeName || isNaN(refLine))
+          continue;
+        const refFile = sanitizeToWsRoot(parts[2], wsRoot);
+        if (!refFile || !callerFiles.has(refFile))
+          continue;
+        const fileScopeEntry = scopeMap.get(refFile);
+        if (!fileScopeEntry)
+          continue;
+        const callerScope = findScopeAtLine(fileScopeEntry.list, refLine);
+        if (!callerScope)
+          continue;
+        const callerEntry = tags.get(callerScope.name)?.find((e) => e.file === refFile && e.isFunc) ?? resolveCallee(tags.get(callerScope.name), refFile);
+        if (!callerEntry)
+          continue;
+        const calleeEntry = resolveCallee(tags.get(calleeName), refFile);
+        if (!calleeEntry?.isFunc)
+          continue;
+        const calleeScope = resolveCalleeScope(scopeMap, calleeEntry.file, calleeName, calleeEntry.line);
+        if (!calleeScope)
+          continue;
+        if (callerScope.name === calleeName && callerEntry.file === calleeEntry.file)
+          continue;
+        const callerId = makeGtagsNodeId(refFile, callerScope.name, callerEntry.line);
+        const calleeId = makeGtagsNodeId(calleeEntry.file, calleeName, calleeEntry.line);
+        edgeSet.add(`${callerId}|||${calleeId}`);
+      }
+    }));
+  }
+  return edgeSet;
+}
+function gtagsEntryToNode(name, entry, scope, currentFile) {
+  const scopeEnd = scope.end === Number.MAX_SAFE_INTEGER ? scope.start + MAX_SOURCE_LINES - 1 : scope.end;
+  const isCurrentFile = currentFile !== "" && normalizeFsPath(entry.file) === normalizeFsPath(currentFile);
+  return {
+    id: makeGtagsNodeId(entry.file, name, entry.line),
+    label: name,
+    labelFull: entry.sourceLine || name,
+    file: entry.file,
+    line: entry.line,
+    scopeEnd,
+    isCurrentFile
+  };
+}
+async function buildFileCallGraphGtags(document, progress, token) {
+  const t0 = Date.now();
+  const errs = [];
+  const wsRoot = getWorkspaceRootForFile(document.uri);
+  if (!wsRoot)
+    throw new Error("No workspace folder is open.");
+  const pct = new Pct(progress);
+  pct.to(0);
+  checkCancellation(token);
+  {
+    const w = await ensureGtagsDb(wsRoot);
+    if (w)
+      errs.push(w);
+  }
+  pct.to(5);
+  const allUris = await vscode.workspace.findFiles(CC_ALL_GLOB, EXCLUDE_GLOB);
+  pct.to(8);
+  checkCancellation(token);
+  const { tags, lineCache, ambiguousNames } = await collectGtags(allUris.map((u) => u.fsPath), wsRoot);
+  if (!tags.size)
+    throw new Error(
+      "No tags found.\nPlease verify that gtags is installed and GTAGS exists."
+    );
+  if (ambiguousNames.length > 0) {
+    const preview = ambiguousNames.slice(0, 5).join(", ");
+    const suffix = ambiguousNames.length > 5 ? ` and ${ambiguousNames.length - 5} more` : "";
+    errs.push(`[gtags] Duplicate function names across files (resolved by callerFile priority): ${preview}${suffix}`);
+  }
+  const currentFile = document.uri.fsPath;
+  const currentFileNorm = normalizeFsPath(currentFile);
+  const currentLines = document.getText().split("\n");
+  lineCache.set(currentFileNorm, currentLines);
+  lineCache.set(currentFile, currentLines);
+  const scopeMap = buildGtagsScopeMap(tags);
+  const fileScopes = findScopeMapEntry(scopeMap, currentFile)?.list ?? [];
+  const nodes = /* @__PURE__ */ new Map();
+  for (const scope of fileScopes) {
+    const entry = tags.get(scope.name)?.find(
+      (e) => normalizeFsPath(e.file) === currentFileNorm && e.isFunc
+    );
+    if (!entry)
+      continue;
+    const nodeId = makeGtagsNodeId(entry.file, scope.name, entry.line);
+    nodes.set(nodeId, gtagsEntryToNode(scope.name, entry, scope, currentFile));
+  }
+  if (!nodes.size)
+    throw new Error("No functions found in this file.");
+  pct.to(20);
+  checkCancellation(token);
+  const callerFiles = /* @__PURE__ */ new Set([currentFile, currentFileNorm]);
+  for (const scope of fileScopes) {
+    const e = tags.get(scope.name)?.find(
+      (e2) => normalizeFsPath(e2.file) === currentFileNorm && e2.isFunc
+    );
+    if (e)
+      callerFiles.add(e.file);
+  }
+  const edgeSet = await buildEdgesGlobalRx(callerFiles, tags, scopeMap, wsRoot, token, pct, 20, 75);
+  for (const edgeKey of edgeSet) {
+    const calleeId = edgeKey.split("|||")[1];
+    if (nodes.has(calleeId))
+      continue;
+    const { file: calleeFile, name: calleeName } = parseGtagsNodeId(calleeId);
+    const calleeEntry = tags.get(calleeName)?.find((e) => e.file === calleeFile && e.isFunc);
+    if (!calleeEntry)
+      continue;
+    const calleeScope = resolveCalleeScope(scopeMap, calleeFile, calleeName, calleeEntry.line);
+    if (!calleeScope)
+      continue;
+    nodes.set(calleeId, gtagsEntryToNode(calleeName, calleeEntry, calleeScope, currentFile));
+  }
+  pct.to(75);
+  {
+    const knownTags = new Set(tags.keys());
+    const downVisited = /* @__PURE__ */ new Set();
+    for (const scope of fileScopes) {
+      const entry = tags.get(scope.name)?.find(
+        (e) => normalizeFsPath(e.file) === currentFileNorm && e.isFunc
+      );
+      if (!entry)
+        continue;
+      downVisited.add(makeGtagsNodeId(entry.file, scope.name, entry.line));
+    }
+    const downQueue = [];
+    for (const nodeId of nodes.keys()) {
+      if (downVisited.has(nodeId))
+        continue;
+      downVisited.add(nodeId);
+      const { file: nFile, name: nName } = parseGtagsNodeId(nodeId);
+      const entry = tags.get(nName)?.find((e) => e.file === nFile && e.isFunc);
+      if (!entry)
+        continue;
+      const scope = resolveCalleeScope(scopeMap, nFile, nName, entry.line);
+      if (!scope)
+        continue;
+      downQueue.push({ name: nName, entry, scope });
+    }
+    while (downQueue.length > 0) {
+      checkCancellation(token);
+      const { name, entry, scope } = downQueue.shift();
+      const callerId = makeGtagsNodeId(entry.file, name, entry.line);
+      const lines = readFileLinesCached(entry.file, lineCache);
+      const callees = extractCallsFromLines(lines, scope.start, scope.end, knownTags, name);
+      for (const callee of callees) {
+        const calleeEntry = resolveCallee(tags.get(callee), entry.file);
+        if (!calleeEntry || !calleeEntry.isFunc)
+          continue;
+        const calleeScope = resolveCalleeScope(scopeMap, calleeEntry.file, callee, calleeEntry.line);
+        if (!calleeScope)
+          continue;
+        const calleeId = makeGtagsNodeId(calleeEntry.file, callee, calleeEntry.line);
+        edgeSet.add(`${callerId}|||${calleeId}`);
+        if (!nodes.has(calleeId)) {
+          nodes.set(calleeId, gtagsEntryToNode(callee, calleeEntry, calleeScope, currentFile));
+        }
+        if (!downVisited.has(calleeId)) {
+          downVisited.add(calleeId);
+          downQueue.push({ name: callee, entry: calleeEntry, scope: calleeScope });
+        }
+      }
+      pct.bfsQ(75, 88, downVisited, downQueue);
+    }
+  }
+  pct.to(88);
+  {
+    const upVisited = /* @__PURE__ */ new Set();
+    const upQueue = [];
+    for (const scope of fileScopes) {
+      const entry = tags.get(scope.name)?.find(
+        (e) => normalizeFsPath(e.file) === currentFileNorm && e.isFunc
+      );
+      if (!entry)
+        continue;
+      const coreId = makeGtagsNodeId(entry.file, scope.name, entry.line);
+      upVisited.add(coreId);
+      upQueue.push({ funcName: scope.name, calleeId: coreId });
+    }
+    while (upQueue.length > 0) {
+      checkCancellation(token);
+      const { funcName, calleeId } = upQueue.shift();
+      for (const { refFile, refLine } of await runGlobalRxSingle(funcName, wsRoot)) {
+        checkCancellation(token);
+        const fileScopeEntry = scopeMap.get(refFile);
+        if (!fileScopeEntry)
+          continue;
+        const callerScope = findScopeAtLine(fileScopeEntry.list, refLine);
+        if (!callerScope || callerScope.name === funcName)
+          continue;
+        const callerEntry = tags.get(callerScope.name)?.find((e) => e.file === refFile && e.isFunc) ?? resolveCallee(tags.get(callerScope.name), refFile);
+        if (!callerEntry)
+          continue;
+        const callerId = makeGtagsNodeId(callerEntry.file, callerScope.name, callerEntry.line);
+        edgeSet.add(`${callerId}|||${calleeId}`);
+        if (!nodes.has(callerId)) {
+          nodes.set(callerId, gtagsEntryToNode(
+            callerScope.name,
+            callerEntry,
+            callerScope,
+            currentFile
+          ));
+        }
+        if (!upVisited.has(callerId)) {
+          upVisited.add(callerId);
+          upQueue.push({ funcName: callerScope.name, calleeId: callerId });
+        }
+      }
+      pct.bfsQ(88, 100, upVisited, upQueue);
+    }
+  }
+  return {
+    nodes: Array.from(nodes.values()),
+    edges: splitEdges(edgeSet),
+    fileName: path.basename(currentFile),
+    buildTimeMs: Date.now() - t0,
+    errors: errs
+  };
+}
+async function buildFunctionCallGraphGtags(document, position, maxHops = 4, progress, token) {
+  const t0 = Date.now();
+  const errs = [];
+  const wsRoot = getWorkspaceRootForFile(document.uri);
+  if (!wsRoot)
+    throw new Error("No workspace folder is open.");
+  const pct = new Pct(progress);
+  pct.to(0);
+  checkCancellation(token);
+  {
+    const w = await ensureGtagsDb(wsRoot);
+    if (w)
+      errs.push(w);
+  }
+  pct.to(5);
+  checkCancellation(token);
+  const allUris = await vscode.workspace.findFiles(CC_ALL_GLOB, EXCLUDE_GLOB);
+  const { tags, lineCache, ambiguousNames } = await collectGtags(allUris.map((u) => u.fsPath), wsRoot);
+  if (!tags.size)
+    throw new Error("No tags found.");
+  if (ambiguousNames.length > 0) {
+    const preview = ambiguousNames.slice(0, 5).join(", ");
+    const suffix = ambiguousNames.length > 5 ? ` and ${ambiguousNames.length - 5} more` : "";
+    errs.push(`[gtags] Duplicate function names across files (resolved by callerFile priority): ${preview}${suffix}`);
+  }
+  const currentFile = document.uri.fsPath;
+  const currentLines = document.getText().split("\n");
+  lineCache.set(currentFile, currentLines);
+  lineCache.set(normalizeFsPath(currentFile), currentLines);
+  const knownTags = new Set(tags.keys());
+  const scopeMap = buildGtagsScopeMap(tags);
+  const cursorLine = position.line + 1;
+  const fileScopes = findScopeMapEntry(scopeMap, currentFile)?.list ?? [];
+  const startScope = fileScopes.find((s) => s.start <= cursorLine && cursorLine <= s.end);
+  if (!startScope)
+    throw new Error(
+      "No function found at cursor position.\nPlace the cursor on a function name and try again."
+    );
+  const currentFileNorm2 = normalizeFsPath(currentFile);
+  const startEntry = tags.get(startScope.name)?.find((e) => normalizeFsPath(e.file) === currentFileNorm2 && e.isFunc) ?? tags.get(startScope.name)?.find((e) => e.isFunc) ?? tags.get(startScope.name)?.[0];
+  if (!startEntry)
+    throw new Error("Tag info for the start function was not found.");
+  const nodes = /* @__PURE__ */ new Map();
+  const edgeSet = /* @__PURE__ */ new Set();
+  const startNodeId = makeGtagsNodeId(startEntry.file, startScope.name, startEntry.line);
+  const visited = /* @__PURE__ */ new Set();
+  const queued = /* @__PURE__ */ new Set([startNodeId]);
+  const queue = [{ name: startScope.name, entry: startEntry, scope: startScope, hop: 0 }];
+  while (queue.length > 0) {
+    checkCancellation(token);
+    const { name, entry, scope, hop } = queue.shift();
+    const nodeId = makeGtagsNodeId(entry.file, name, entry.line);
+    if (visited.has(nodeId))
+      continue;
+    visited.add(nodeId);
+    const lines = readFileLinesCached(entry.file, lineCache);
+    nodes.set(nodeId, gtagsEntryToNode(name, entry, scope, currentFile));
+    if (hop >= maxHops)
+      continue;
+    const callees = extractCallsFromLines(lines, scope.start, scope.end, knownTags, name);
+    for (const callee of callees) {
+      const calleeEntry = resolveCallee(tags.get(callee), entry.file);
+      if (!calleeEntry || !calleeEntry.isFunc)
+        continue;
+      const calleeScope = resolveCalleeScope(scopeMap, calleeEntry.file, callee, calleeEntry.line);
+      if (!calleeScope)
+        continue;
+      const calleeId = makeGtagsNodeId(calleeEntry.file, callee, calleeEntry.line);
+      edgeSet.add(`${nodeId}|||${calleeId}`);
+      if (!queued.has(calleeId)) {
+        queued.add(calleeId);
+        queue.push({ name: callee, entry: calleeEntry, scope: calleeScope, hop: hop + 1 });
+      }
+    }
+    pct.bfsQ(20, 100, queued, queue);
+  }
+  return {
+    nodes: Array.from(nodes.values()),
+    edges: splitEdges(edgeSet),
+    fileName: `${startScope.name} (${path.basename(currentFile)})`,
+    buildTimeMs: Date.now() - t0,
+    errors: errs
+  };
+}
+async function buildWorkspaceCallGraphGtags(uris, progress, token) {
+  const t0 = Date.now();
+  const errs = [];
+  const uniqueUris = Array.from(new Map(uris.map((u) => [u.fsPath, u])).values()).filter((u) => CC_SOURCE_EXTENSIONS.has(path.extname(u.fsPath).toLowerCase()));
+  if (!uniqueUris.length)
+    throw new Error("No C/C++ source files found.");
+  const wsRoot = getWorkspaceRootForFile(uniqueUris[0]);
+  if (!wsRoot)
+    throw new Error("No workspace folder is open.");
+  const pct = new Pct(progress);
+  pct.to(0);
+  checkCancellation(token);
+  {
+    const w = await ensureGtagsDb(wsRoot);
+    if (w)
+      errs.push(w);
+  }
+  pct.to(5);
+  checkCancellation(token);
+  const allUris = await vscode.workspace.findFiles(CC_ALL_GLOB, EXCLUDE_GLOB);
+  const { tags, lineCache, ambiguousNames } = await collectGtags(allUris.map((u) => u.fsPath), wsRoot);
+  if (!tags.size)
+    throw new Error("No tags found. Run `gtags` in the workspace root, or check that GTAGS/GRTAGS/GPATH files exist.");
+  if (ambiguousNames.length > 0) {
+    const preview = ambiguousNames.slice(0, 5).join(", ");
+    const suffix = ambiguousNames.length > 5 ? ` and ${ambiguousNames.length - 5} more` : "";
+    errs.push(`[gtags] Duplicate function names across files (resolved by callerFile priority): ${preview}${suffix}`);
+  }
+  const scopeMap = buildGtagsScopeMap(tags);
+  const nodes = /* @__PURE__ */ new Map();
+  const callerFiles = /* @__PURE__ */ new Set();
+  for (const uri of uniqueUris) {
+    callerFiles.add(uri.fsPath);
+    callerFiles.add(normalizeFsPath(uri.fsPath));
+  }
+  pct.to(20);
+  for (const uri of uniqueUris) {
+    checkCancellation(token);
+    const fileScopes = findScopeMapEntry(scopeMap, uri.fsPath)?.list ?? [];
+    for (const scope of fileScopes) {
+      const entry = tags.get(scope.name)?.find(
+        (e) => normalizeFsPath(e.file) === normalizeFsPath(uri.fsPath) && e.isFunc
+      );
+      if (!entry)
+        continue;
+      callerFiles.add(entry.file);
+      const nodeId = makeGtagsNodeId(entry.file, scope.name, entry.line);
+      if (!nodes.has(nodeId))
+        nodes.set(nodeId, gtagsEntryToNode(scope.name, entry, scope, ""));
+    }
+  }
+  pct.to(30);
+  checkCancellation(token);
+  const edgeSet = await buildEdgesGlobalRx(callerFiles, tags, scopeMap, wsRoot, token, pct, 30, 90);
+  for (const edgeKey of edgeSet) {
+    const calleeId = edgeKey.split("|||")[1];
+    if (nodes.has(calleeId))
+      continue;
+    const { file: calleeFile, name: calleeName } = parseGtagsNodeId(calleeId);
+    const calleeEntry = tags.get(calleeName)?.find((e) => e.file === calleeFile && e.isFunc);
+    if (!calleeEntry)
+      continue;
+    const calleeScope = resolveCalleeScope(scopeMap, calleeFile, calleeName, calleeEntry.line);
+    if (!calleeScope)
+      continue;
+    nodes.set(calleeId, gtagsEntryToNode(calleeName, calleeEntry, calleeScope, ""));
+  }
+  const label = uniqueUris.length === 1 ? path.basename(uniqueUris[0].fsPath) : `${uniqueUris.length} files`;
+  return {
+    nodes: Array.from(nodes.values()),
+    edges: splitEdges(edgeSet),
+    fileName: label,
+    buildTimeMs: Date.now() - t0,
+    errors: errs
+  };
+}
+async function runGlobalRxSingle(funcName, wsRoot) {
+  try {
+    const { stdout } = await execFileAsync(
+      "global",
+      ["-rx", funcName],
+      { cwd: wsRoot, maxBuffer: 10 * 1024 * 1024, timeout: 3e4 }
+    );
+    return stdout.split("\n").flatMap((line) => {
+      const parts = line.trim().split(/\s+/);
+      if (parts.length < 3)
+        return [];
+      const refLine = parseInt(parts[1], 10);
+      if (isNaN(refLine))
+        return [];
+      const refFile = sanitizeToWsRoot(parts[2], wsRoot);
+      if (!refFile)
+        return [];
+      return [{ refFile, refLine }];
+    });
+  } catch {
+    return [];
+  }
+}
+async function buildPathThroughCallGraphGtags(document, position, maxHops = 4, progress, token) {
+  const t0 = Date.now();
+  const errs = [];
+  const wsRoot = getWorkspaceRootForFile(document.uri);
+  if (!wsRoot)
+    throw new Error("No workspace folder is open.");
+  const pct = new Pct(progress);
+  pct.to(0);
+  checkCancellation(token);
+  {
+    const w = await ensureGtagsDb(wsRoot);
+    if (w)
+      errs.push(w);
+  }
+  pct.to(5);
+  checkCancellation(token);
+  const allUris = await vscode.workspace.findFiles(CC_ALL_GLOB, EXCLUDE_GLOB);
+  const { tags, lineCache, ambiguousNames } = await collectGtags(allUris.map((u) => u.fsPath), wsRoot);
+  if (!tags.size)
+    throw new Error("No tags found.");
+  if (ambiguousNames.length > 0) {
+    const preview = ambiguousNames.slice(0, 5).join(", ");
+    const suffix = ambiguousNames.length > 5 ? ` and ${ambiguousNames.length - 5} more` : "";
+    errs.push(`[gtags] Duplicate function names across files (resolved by callerFile priority): ${preview}${suffix}`);
+  }
+  const currentFile = document.uri.fsPath;
+  const currentLines = document.getText().split("\n");
+  lineCache.set(currentFile, currentLines);
+  lineCache.set(normalizeFsPath(currentFile), currentLines);
+  const knownTags = new Set(tags.keys());
+  const scopeMap = buildGtagsScopeMap(tags);
+  const cursorLine = position.line + 1;
+  const fileScopes = findScopeMapEntry(scopeMap, currentFile)?.list ?? [];
+  const startScope = fileScopes.find((s) => s.start <= cursorLine && cursorLine <= s.end);
+  if (!startScope)
+    throw new Error(
+      "No function found at cursor position.\nPlace the cursor on a function name and try again."
+    );
+  const currentFileNorm2 = normalizeFsPath(currentFile);
+  const startEntry = tags.get(startScope.name)?.find((e) => normalizeFsPath(e.file) === currentFileNorm2 && e.isFunc) ?? tags.get(startScope.name)?.find((e) => e.isFunc) ?? tags.get(startScope.name)?.[0];
+  if (!startEntry)
+    throw new Error("Tag info for the start function was not found.");
+  const startNodeId = makeGtagsNodeId(startEntry.file, startScope.name, startEntry.line);
+  const nodes = /* @__PURE__ */ new Map();
+  const edgeSet = /* @__PURE__ */ new Set();
+  pct.to(20);
+  {
+    const visited = /* @__PURE__ */ new Set();
+    const queued = /* @__PURE__ */ new Set([startNodeId]);
+    const queue = [{ name: startScope.name, entry: startEntry, scope: startScope, hop: 0 }];
+    while (queue.length > 0) {
+      checkCancellation(token);
+      const { name, entry, scope, hop } = queue.shift();
+      const nodeId = makeGtagsNodeId(entry.file, name, entry.line);
+      if (visited.has(nodeId))
+        continue;
+      visited.add(nodeId);
+      const lines = readFileLinesCached(entry.file, lineCache);
+      nodes.set(nodeId, gtagsEntryToNode(name, entry, scope, currentFile));
+      if (hop >= maxHops)
+        continue;
+      for (const callee of extractCallsFromLines(lines, scope.start, scope.end, knownTags, name)) {
+        const calleeEntry = resolveCallee(tags.get(callee), entry.file);
+        if (!calleeEntry)
+          continue;
+        const calleeScope = resolveCalleeScope(scopeMap, calleeEntry.file, callee, calleeEntry.line);
+        if (!calleeScope)
+          continue;
+        const calleeId = makeGtagsNodeId(calleeEntry.file, callee, calleeEntry.line);
+        edgeSet.add(`${nodeId}|||${calleeId}`);
+        if (!queued.has(calleeId)) {
+          queued.add(calleeId);
+          queue.push({ name: callee, entry: calleeEntry, scope: calleeScope, hop: hop + 1 });
+        }
+      }
+      pct.bfsQ(20, 55, queued, queue);
+    }
+  }
+  pct.to(55);
+  {
+    const queued = /* @__PURE__ */ new Set([startNodeId]);
+    const queue = [{
+      funcName: startScope.name,
+      calleeId: startNodeId,
+      hop: 0
+    }];
+    while (queue.length > 0) {
+      checkCancellation(token);
+      const { funcName, calleeId, hop } = queue.shift();
+      if (hop >= maxHops)
+        continue;
+      for (const { refFile, refLine } of await runGlobalRxSingle(funcName, wsRoot)) {
+        checkCancellation(token);
+        const fileScopeEntry = scopeMap.get(refFile);
+        if (!fileScopeEntry)
+          continue;
+        const callerScope = findScopeAtLine(fileScopeEntry.list, refLine);
+        if (!callerScope || callerScope.name === funcName)
+          continue;
+        const callerEntry = tags.get(callerScope.name)?.find((e) => e.file === refFile && e.isFunc) ?? resolveCallee(tags.get(callerScope.name), refFile);
+        if (!callerEntry)
+          continue;
+        const callerId = makeGtagsNodeId(callerEntry.file, callerScope.name, callerEntry.line);
+        edgeSet.add(`${callerId}|||${calleeId}`);
+        if (!nodes.has(callerId)) {
+          nodes.set(callerId, gtagsEntryToNode(
+            callerScope.name,
+            callerEntry,
+            callerScope,
+            currentFile
+          ));
+        }
+        if (!queued.has(callerId)) {
+          queued.add(callerId);
+          queue.push({ funcName: callerScope.name, calleeId: callerId, hop: hop + 1 });
+        }
+      }
+      pct.bfsQ(55, 100, queued, queue);
+    }
+  }
+  return {
+    nodes: Array.from(nodes.values()),
+    edges: splitEdges(edgeSet),
+    fileName: `\u2195 ${startScope.name} (${path.basename(currentFile)})`,
+    buildTimeMs: Date.now() - t0,
+    errors: errs
+  };
+}
+function makeCacheKey(type, ...parts) {
+  return `${type}::${parts.join("::")}`;
+}
+async function buildFileCallGraph(document, progress, backend = "auto", token) {
+  const key = makeCacheKey("file", document.uri.fsPath);
+  const cached = graphDataCache.get(key);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS)
+    return cached.data;
+  const result = await (await resolveBackend(backend) === "gtags" ? buildFileCallGraphGtags(document, progress, token) : buildFileCallGraphLsp(document, progress, token));
+  setGraphCache(key, { data: result, timestamp: Date.now() });
+  return result;
+}
+async function buildFunctionCallGraph(document, position, maxHops = 4, progress, backend = "auto", token) {
+  const key = makeCacheKey("func", document.uri.fsPath, String(position.line));
+  const cached = graphDataCache.get(key);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS)
+    return cached.data;
+  const result = await (await resolveBackend(backend) === "gtags" ? buildFunctionCallGraphGtags(document, position, maxHops, progress, token) : buildFunctionCallGraphLsp(document, position, maxHops, progress, token));
+  setGraphCache(key, { data: result, timestamp: Date.now() });
+  return result;
+}
+async function buildWorkspaceCallGraph(uris, progress, backend = "auto", token) {
+  const sorted = uris.map((u) => u.fsPath).sort();
+  const PRIME = 31;
+  const hashSeed = sorted.reduce((acc, p) => {
+    let h = acc * PRIME + 0 | 0;
+    for (let i = 0; i < p.length; i++) {
+      h = h * PRIME + p.charCodeAt(i) | 0;
+    }
+    return h;
+  }, 17);
+  const key = makeCacheKey("workspace", String(hashSeed), String(sorted.length));
+  const cached = graphDataCache.get(key);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS)
+    return cached.data;
+  const result = await (await resolveBackend(backend) === "gtags" ? buildWorkspaceCallGraphGtags(uris, progress, token) : buildWorkspaceCallGraphLsp(uris, progress, token));
+  setGraphCache(key, { data: result, timestamp: Date.now() });
+  return result;
+}
+async function buildPathThroughCallGraph(document, position, maxHops = 4, progress, backend = "auto", token) {
+  const resolved = await resolveBackend(backend);
+  if (resolved !== "gtags") {
+    throw new Error(
+      'Path-through graph is only supported with the gtags backend.\nPlease select "gtags (Fast)" as the backend.'
+    );
+  }
+  const key = makeCacheKey("path", document.uri.fsPath, String(position.line));
+  const cached = graphDataCache.get(key);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS)
+    return cached.data;
+  const result = await buildPathThroughCallGraphGtags(document, position, maxHops, progress, token);
+  setGraphCache(key, { data: result, timestamp: Date.now() });
+  return result;
+}
+
+// src/webviewPanel.ts
+function resolveAndNormalize(p) {
+  const resolved = path2.resolve(p);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+function isPathInWorkspace(filePath, wsRoots, allowedFiles) {
+  const fileResolved = resolveAndNormalize(filePath);
+  if (wsRoots.length > 0) {
+    return wsRoots.some((r) => {
+      const rResolved = resolveAndNormalize(r);
+      return fileResolved === rResolved || fileResolved.startsWith(rResolved + path2.sep) || fileResolved.startsWith(rResolved + "/");
+    });
+  }
+  if (allowedFiles.size > 0) {
+    return allowedFiles.has(fileResolved);
+  }
+  return false;
+}
+var FILE_COLORS_BASE = [
+  { background: "#ffeaa7", border: "#fdcb6e" },
+  { background: "#fab1a0", border: "#e17055" },
+  { background: "#a29bfe", border: "#6c5ce7" },
+  { background: "#81ecec", border: "#00cec9" },
+  { background: "#55efc4", border: "#00b894" },
+  { background: "#fd79a8", border: "#e84393" },
+  { background: "#74b9ff", border: "#0984e3" },
+  { background: "#dfe6e9", border: "#b2bec3" }
+];
+function generateFileColors(files) {
+  const map = {};
+  files.forEach((f, i) => {
+    map[f] = i < FILE_COLORS_BASE.length ? FILE_COLORS_BASE[i] : {
+      background: `hsl(${Math.round(i * 360 / files.length % 360)},65%,80%)`,
+      border: `hsl(${Math.round(i * 360 / files.length % 360)},65%,55%)`
+    };
+  });
+  return map;
+}
+function buildGraphMsg(data) {
+  const files = [...new Set(data.nodes.map((n) => n.file))].sort();
+  const colorMap = generateFileColors(files);
+  const fileLegend = files.map((f) => ({ file: f, color: colorMap[f].background, border: colorMap[f].border }));
+  return {
+    type: "graphData",
+    nodes: data.nodes.map((n) => ({
+      id: n.id,
+      label: n.label,
+      labelFull: n.labelFull,
+      file: n.file,
+      line: n.line,
+      scopeEnd: n.scopeEnd,
+      // ⑥ lazy source 用 (source は送らない)
+      isCurrentFile: n.isCurrentFile,
+      color: colorMap[n.file] ?? FILE_COLORS_BASE[FILE_COLORS_BASE.length - 1],
+      title: `${n.label}
+${path2.basename(n.file)} : line ${n.line}`
+    })),
+    edges: data.edges,
+    fileLegend,
+    buildTimeMs: data.buildTimeMs,
+    errors: data.errors
+  };
+}
+function generateStandaloneHtml(extensionUri, data) {
+  const distDir = vscode2.Uri.joinPath(extensionUri, "dist").fsPath;
+  const visJs = fs2.readFileSync(path2.join(distDir, "vis-network.min.js"), "utf-8");
+  const webviewJs = fs2.readFileSync(path2.join(distDir, "webview.js"), "utf-8");
+  const graphMsg = buildGraphMsg(data);
+  const safeJson = JSON.stringify(graphMsg).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
+  const escapeScript = (s) => s.replace(/<\/script/gi, "<\\/script");
+  return htmlTemplate({ kind: "standalone" }, [
+    `<script>var INITIAL_GRAPH_DATA = ${safeJson};</script>`,
+    `<script>${escapeScript(visJs)}</script>`,
+    `<script>${escapeScript(webviewJs)}</script>`
+  ].join("\n"));
+}
+var CallGraphPanel = class _CallGraphPanel {
+  constructor(panel, extensionUri) {
+    this._disposables = [];
+    this._isReady = false;
+    // ★ ⑤: 単一メッセージ保留 → キュー方式に変更。
+    //   setLoading() → updateGraph() の順で ready 前に呼ばれても
+    //   両メッセージが順番通りに届くようにする。
+    this._pendingMessages = [];
+    this._lastGraphData = null;
+    // Security①: グラフに含まれるファイルパス（正規化済み）のセット。
+    //   wsRoots が空の単一ファイル編集モードでのアクセス制限に使用する。
+    this._allowedFiles = /* @__PURE__ */ new Set();
+    this._panel = panel;
+    this._extensionUri = extensionUri;
+    this._panel.webview.onDidReceiveMessage(
+      async (msg) => {
+        switch (msg.type) {
+          case "ready":
+            this._isReady = true;
+            for (const pending of this._pendingMessages) {
+              this._panel.webview.postMessage(pending);
+            }
+            this._pendingMessages = [];
+            break;
+          case "openFile":
+            if (msg.file && msg.line !== void 0)
+              await this._openFileAtLine(msg.file, msg.line);
+            break;
+          case "requestSource": {
+            const { nodeId, file, line, scopeEnd } = msg;
+            if (!file || line === void 0)
+              break;
+            const wsRoots = vscode2.workspace.workspaceFolders?.map((f) => f.uri.fsPath) ?? [];
+            if (!isPathInWorkspace(file, wsRoots, this._allowedFiles))
+              break;
+            const resolvedFile = path2.resolve(file);
+            try {
+              const content = await fs2.promises.readFile(resolvedFile, "utf-8");
+              const lines = content.split("\n");
+              const startIdx = Math.max(0, line - 1);
+              const endIdx = scopeEnd !== void 0 ? Math.min(scopeEnd, startIdx + MAX_SOURCE_LINES, lines.length) : Math.min(startIdx + MAX_SOURCE_LINES, lines.length);
+              const source = lines.slice(startIdx, endIdx).join("\n");
+              this._panel.webview.postMessage({ type: "sourceData", nodeId, source });
+            } catch {
+              this._panel.webview.postMessage({ type: "sourceData", nodeId, source: "// Could not read source" });
+            }
+            break;
+          }
+          case "exportHtml":
+            if (this._lastGraphData)
+              await _CallGraphPanel.exportHtmlFile(this._extensionUri, this._lastGraphData);
+            else
+              vscode2.window.showWarningMessage("No graph data to export.");
+            break;
+        }
+      },
+      null,
+      this._disposables
+    );
+    this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
+    this._panel.webview.html = this._buildHtml();
+  }
+  static createOrShow(extensionUri) {
+    const column = vscode2.window.activeTextEditor ? vscode2.ViewColumn.Beside : vscode2.ViewColumn.One;
+    if (_CallGraphPanel.currentPanel) {
+      _CallGraphPanel.currentPanel._panel.reveal(column);
+      return _CallGraphPanel.currentPanel;
+    }
+    const panel = vscode2.window.createWebviewPanel(
+      "callGraphViewer",
+      "Call Map",
+      column,
+      { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [extensionUri] }
+    );
+    _CallGraphPanel.currentPanel = new _CallGraphPanel(panel, extensionUri);
+    return _CallGraphPanel.currentPanel;
+  }
+  setLoading(fileName) {
+    this._panel.title = "Call Map \u2014 Analyzing...";
+    this._postOrQueue({ type: "loading", fileName });
+  }
+  updateGraph(data) {
+    this._lastGraphData = data;
+    this._panel.title = `Call Map \u2014 ${data.fileName}`;
+    this._allowedFiles = new Set(data.nodes.map((n) => resolveAndNormalize(n.file)));
+    this._postOrQueue(buildGraphMsg(data));
+  }
+  showError(message) {
+    this._panel.title = "Call Map \u2014 Error";
+    this._postOrQueue({ type: "error", message });
+  }
+  static async exportHtmlFile(extensionUri, data) {
+    const wsRoot = vscode2.workspace.workspaceFolders?.[0]?.uri;
+    const safeName = data.fileName.replace(/[^\w.-]/g, "_");
+    const defaultUri = wsRoot ? vscode2.Uri.joinPath(wsRoot, `callgraph_${safeName}.html`) : vscode2.Uri.file(path2.join(os.homedir(), `callgraph_${safeName}.html`));
+    const saveUri = await vscode2.window.showSaveDialog({
+      defaultUri,
+      filters: { "HTML File": ["html"] }
+    });
+    if (!saveUri)
+      return;
+    try {
+      const html = generateStandaloneHtml(extensionUri, data);
+      await vscode2.workspace.fs.writeFile(saveUri, Buffer.from(html, "utf-8"));
+      const open = await vscode2.window.showInformationMessage(
+        `Saved: ${path2.basename(saveUri.fsPath)}`,
+        "Open in Browser"
+      );
+      if (open === "Open in Browser")
+        await vscode2.env.openExternal(saveUri);
+    } catch (e) {
+      vscode2.window.showErrorMessage(`Failed to save: ${e}`);
+    }
+  }
+  dispose() {
+    _CallGraphPanel.currentPanel = void 0;
+    this._panel.dispose();
+    this._disposables.forEach((d) => d.dispose());
+  }
+  _postOrQueue(msg) {
+    if (this._isReady)
+      this._panel.webview.postMessage(msg);
+    else
+      this._pendingMessages.push(msg);
+  }
+  async _openFileAtLine(filePath, line) {
+    const wsRoots = (vscode2.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
+    if (!isPathInWorkspace(filePath, wsRoots, this._allowedFiles)) {
+      vscode2.window.showErrorMessage(
+        `Call Map: Cannot open file outside workspace:
+${filePath}`
+      );
+      return;
+    }
+    const resolvedPath = path2.resolve(filePath);
+    try {
+      const uri = vscode2.Uri.file(resolvedPath);
+      const pos = new vscode2.Position(Math.max(0, line - 1), 0);
+      const doc = await vscode2.workspace.openTextDocument(uri);
+      await vscode2.window.showTextDocument(doc, { selection: new vscode2.Range(pos, pos), viewColumn: vscode2.ViewColumn.One });
+    } catch {
+      vscode2.window.showErrorMessage(`Could not open file: ${resolvedPath}`);
+    }
+  }
+  _buildHtml() {
+    const nonce = crypto.randomBytes(16).toString("hex");
+    const webview = this._panel.webview;
+    const distDir = vscode2.Uri.joinPath(this._extensionUri, "dist");
+    const visUri = webview.asWebviewUri(vscode2.Uri.joinPath(distDir, "vis-network.min.js"));
+    const webviewUri = webview.asWebviewUri(vscode2.Uri.joinPath(distDir, "webview.js"));
+    return htmlTemplate(
+      { kind: "webview", nonce, cspSource: webview.cspSource },
+      `<script nonce="${nonce}" src="${visUri}"></script>
+<script nonce="${nonce}" src="${webviewUri}"></script>`
+    );
+  }
+};
+function htmlTemplate(mode, scripts) {
+  const cspMeta = mode.kind === "webview" ? `<meta http-equiv="Content-Security-Policy"
+         content="default-src 'none'; script-src 'nonce-${mode.nonce}' ${mode.cspSource}; style-src 'unsafe-inline';">` : `<meta http-equiv="Content-Security-Policy"
+         content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline';">`;
+  return `<!DOCTYPE html>
+<html lang="en">
 <head>
 <meta charset="UTF-8">
-${t.kind==="webview"?`<meta http-equiv="Content-Security-Policy"
-         content="default-src 'none'; script-src 'nonce-${t.nonce}' ${t.cspSource}; style-src 'unsafe-inline';">`:`<meta http-equiv="Content-Security-Policy"
-         content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline';">`}
+${cspMeta}
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { width: 100%; height: 100%; overflow: hidden; background: #f8f9fa; }
@@ -31,7 +1908,7 @@ div.vis-network div.vis-navigation div.vis-button.vis-zoomOut     { left: 122px 
   background: rgba(255,255,255,0.95); border: 1px solid #ddd;
   border-radius: 8px; padding: 12px 14px; font-family: monospace;
   font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.12);
-  min-width: 230px; line-height: 1.8;
+  width: auto; line-height: 1.8;
 }
 #search-box {
   width: 100%; padding: 5px 8px; border: 1px solid #b2bec3;
@@ -56,35 +1933,53 @@ div.vis-network div.vis-navigation div.vis-button.vis-zoomOut     { left: 122px 
 }
 .spinner { width: 36px; height: 36px; border: 3px solid #dfe6e9; border-top-color: #00b894; border-radius: 50%; animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+/* \u30CD\u30A4\u30C6\u30A3\u30D6 number \u30B9\u30D4\u30CA\u30FC\u3092\u975E\u8868\u793A\u306B\u3057\u3066\u898B\u5207\u308C\u3092\u9632\u3050 */
+#font-size-input::-webkit-inner-spin-button,
+#font-size-input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+#font-size-input { -moz-appearance: textfield; text-align: center; }
+/* \u30B3\u30F3\u30C8\u30ED\u30FC\u30EB\u30D1\u30CD\u30EB\u6298\u308A\u305F\u305F\u307F */
+#controls-toggle {
+  background: none; border: none; cursor: pointer;
+  font-size: 12px; color: #636e72; padding: 0 2px; line-height: 1;
+  transition: transform 0.15s;
+}
+#controls-toggle.collapsed { transform: rotate(-90deg); }
+#controls-body { overflow: hidden; }
 </style>
 </head>
 <body>
 <div id="network"></div>
 
 <div id="controls">
-  <b style="font-size:13px;">\u{1F4DE} Call Map</b>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+    <b style="font-size:13px;">\u{1F4DE} Call Map</b>
+    <button id="controls-toggle" title="Collapse panel">\u25BC</button>
+  </div>
+  <div id="controls-body">
   <div style="color:#636e72;font-size:11px;margin:2px 0 8px;">
-    <b style="color:#97c2fc;">\u25CF</b> \u9078\u629E\u4E2D &nbsp;
+    <b style="color:#97c2fc;">\u25CF</b> selected &nbsp;
     <b style="color:#e17055;">\u25CF</b> callee &nbsp;
     <b style="color:#00b894;">\u25CF</b> caller &nbsp;
-    <span style="color:#aaa;font-size:10px;">Ctrl+\u30AF\u30EA\u30C3\u30AF\u2192\u30B8\u30E3\u30F3\u30D7</span>
+    <span style="color:#aaa;font-size:10px;">Ctrl+Click to jump</span>
   </div>
-  <input id="search-box" type="text" placeholder="\u{1F50D} \u95A2\u6570\u540D\u3092\u691C\u7D22">
+  <input id="search-box" type="text" placeholder="\u{1F50D} Search function">
 
   <label style="cursor:pointer;display:flex;align-items:center;gap:6px;font-size:11px;color:#2d3436;margin-bottom:4px;">
-    <input id="src-toggle" type="checkbox" style="cursor:pointer;"> \u30BD\u30FC\u30B9\u30B3\u30FC\u30C9\u30D1\u30CD\u30EB\u3092\u8868\u793A
+    <input id="src-toggle" type="checkbox" style="cursor:pointer;"> Show source panel
   </label>
-  <div style="display:flex;align-items:center;gap:5px;font-size:11px;color:#636e72;margin-bottom:6px;">
-    <label for="font-size-input" style="white-space:nowrap;">\u6587\u5B57\u30B5\u30A4\u30BA:</label>
+  <div style="display:flex;align-items:center;gap:4px;font-size:11px;color:#636e72;margin-bottom:6px;">
+    <label for="font-size-input" style="white-space:nowrap;">Font size:</label>
+    <button id="font-size-down" style="width:22px;height:22px;border:1px solid #b2bec3;border-radius:4px;background:#f0f0f0;font-size:13px;line-height:1;cursor:pointer;color:#636e72;padding:0;display:flex;align-items:center;justify-content:center;">\uFF0D</button>
     <input id="font-size-input" type="number" value="11" min="6" max="64"
-      style="width:46px;padding:2px 5px;border:1px solid #b2bec3;border-radius:4px;font-family:monospace;font-size:11px;text-align:center;outline:none;">
-    <button id="font-size-reset" style="padding:2px 7px;border:1px solid #b2bec3;border-radius:4px;background:#f0f0f0;font-family:monospace;font-size:11px;cursor:pointer;color:#636e72;">Default</button>
+      style="width:38px;height:22px;padding:0 2px;border:1px solid #b2bec3;border-radius:4px;font-family:monospace;font-size:11px;outline:none;">
+    <button id="font-size-up" style="width:22px;height:22px;border:1px solid #b2bec3;border-radius:4px;background:#f0f0f0;font-size:13px;line-height:1;cursor:pointer;color:#636e72;padding:0;display:flex;align-items:center;justify-content:center;">\uFF0B</button>
+    <button id="font-size-reset" style="padding:2px 7px;height:22px;border:1px solid #b2bec3;border-radius:4px;background:#f0f0f0;font-family:monospace;font-size:11px;cursor:pointer;color:#636e72;">Reset</button>
   </div>
   <button id="export-btn" style="width:100%;padding:5px 0;margin-bottom:6px;border:1px solid #b2bec3;border-radius:4px;background:#f8f9fa;font-family:monospace;font-size:11px;cursor:pointer;color:#2d3436;">
-    \u{1F4BE} HTML \u3068\u3057\u3066\u4FDD\u5B58
+    \u{1F4BE} Save as HTML
   </button>
   <div id="hop-panel" style="display:none;margin-top:2px;">
-    <div style="color:#636e72;font-size:11px;margin-bottom:4px;">\u8868\u793A\u7BC4\u56F2\uFF08\u30DB\u30C3\u30D7\u6570\uFF09:</div>
+    <div style="color:#636e72;font-size:11px;margin-bottom:4px;">Hop filter:</div>
     <div style="display:flex;gap:5px;">
       <button class="hop-btn" data-hop="1">1</button>
       <button class="hop-btn" data-hop="2">2</button>
@@ -93,17 +1988,18 @@ div.vis-network div.vis-navigation div.vis-button.vis-zoomOut     { left: 122px 
     </div>
   </div>
   <div style="margin-top:10px;border-top:1px solid #ddd;padding-top:8px;">
-    <div style="color:#636e72;font-size:11px;margin-bottom:5px;">\u30D5\u30A1\u30A4\u30EB\u51E1\u4F8B:</div>
+    <div style="color:#636e72;font-size:11px;margin-bottom:5px;">File legend:</div>
     <div id="legend-items"></div>
   </div>
   <div id="build-info" style="margin-top:8px;border-top:1px solid #ddd;padding-top:6px;color:#b2bec3;font-size:10px;"></div>
+  </div><!-- #controls-body -->
 </div>
 
 <div id="source-panel">
   <div id="source-placeholder">
     <span style="font-size:28px;">\u2190</span>
-    <span style="font-size:13px;">\u30CE\u30FC\u30C9\u3092\u30AF\u30EA\u30C3\u30AF\u3057\u3066\u304F\u3060\u3055\u3044</span>
-    <span style="font-size:11px;color:#6c7086;">Ctrl+\u30AF\u30EA\u30C3\u30AF\u3067\u30A8\u30C7\u30A3\u30BF\u3078\u30B8\u30E3\u30F3\u30D7</span>
+    <span style="font-size:13px;">Click a node</span>
+    <span style="font-size:11px;color:#6c7086;">Ctrl+Click to jump to editor</span>
   </div>
   <div id="source-content">
     <div style="padding:10px 16px;background:#181825;border-bottom:1px solid #45475a;display:flex;justify-content:space-between;align-items:flex-start;flex-shrink:0;">
@@ -112,7 +2008,7 @@ div.vis-network div.vis-navigation div.vis-button.vis-zoomOut     { left: 122px 
         <span id="source-file-info" style="color:#6c7086;font-size:11px;"></span>
       </div>
       <div style="display:flex;gap:8px;align-items:center;margin-left:8px;">
-        <button id="goto-btn" style="background:#313244;border:1px solid #45475a;color:#cdd6f4;cursor:pointer;padding:4px 10px;border-radius:4px;font-family:monospace;font-size:11px;">\u25B7 \u30BD\u30FC\u30B9\u3078\u30B8\u30E3\u30F3\u30D7</button>
+        <button id="goto-btn" style="background:#313244;border:1px solid #45475a;color:#cdd6f4;cursor:pointer;padding:4px 10px;border-radius:4px;font-family:monospace;font-size:11px;">\u25B7 Go to source</button>
         <button id="src-close-btn" style="background:none;border:none;color:#6c7086;cursor:pointer;font-size:16px;">\u2715</button>
       </div>
     </div>
@@ -122,28 +2018,372 @@ div.vis-network div.vis-navigation div.vis-button.vis-zoomOut     { left: 122px 
 
 <div id="loading-overlay">
   <div class="spinner"></div>
-  <div id="loading-msg" style="font-family:monospace;color:#636e72;font-size:13px;">\u89E3\u6790\u4E2D...</div>
+  <div id="loading-msg" style="font-family:monospace;color:#636e72;font-size:13px;">Analyzing...</div>
 </div>
 
-${e}
+${scripts}
 </body>
-</html>`}var S=_(require("vscode")),k=_(require("path")),H=_(require("fs")),Pe=require("child_process"),Me=require("util"),te=(0,Me.promisify)(Pe.execFile),I=2,Se=50,$e=new Set([".c",".cpp",".cc",".cxx",".cu",".cuh"]),ne="**/*.{c,cpp,cc,cxx,cu,cuh}",V="{**/node_modules/**,**/build/**,**/dist/**,**/out/**,**/.git/**}";function j(t){return Array.from(t).map(e=>{let n=e.indexOf("|||");return{from:e.slice(0,n),to:e.slice(n+3)}})}function se(t){return new Promise(e=>setTimeout(e,t))}function ie(t){return S.workspace.workspaceFolders?.[0]?.uri.fsPath??(t?k.dirname(t.fsPath):void 0)}function oe(t){let e=(S.workspace.workspaceFolders??[]).map(n=>n.uri.fsPath);return e.length===0&&t?[k.dirname(t.fsPath)]:e}async function Be(){try{return await te("gtags",["--version"]),!0}catch{return!1}}async function re(t){return t==="lsp"?"lsp":t==="gtags"||await Be()?"gtags":"lsp"}function Ee(t){return $e.has(k.extname(t.fsPath).toLowerCase())}function Qe(t,e){if(e.length===0)return!0;let n=t.fsPath;return e.some(s=>n===s||n.startsWith(s+k.sep)||n.startsWith(s+"/"))}function ae(t,e){return Qe(t,e)&&Ee(t)}function U(t,e,n){return`${t.fsPath}||${T(e)}||${n}`}function T(t){let e=t.indexOf("(");return e>=0?t.slice(0,e).trim():t}function ce(t,e){let n=U(e.uri,e.name,e.selectionRange.start.line);if(t.has(n))return n;let s=T(e.name),i=e.uri.fsPath;for(let[r,a]of t)if(a.file===i&&(a.label===s||T(a.label)===s))return r;let o=k.extname(i).toLowerCase();if([".h",".hpp",".hxx"].includes(o)){for(let[r,a]of t)if(a.label===s||T(a.label)===s)return r}return null}function Ge(t){let e=new Set([S.SymbolKind.Function,S.SymbolKind.Method,S.SymbolKind.Constructor]),n=new Set,s=[];function i(o){for(let r of o){if(e.has(r.kind)){let a=`${r.selectionRange.start.line}:${T(r.name)}`;n.has(a)||(n.add(a),s.push(r))}r.children?.length&&i(r.children)}}return i(t),s}async function Z(t,e){let n=t.fsPath;if(e.has(n))return e.get(n);try{let s=S.workspace.textDocuments.find(r=>r.uri.fsPath===n);if(s){let r=s.getText().split(`
-`);return e.set(n,r),r}let o=(await H.promises.readFile(n,"utf-8")).split(`
-`);return e.set(n,o),o}catch{return e.set(n,[]),[]}}var De=200;function Q(t,e,n){let s=Math.min(n+1,e+De,t.length);return t.slice(e,s).join(`
-`)}function E(t){if(t?.isCancellationRequested)throw new S.CancellationError}var ke=6,qe=200;async function A(t,e,...n){for(let s=0;s<ke;s++){E(e);try{return await S.commands.executeCommand(t,...n)}catch(i){let o=String(i);if(o.includes("not found"))throw i;if(o.includes("Canceled")&&s<ke-1){await se(qe*Math.pow(2,s));continue}throw i}}}async function Xe(t,e,n){let s=Date.now(),i=[],o=new Map,r=oe(t.uri),a=t.getText().split(`
-`);o.set(t.uri.fsPath,a),e?.report({message:"\u30B7\u30F3\u30DC\u30EB\u3092\u53D6\u5F97\u4E2D..."}),E(n);let p=await S.commands.executeCommand("vscode.executeDocumentSymbolProvider",t.uri);if(!p?.length)throw new Error(`\u30B7\u30F3\u30DC\u30EB\u304C\u898B\u3064\u304B\u308A\u307E\u305B\u3093\u3067\u3057\u305F\u3002
+</html>`;
+}
 
-\u3010\u78BA\u8A8D\u4E8B\u9805\u3011
-  1. clangd \u307E\u305F\u306F C/C++ \u62E1\u5F35\u6A5F\u80FD\u304C\u6709\u52B9\u304B
-  2. \u30A4\u30F3\u30C7\u30C3\u30AF\u30B9\u4F5C\u6210\u304C\u5B8C\u4E86\u3057\u3066\u3044\u308B\u304B
-  3. clangd \u306E\u5834\u5408: compile_commands.json \u304C\u3042\u308B\u304B`);let g=Ge(p);if(!g.length)throw new Error("\u3053\u306E\u30D5\u30A1\u30A4\u30EB\u306B\u95A2\u6570\u30B7\u30F3\u30DC\u30EB\u304C\u898B\u3064\u304B\u308A\u307E\u305B\u3093\u3067\u3057\u305F\u3002");let u=new Map,c=new Set;for(let l of g){let f=U(t.uri,l.name,l.selectionRange.start.line);u.set(f,{id:f,label:T(l.name),labelFull:l.name,file:t.uri.fsPath,line:l.selectionRange.start.line+1,source:Q(a,l.range.start.line,l.range.end.line),isCurrentFile:!0})}let b=g.length;for(let l=0;l<g.length;l+=I){E(n);let f=g.slice(l,l+I);e?.report({message:`\u30B3\u30FC\u30EB\u89E3\u6790\u4E2D... (${Math.min(l+I,b)}/${b})`,increment:f.length/b*80});let $=new Set;await Promise.all(f.map(async v=>{try{let d=await A("vscode.prepareCallHierarchy",n,t.uri,v.selectionRange.start);if(!d?.length)return;let m=await A("vscode.provideOutgoingCalls",n,d[0]);if(!m?.length)return;let w=U(t.uri,v.name,v.selectionRange.start.line);for(let G of m){let{to:y}=G,C=ce(u,y);if(!C){if(!ae(y.uri,r))continue;if(C=U(y.uri,y.name,y.selectionRange.start.line),!u.has(C)&&!$.has(C)){$.add(C);let h=await Z(y.uri,o);u.has(C)||u.set(C,{id:C,label:T(y.name),labelFull:y.name,file:y.uri.fsPath,line:y.selectionRange.start.line+1,source:Q(h,y.range.start.line,y.range.end.line),isCurrentFile:!1})}}c.add(`${w}|||${C}`)}}catch(d){if(d instanceof S.CancellationError)throw d;i.push(`${v.name}: ${String(d)}`)}})),l+I<g.length&&await se(Se)}return{nodes:Array.from(u.values()),edges:j(c),fileName:k.basename(t.uri.fsPath),buildTimeMs:Date.now()-s,errors:i}}async function Ve(t,e,n=4,s,i){let o=Date.now(),r=[],a=new Map,p=oe(t.uri);s?.report({message:"\u8D77\u70B9\u95A2\u6570\u3092\u7279\u5B9A\u4E2D..."}),E(i);let g=await A("vscode.prepareCallHierarchy",i,t.uri,e);if(!g?.length)throw new Error(`\u30AB\u30FC\u30BD\u30EB\u4F4D\u7F6E\u306B\u95A2\u6570\u304C\u898B\u3064\u304B\u308A\u307E\u305B\u3093\u3067\u3057\u305F\u3002
-\u95A2\u6570\u540D\u306E\u4E0A\u306B\u30AB\u30FC\u30BD\u30EB\u3092\u7F6E\u3044\u3066\u304B\u3089\u5B9F\u884C\u3057\u3066\u304F\u3060\u3055\u3044\u3002`);let u=new Map,c=new Set,b=new Set,l=[[g[0],0]];for(;l.length>0;){E(i);let[f,$]=l.shift(),v=U(f.uri,f.name,f.selectionRange.start.line);if(!b.has(v)){if(b.add(v),!u.has(v)){let d=await Z(f.uri,a);u.set(v,{id:v,label:T(f.name),labelFull:f.name,file:f.uri.fsPath,line:f.selectionRange.start.line+1,source:Q(d,f.range.start.line,f.range.end.line),isCurrentFile:f.uri.fsPath===t.uri.fsPath})}if(!($>=n)){s?.report({message:`BFS \u5C55\u958B\u4E2D... (\u30CE\u30FC\u30C9: ${u.size})`});try{let d=await A("vscode.provideOutgoingCalls",i,f);if(!d?.length)continue;for(let m of d){let w=ce(u,m.to);if(!w){if(!ae(m.to.uri,p))continue;w=U(m.to.uri,m.to.name,m.to.selectionRange.start.line)}c.add(`${v}|||${w}`),b.has(w)||(b.add(w),l.push([m.to,$+1]))}}catch(d){if(d instanceof S.CancellationError)throw d;r.push(`${f.name}: ${String(d)}`)}}}}return{nodes:Array.from(u.values()),edges:j(c),fileName:`${T(g[0].name)} (${k.basename(t.uri.fsPath)})`,buildTimeMs:Date.now()-o,errors:r}}async function Je(t,e,n){let s=Date.now(),i=[],o=new Map,r=Array.from(new Map(t.map(c=>[c.fsPath,c])).values()),a=oe(r[0]),p=new Map,g=new Set;for(let c=0;c<r.length;c++){E(n);let b=r[c];if(!Ee(b))continue;e?.report({message:`\u89E3\u6790\u4E2D ${c+1}/${r.length}: ${k.basename(b.fsPath)}`,increment:1/r.length*100});let l;try{l=await S.commands.executeCommand("vscode.executeDocumentSymbolProvider",b)}catch{continue}if(!l?.length)continue;let f=Ge(l),$=await Z(b,o);for(let v of f){let d=U(b,v.name,v.selectionRange.start.line);p.has(d)||p.set(d,{id:d,label:T(v.name),labelFull:v.name,file:b.fsPath,line:v.selectionRange.start.line+1,source:Q($,v.range.start.line,v.range.end.line),isCurrentFile:!1})}for(let v=0;v<f.length;v+=I){E(n);let d=new Set;await Promise.all(f.slice(v,v+I).map(async m=>{try{let w=await A("vscode.prepareCallHierarchy",n,b,m.selectionRange.start);if(!w?.length)return;let G=await A("vscode.provideOutgoingCalls",n,w[0]);if(!G?.length)return;let y=U(b,m.name,m.selectionRange.start.line);for(let C of G){let{to:h}=C,M=ce(p,h);if(!M){if(!ae(h.uri,a))continue;if(M=U(h.uri,h.name,h.selectionRange.start.line),!p.has(M)&&!d.has(M)){d.add(M);let D=await Z(h.uri,o);p.has(M)||p.set(M,{id:M,label:T(h.name),labelFull:h.name,file:h.uri.fsPath,line:h.selectionRange.start.line+1,source:Q(D,h.range.start.line,h.range.end.line),isCurrentFile:!1})}}g.add(`${y}|||${M}`)}}catch(w){if(w instanceof S.CancellationError)throw w;i.push(`${k.basename(b.fsPath)}::${m.name}: ${String(w)}`)}})),v+I<f.length&&await se(Se)}}let u=r.length===1?k.basename(r[0].fsPath):`${r.length} \u30D5\u30A1\u30A4\u30EB`;return{nodes:Array.from(p.values()),edges:j(g),fileName:u,buildTimeMs:Date.now()-s,errors:i}}function Ke(t){let e=t.trim();return!(!e||e.startsWith("#")||e.startsWith("}")||e.includes("typedef")||!e.includes("(")||e.endsWith(";"))}async function le(t){H.existsSync(k.join(t,"GTAGS"))||await te("gtags",["--accept-dotfiles"],{cwd:t,timeout:12e4})}async function Ye(t,e){try{let n=k.relative(e,t),{stdout:s}=await te("global",["-f",n],{cwd:e,maxBuffer:10*1024*1024});return s.split(`
-`).flatMap(i=>{let o=i.split(/\s+/);if(o.length<3)return[];let r=o[0],a=parseInt(o[1],10);if(!r||isNaN(a))return[];let p=k.isAbsolute(o[2])?o[2]:k.resolve(e,o[2]);return[{name:r,line:a,file:p}]})}catch{return[]}}function q(t,e){if(e.has(t))return e.get(t);try{let n=H.readFileSync(t,"utf-8").split(`
-`);return e.set(t,n),n}catch{return e.set(t,[]),[]}}async function de(t,e){let n=new Map,s=new Map,i=Math.min(16,Math.max(1,t.length));for(let a=0;a<t.length;a+=i){let p=await Promise.all(t.slice(a,a+i).map(g=>Ye(g,e)));for(let g of p)for(let u of g)s.has(u.name)||s.set(u.name,[]),s.get(u.name).push(u)}let o=new Map,r=[];for(let[a,p]of s){new Set(p.map(c=>c.file)).size>1&&r.push(a);let u=null;for(let c of p){let l=q(c.file,n)[c.line-1]?.trimEnd()??"",f=Ke(l),$={name:a,file:c.file,line:c.line,sourceLine:l,isFunc:f};(!u||f&&!u.isFunc)&&(u=$)}u&&o.set(a,u)}return{tags:o,lineCache:n,ambiguousNames:r}}function pe(t){let e=new Map;for(let[s,i]of t)e.has(i.file)||e.set(i.file,[]),e.get(i.file).push({name:s,line:i.line});let n=new Map;for(let[s,i]of e)i.sort((o,r)=>o.line-r.line),n.set(s,i.map((o,r)=>({name:o.name,start:o.line,end:r+1<i.length?i[r+1].line-1:Number.MAX_SAFE_INTEGER})));return n}function ue(t,e,n,s,i){let o=new Set,r=/\b([A-Za-z_]\w*)\s*\(/g,a=!1;for(let p=e-1;p<Math.min(n,t.length);p++){let g=t[p],u="",c=0;for(;c<g.length;)if(a){let l=g.indexOf("*/",c);l===-1?c=g.length:(a=!1,c=l+2)}else{let l=g.indexOf("//",c),f=g.indexOf("/*",c);f!==-1&&(l===-1||f<l)?(u+=g.slice(c,f),a=!0,c=f+2):l!==-1?(u+=g.slice(c,l),c=g.length):(u+=g.slice(c),c=g.length)}r.lastIndex=0;let b;for(;(b=r.exec(u))!==null;){let l=b[1];l!==i&&s.has(l)&&o.add(l)}}return o}function z(t,e,n){return`${t}||${e}||${n}`}function X(t,e,n,s,i){return{id:z(e.file,t,e.line),label:t,labelFull:t,file:e.file,line:e.line,source:s.slice(n.start-1,Math.min(n.end,n.start-1+De,s.length)).join(`
-`),isCurrentFile:e.file===i}}async function Ze(t,e,n){let s=Date.now(),i=[],o=ie(t.uri);if(!o)throw new Error("\u30EF\u30FC\u30AF\u30B9\u30DA\u30FC\u30B9\u304C\u958B\u304B\u308C\u3066\u3044\u307E\u305B\u3093\u3002");e?.report({message:"[gtags] DB \u3092\u78BA\u8A8D\u4E2D..."}),E(n),await le(o),e?.report({message:"[gtags] C/C++ \u30D5\u30A1\u30A4\u30EB\u3092\u691C\u7D22\u4E2D..."});let a=(await S.workspace.findFiles(ne,V)).map(m=>m.fsPath);e?.report({message:"[gtags] \u30BF\u30B0\u3092\u53CE\u96C6\u4E2D..."}),E(n);let{tags:p,lineCache:g,ambiguousNames:u}=await de(a,o);if(!p.size)throw new Error(`\u30BF\u30B0\u304C\u898B\u3064\u304B\u308A\u307E\u305B\u3093\u3067\u3057\u305F\u3002
-gtags \u306E\u30A4\u30F3\u30B9\u30C8\u30FC\u30EB\u3068 GTAGS \u306E\u78BA\u8A8D\u3092\u3057\u3066\u304F\u3060\u3055\u3044\u3002`);if(u.length>0){let m=u.slice(0,5).join(", "),w=u.length>5?` \u307B\u304B ${u.length-5} \u4EF6`:"";i.push(`[gtags] \u8907\u6570\u30D5\u30A1\u30A4\u30EB\u306B\u540C\u540D\u95A2\u6570\u304C\u5B58\u5728\u3057\u307E\u3059 (\u5148\u982D\u30D2\u30C3\u30C8\u3092\u4F7F\u7528): ${m}${w}`)}let c=t.uri.fsPath,b=t.getText().split(`
-`);g.set(c,b);let l=new Set(p.keys()),f=pe(p),$=f.get(c)??[],v=new Map,d=new Set;for(let m of $){let w=p.get(m.name);if(!w||!w.isFunc||w.file!==c)continue;let G=X(m.name,w,m,b,c);v.set(G.id,G)}if(!v.size)throw new Error("\u3053\u306E\u30D5\u30A1\u30A4\u30EB\u306B\u95A2\u6570\u304C\u898B\u3064\u304B\u308A\u307E\u305B\u3093\u3067\u3057\u305F\u3002");e?.report({message:"[gtags] \u30B3\u30FC\u30EB\u95A2\u4FC2\u3092\u89E3\u6790\u4E2D...",increment:50}),E(n);for(let m of $){let w=p.get(m.name);if(!w||!w.isFunc||w.file!==c)continue;let G=z(c,m.name,w.line),y=ue(b,m.start,m.end,l,m.name);for(let C of y){let h=p.get(C);if(!h)continue;let M=f.get(h.file)?.find(F=>F.name===C);if(!M)continue;let D=z(h.file,C,h.line);if(!v.has(D)){let F=q(h.file,g);v.set(D,X(C,h,M,F,c))}d.add(`${G}|||${D}`)}}return{nodes:Array.from(v.values()),edges:j(d),fileName:k.basename(c),buildTimeMs:Date.now()-s,errors:i}}async function et(t,e,n=4,s,i){let o=Date.now(),r=[],a=ie(t.uri);if(!a)throw new Error("\u30EF\u30FC\u30AF\u30B9\u30DA\u30FC\u30B9\u304C\u958B\u304B\u308C\u3066\u3044\u307E\u305B\u3093\u3002");s?.report({message:"[gtags] DB \u3092\u78BA\u8A8D\u4E2D..."}),E(i),await le(a),s?.report({message:"[gtags] \u30BF\u30B0\u3092\u53CE\u96C6\u4E2D..."}),E(i);let p=await S.workspace.findFiles(ne,V),{tags:g,lineCache:u,ambiguousNames:c}=await de(p.map(h=>h.fsPath),a);if(!g.size)throw new Error("\u30BF\u30B0\u304C\u898B\u3064\u304B\u308A\u307E\u305B\u3093\u3067\u3057\u305F\u3002");if(c.length>0){let h=c.slice(0,5).join(", "),M=c.length>5?` \u307B\u304B ${c.length-5} \u4EF6`:"";r.push(`[gtags] \u8907\u6570\u30D5\u30A1\u30A4\u30EB\u306B\u540C\u540D\u95A2\u6570\u304C\u5B58\u5728\u3057\u307E\u3059 (\u5148\u982D\u30D2\u30C3\u30C8\u3092\u4F7F\u7528): ${h}${M}`)}let b=t.uri.fsPath;u.set(b,t.getText().split(`
-`));let l=new Set(g.keys()),f=pe(g),$=e.line+1,d=(f.get(b)??[]).find(h=>h.start<=$&&$<=h.end);if(!d)throw new Error(`\u30AB\u30FC\u30BD\u30EB\u4F4D\u7F6E\u306B\u95A2\u6570\u304C\u898B\u3064\u304B\u308A\u307E\u305B\u3093\u3067\u3057\u305F\u3002
-\u95A2\u6570\u540D\u306E\u4E0A\u306B\u30AB\u30FC\u30BD\u30EB\u3092\u7F6E\u3044\u3066\u304B\u3089\u5B9F\u884C\u3057\u3066\u304F\u3060\u3055\u3044\u3002`);let m=g.get(d.name);if(!m)throw new Error("\u8D77\u70B9\u95A2\u6570\u306E\u30BF\u30B0\u60C5\u5831\u304C\u898B\u3064\u304B\u308A\u307E\u305B\u3093\u3067\u3057\u305F\u3002");let w=new Map,G=new Set,y=new Set,C=[{name:d.name,entry:m,scope:d,hop:0}];for(;C.length>0;){E(i);let{name:h,entry:M,scope:D,hop:F}=C.shift(),N=z(M.file,h,M.line);if(y.has(N))continue;y.add(N);let L=q(M.file,u);if(w.has(N)||w.set(N,X(h,M,D,L,b)),F>=n)continue;s?.report({message:`[gtags] BFS \u5C55\u958B\u4E2D... (\u30CE\u30FC\u30C9: ${w.size})`});let W=ue(L,D.start,D.end,l,h);for(let J of W){let B=g.get(J);if(!B)continue;let he=f.get(B.file)?.find(Ue=>Ue.name===J);if(!he)continue;let be=z(B.file,J,B.line);G.add(`${N}|||${be}`),y.has(be)||C.push({name:J,entry:B,scope:he,hop:F+1})}}return{nodes:Array.from(w.values()),edges:j(G),fileName:`${d.name} (${k.basename(b)})`,buildTimeMs:Date.now()-o,errors:r}}async function tt(t,e,n){let s=Date.now(),i=[],o=Array.from(new Map(t.map(d=>[d.fsPath,d])).values()).filter(d=>$e.has(k.extname(d.fsPath).toLowerCase()));if(!o.length)throw new Error("C/C++ \u30BD\u30FC\u30B9\u30D5\u30A1\u30A4\u30EB\u304C\u898B\u3064\u304B\u308A\u307E\u305B\u3093\u3067\u3057\u305F\u3002");let r=ie(o[0]);if(!r)throw new Error("\u30EF\u30FC\u30AF\u30B9\u30DA\u30FC\u30B9\u304C\u958B\u304B\u308C\u3066\u3044\u307E\u305B\u3093\u3002");e?.report({message:"[gtags] DB \u3092\u78BA\u8A8D\u4E2D..."}),E(n),await le(r),e?.report({message:"[gtags] \u30BF\u30B0\u3092\u53CE\u96C6\u4E2D..."}),E(n);let a=await S.workspace.findFiles(ne,V),{tags:p,lineCache:g,ambiguousNames:u}=await de(a.map(d=>d.fsPath),r);if(u.length>0){let d=u.slice(0,5).join(", "),m=u.length>5?` \u307B\u304B ${u.length-5} \u4EF6`:"";i.push(`[gtags] \u8907\u6570\u30D5\u30A1\u30A4\u30EB\u306B\u540C\u540D\u95A2\u6570\u304C\u5B58\u5728\u3057\u307E\u3059 (\u5148\u982D\u30D2\u30C3\u30C8\u3092\u4F7F\u7528): ${d}${m}`)}let c=new Set(p.keys()),b=pe(p),l=new Map,f=new Set,$=o.length;for(let d=0;d<o.length;d++){E(n);let m=o[d];e?.report({message:`[gtags] \u89E3\u6790\u4E2D ${d+1}/${$}: ${k.basename(m.fsPath)}`,increment:1/$*100});let w=b.get(m.fsPath)??[],G=q(m.fsPath,g);for(let y of w){let C=p.get(y.name);if(!C||!C.isFunc||C.file!==m.fsPath)continue;let h=X(y.name,C,y,G,"");l.has(h.id)||l.set(h.id,h)}for(let y of w){let C=p.get(y.name);if(!C||!C.isFunc||C.file!==m.fsPath)continue;let h=z(m.fsPath,y.name,C.line),M=ue(G,y.start,y.end,c,y.name);for(let D of M){let F=p.get(D);if(!F)continue;let N=b.get(F.file)?.find(W=>W.name===D);if(!N)continue;let L=z(F.file,D,F.line);if(!l.has(L)){let W=q(F.file,g);l.set(L,X(D,F,N,W,""))}f.add(`${h}|||${L}`)}}}let v=o.length===1?k.basename(o[0].fsPath):`${o.length} \u30D5\u30A1\u30A4\u30EB`;return{nodes:Array.from(l.values()),edges:j(f),fileName:v,buildTimeMs:Date.now()-s,errors:i}}async function Fe(t,e,n="auto",s){return await re(n)==="gtags"?Ze(t,e,s):Xe(t,e,s)}async function Te(t,e,n=4,s,i="auto",o){return await re(i)==="gtags"?et(t,e,n,s,o):Ve(t,e,n,s,o)}async function _e(t,e,n="auto",s){return await re(n)==="gtags"?tt(t,e,s):Je(t,e,s)}var nt=50;async function ge(){return(await P.window.showQuickPick([{label:"$(search) LSP (\u9AD8\u7CBE\u5EA6)",description:"clangd / C/C++ \u62E1\u5F35\u6A5F\u80FD\u3092\u4F7F\u7528\u3002\u30A4\u30F3\u30C7\u30C3\u30AF\u30B9\u304C\u5FC5\u8981\u3002",backend:"lsp"},{label:"$(zap) gtags (\u9AD8\u901F)",description:"GNU Global \u3092\u4F7F\u7528\u3002LSP \u4E0D\u8981\u3067\u5927\u898F\u6A21\u30D7\u30ED\u30B8\u30A7\u30AF\u30C8\u306B\u9069\u3059\u308B\u3002",backend:"gtags"}],{placeHolder:"\u89E3\u6790\u30D0\u30C3\u30AF\u30A8\u30F3\u30C9\u3092\u9078\u629E\u3057\u3066\u304F\u3060\u3055\u3044",title:"Call Map: \u30D0\u30C3\u30AF\u30A8\u30F3\u30C9"}))?.backend}async function fe(){return(await P.window.showQuickPick([{label:"$(callhierarchy-outgoing) WebView \u3067\u8868\u793A",mode:"webview"},{label:"$(browser) HTML \u30D5\u30A1\u30A4\u30EB\u306B\u4FDD\u5B58\u3057\u3066\u30D6\u30E9\u30A6\u30B6\u3067\u958B\u304F",mode:"html"}],{placeHolder:"\u8868\u793A\u65B9\u6CD5\u3092\u9078\u629E\u3057\u3066\u304F\u3060\u3055\u3044",title:"Call Map: \u51FA\u529B\u30E2\u30FC\u30C9"}))?.mode}async function me(t,e,n,s){let i=t==="webview"?O.createOrShow(n):void 0;i?.setLoading(Re.basename(e)),await P.window.withProgress({location:P.ProgressLocation.Notification,title:"Call Map \u3092\u69CB\u7BC9\u4E2D",cancellable:!0},async(o,r)=>{try{let a=await s(o,r);if(r.isCancellationRequested)return;a.errors.length>0&&console.warn("[CallMap] \u89E3\u6790\u8B66\u544A:",a.errors),t==="webview"?(i.updateGraph(a),P.window.setStatusBarMessage(`\u{1F4DE} Call Map: ${a.nodes.length} \u30CE\u30FC\u30C9 / ${a.edges.length} \u30A8\u30C3\u30B8 (${a.buildTimeMs}ms)`,6e3)):await O.exportHtmlFile(n,a)}catch(a){if(a instanceof P.CancellationError)return;let p=a instanceof Error?a.message:String(a);i?i.showError(p):P.window.showErrorMessage(`Call Map \u30A8\u30E9\u30FC:
-`+p)}})}function st(t){t.subscriptions.push(P.commands.registerCommand("callgraph.showFileGraph",async()=>{let e=P.window.activeTextEditor;if(!e){P.window.showErrorMessage("Call Map: C/C++ \u30D5\u30A1\u30A4\u30EB\u3092\u958B\u3044\u3066\u304B\u3089\u5B9F\u884C\u3057\u3066\u304F\u3060\u3055\u3044\u3002");return}let n=await ge();if(!n)return;let s=await fe();s&&await me(s,e.document.fileName,t.extensionUri,(i,o)=>Fe(e.document,i,n,o))})),t.subscriptions.push(P.commands.registerCommand("callgraph.showFunctionGraph",async()=>{let e=P.window.activeTextEditor;if(!e){P.window.showErrorMessage("Call Map: C/C++ \u30D5\u30A1\u30A4\u30EB\u3092\u958B\u3044\u3066\u304B\u3089\u5B9F\u884C\u3057\u3066\u304F\u3060\u3055\u3044\u3002");return}let n=await ge();if(!n)return;let s=await fe();s&&await me(s,e.document.fileName,t.extensionUri,(i,o)=>Te(e.document,e.selection.active,4,i,n,o))})),t.subscriptions.push(P.commands.registerCommand("callgraph.showWorkspaceGraph",async()=>{let e=await P.window.showQuickPick([{label:"$(files) \u3059\u3079\u3066 (\u30BD\u30FC\u30B9\u306E\u307F)",description:".c .cpp .cc .cxx .cu .cuh",glob:"**/*.{c,cpp,cc,cxx,cu,cuh}"},{label:"$(file-code) C \u30BD\u30FC\u30B9",description:".c",glob:"**/*.c"},{label:"$(file-code) C++ \u30BD\u30FC\u30B9",description:".cpp .cc .cxx",glob:"**/*.{cpp,cc,cxx}"},{label:"$(file-code) CUDA",description:".cu .cuh",glob:"**/*.{cu,cuh}"}],{placeHolder:"\u89E3\u6790\u5BFE\u8C61\u306E\u62E1\u5F35\u5B50\u3092\u9078\u629E\u3057\u3066\u304F\u3060\u3055\u3044",title:"Call Map: \u30EF\u30FC\u30AF\u30B9\u30DA\u30FC\u30B9\u6A2A\u65AD\u89E3\u6790"});if(!e)return;let n=await P.window.withProgress({location:P.ProgressLocation.Notification,title:"C/C++ \u30D5\u30A1\u30A4\u30EB\u3092\u691C\u7D22\u4E2D...",cancellable:!1},()=>P.workspace.findFiles(e.glob,V));if(!n.length){P.window.showErrorMessage(`Call Map: \u5BFE\u8C61\u30D5\u30A1\u30A4\u30EB\u304C\u898B\u3064\u304B\u308A\u307E\u305B\u3093\u3067\u3057\u305F\u3002
-\u5BFE\u8C61: `+e.description);return}if(n.length>nt&&await P.window.showWarningMessage(`${n.length} \u30D5\u30A1\u30A4\u30EB\u3092\u89E3\u6790\u3057\u307E\u3059\u3002\u7D9A\u884C\u3057\u307E\u3059\u304B?`,{modal:!0},"\u7D9A\u884C")!=="\u7D9A\u884C")return;let s=await ge();if(!s)return;let i=await fe();i&&await me(i,`${n.length} \u30D5\u30A1\u30A4\u30EB`,t.extensionUri,(o,r)=>_e(n,o,s,r))}))}function it(){O.currentPanel?.dispose()}0&&(module.exports={activate,deactivate});
+// src/extension.ts
+function getWarnThreshold() {
+  return vscode3.workspace.getConfiguration("callmap").get("warnThreshold", 30);
+}
+var EXCLUDE_DIRS = /* @__PURE__ */ new Set(["node_modules", "build", "dist", "out", ".git"]);
+async function findFilesInFolder(folderUri, extensions) {
+  const result = [];
+  async function walk(uri) {
+    let entries;
+    try {
+      entries = await vscode3.workspace.fs.readDirectory(uri);
+    } catch {
+      return;
+    }
+    for (const [name, type] of entries) {
+      if (type === vscode3.FileType.Directory) {
+        if (EXCLUDE_DIRS.has(name))
+          continue;
+        await walk(vscode3.Uri.joinPath(uri, name));
+      } else if (type === vscode3.FileType.File) {
+        if (extensions.has(path3.extname(name).toLowerCase())) {
+          result.push(vscode3.Uri.joinPath(uri, name));
+        }
+      }
+    }
+  }
+  await walk(folderUri);
+  return result;
+}
+async function pickBackend() {
+  const defaultBackend = vscode3.workspace.getConfiguration("callmap").get("defaultBackend", "lsp");
+  const items = [
+    {
+      label: "$(search) LSP (High accuracy)",
+      description: "Uses clangd / C/C++ extension. Requires LSP index.",
+      backend: "lsp"
+    },
+    {
+      label: "$(zap) gtags (Fast)",
+      description: "Uses GNU GLOBAL. No LSP required. Suitable for large projects.",
+      backend: "gtags"
+    }
+  ];
+  const picked = await vscode3.window.showQuickPick(
+    items,
+    {
+      placeHolder: "Select analysis backend",
+      title: "Call Map: Backend",
+      // デフォルトバックエンドに対応するインデックスを初期選択に設定
+      activeItems: items.filter((i) => i.backend === defaultBackend)
+    }
+  );
+  return picked?.backend;
+}
+async function pickOutputMode() {
+  const picked = await vscode3.window.showQuickPick(
+    [
+      { label: "$(callhierarchy-outgoing) Open in WebView", mode: "webview" },
+      { label: "$(browser) Save as HTML and open in browser", mode: "html" }
+    ],
+    { placeHolder: "Select output mode", title: "Call Map: Output mode" }
+  );
+  return picked?.mode;
+}
+async function buildAndOutput(mode, fileName, extensionUri, build) {
+  const panel = mode === "webview" ? CallGraphPanel.createOrShow(extensionUri) : void 0;
+  panel?.setLoading(path3.basename(fileName));
+  await vscode3.window.withProgress(
+    {
+      location: vscode3.ProgressLocation.Notification,
+      title: "Building Call Map",
+      // ★ ④: キャンセル可能にする
+      cancellable: true
+    },
+    async (progress, token) => {
+      try {
+        const data = await build(progress, token);
+        if (token.isCancellationRequested)
+          return;
+        if (data.errors.length > 0)
+          console.warn("[CallMap] Analysis warnings:", data.errors);
+        if (mode === "webview") {
+          panel.updateGraph(data);
+          vscode3.window.setStatusBarMessage(
+            `\u{1F4DE} Call Map: ${data.nodes.length} nodes / ${data.edges.length} edges (${data.buildTimeMs}ms)`,
+            6e3
+          );
+        } else {
+          await CallGraphPanel.exportHtmlFile(extensionUri, data);
+        }
+      } catch (err) {
+        if (err instanceof vscode3.CancellationError)
+          return;
+        const msg = err instanceof Error ? err.message : String(err);
+        if (panel)
+          panel.showError(msg);
+        else
+          vscode3.window.showErrorMessage("Call Map error:\n" + msg);
+      }
+    }
+  );
+}
+function activate(context) {
+  const watcher = vscode3.workspace.createFileSystemWatcher(
+    "**/*.{c,cpp,cc,cxx,cu,cuh,h,hpp,hxx}",
+    false,
+    false,
+    false
+  );
+  const onChanged = (uri) => invalidateCache(uri.fsPath);
+  context.subscriptions.push(
+    watcher,
+    watcher.onDidChange(onChanged),
+    watcher.onDidCreate(onChanged),
+    watcher.onDidDelete(onChanged)
+  );
+  context.subscriptions.push(
+    vscode3.commands.registerCommand("callgraph.showFileGraph", async () => {
+      const editor = vscode3.window.activeTextEditor;
+      if (!editor) {
+        vscode3.window.showErrorMessage("Call Map: Please open a C/C++ file first.");
+        return;
+      }
+      const backend = await pickBackend();
+      if (!backend)
+        return;
+      const mode = await pickOutputMode();
+      if (!mode)
+        return;
+      await buildAndOutput(
+        mode,
+        editor.document.fileName,
+        context.extensionUri,
+        (prog, tok) => buildFileCallGraph(editor.document, prog, backend, tok)
+      );
+    })
+  );
+  context.subscriptions.push(
+    vscode3.commands.registerCommand("callgraph.showFunctionGraph", async () => {
+      const editor = vscode3.window.activeTextEditor;
+      if (!editor) {
+        vscode3.window.showErrorMessage("Call Map: Please open a C/C++ file first.");
+        return;
+      }
+      const backend = await pickBackend();
+      if (!backend)
+        return;
+      const mode = await pickOutputMode();
+      if (!mode)
+        return;
+      await buildAndOutput(
+        mode,
+        editor.document.fileName,
+        context.extensionUri,
+        // ⑩ callmap.maxHops 設定値を参照する（デフォルト 4）。
+        //   旧実装は Number.MAX_SAFE_INTEGER をハードコードしており設定が無視されていた。
+        (prog, tok) => {
+          const maxHops = vscode3.workspace.getConfiguration("callmap").get("maxHops", 4);
+          return buildFunctionCallGraph(editor.document, editor.selection.active, maxHops, prog, backend, tok);
+        }
+      );
+    })
+  );
+  context.subscriptions.push(
+    vscode3.commands.registerCommand("callgraph.showWorkspaceGraph", async () => {
+      const extPick = await vscode3.window.showQuickPick(
+        [
+          {
+            label: "$(files) All (source only)",
+            description: ".c .cpp .cc .cxx .cu .cuh",
+            extensions: /* @__PURE__ */ new Set([".c", ".cpp", ".cc", ".cxx", ".cu", ".cuh"])
+          },
+          {
+            label: "$(file-code) C source",
+            description: ".c",
+            extensions: /* @__PURE__ */ new Set([".c"])
+          },
+          {
+            label: "$(file-code) C++ source",
+            description: ".cpp .cc .cxx",
+            extensions: /* @__PURE__ */ new Set([".cpp", ".cc", ".cxx"])
+          },
+          {
+            label: "$(file-code) CUDA",
+            description: ".cu .cuh",
+            extensions: /* @__PURE__ */ new Set([".cu", ".cuh"])
+          }
+        ],
+        { placeHolder: "Select file extensions to analyze", title: "Call Map: Workspace analysis" }
+      );
+      if (!extPick)
+        return;
+      const workspaceFolders = vscode3.workspace.workspaceFolders;
+      if (!workspaceFolders?.length) {
+        vscode3.window.showErrorMessage("Call Map: No workspace folder is open.");
+        return;
+      }
+      const foundUris = await vscode3.window.withProgress(
+        { location: vscode3.ProgressLocation.Notification, title: "Searching C/C++ files...", cancellable: false },
+        async () => {
+          const results = await Promise.all(
+            workspaceFolders.map((folder) => findFilesInFolder(folder.uri, extPick.extensions))
+          );
+          return results.flat();
+        }
+      );
+      if (!foundUris.length) {
+        vscode3.window.showErrorMessage(
+          "Call Map: No target files found.\nExtension: " + extPick.description
+        );
+        return;
+      }
+      if (foundUris.length > getWarnThreshold()) {
+        const answer = await vscode3.window.showWarningMessage(
+          `Analyze ${foundUris.length} files. Continue?`,
+          { modal: true },
+          "Continue"
+        );
+        if (answer !== "Continue")
+          return;
+      }
+      const backend = await pickBackend();
+      if (!backend)
+        return;
+      const mode = await pickOutputMode();
+      if (!mode)
+        return;
+      await buildAndOutput(
+        mode,
+        `${foundUris.length} files`,
+        context.extensionUri,
+        (prog, tok) => buildWorkspaceCallGraph(foundUris, prog, backend, tok)
+      );
+    })
+  );
+  context.subscriptions.push(
+    vscode3.commands.registerCommand("callgraph.showFolderGraph", async (uri) => {
+      let folderUri;
+      if (uri) {
+        try {
+          const stat = await vscode3.workspace.fs.stat(uri);
+          folderUri = stat.type === vscode3.FileType.Directory ? uri : vscode3.Uri.file(path3.dirname(uri.fsPath));
+        } catch {
+          folderUri = vscode3.Uri.file(path3.dirname(uri.fsPath));
+        }
+      } else {
+        const activeFile = vscode3.window.activeTextEditor?.document.uri;
+        const defaultUri = activeFile ? vscode3.Uri.file(path3.dirname(activeFile.fsPath)) : vscode3.workspace.workspaceFolders?.[0]?.uri;
+        const result = await vscode3.window.showOpenDialog({
+          canSelectFolders: true,
+          canSelectFiles: false,
+          canSelectMany: false,
+          openLabel: "Analyze this folder",
+          title: "Call Map: Select folder to analyze",
+          defaultUri
+        });
+        if (!result?.length)
+          return;
+        folderUri = result[0];
+      }
+      const extPick = await vscode3.window.showQuickPick(
+        [
+          {
+            label: "$(files) All (source only)",
+            description: ".c .cpp .cc .cxx .cu .cuh",
+            extensions: /* @__PURE__ */ new Set([".c", ".cpp", ".cc", ".cxx", ".cu", ".cuh"])
+          },
+          {
+            label: "$(file-code) C source",
+            description: ".c",
+            extensions: /* @__PURE__ */ new Set([".c"])
+          },
+          {
+            label: "$(file-code) C++ source",
+            description: ".cpp .cc .cxx",
+            extensions: /* @__PURE__ */ new Set([".cpp", ".cc", ".cxx"])
+          },
+          {
+            label: "$(file-code) CUDA",
+            description: ".cu .cuh",
+            extensions: /* @__PURE__ */ new Set([".cu", ".cuh"])
+          }
+        ],
+        { placeHolder: "Select file extensions to analyze", title: "Call Map: Folder analysis" }
+      );
+      if (!extPick)
+        return;
+      if (!folderUri)
+        return;
+      const foundUris = await vscode3.window.withProgress(
+        { location: vscode3.ProgressLocation.Notification, title: "Searching C/C++ files...", cancellable: false },
+        () => findFilesInFolder(folderUri, extPick.extensions)
+      );
+      if (!foundUris.length) {
+        vscode3.window.showErrorMessage(
+          `Call Map: No target files found.
+Folder: ${folderUri.fsPath}
+Extension: ${extPick.description}`
+        );
+        return;
+      }
+      if (foundUris.length > getWarnThreshold()) {
+        const answer = await vscode3.window.showWarningMessage(
+          `Analyze ${foundUris.length} files. Continue?`,
+          { modal: true },
+          "Continue"
+        );
+        if (answer !== "Continue")
+          return;
+      }
+      const backend = await pickBackend();
+      if (!backend)
+        return;
+      const mode = await pickOutputMode();
+      if (!mode)
+        return;
+      const folderName = path3.basename(folderUri.fsPath);
+      await buildAndOutput(
+        mode,
+        folderName,
+        context.extensionUri,
+        (prog, tok) => buildWorkspaceCallGraph(foundUris, prog, backend, tok)
+      );
+    })
+  );
+  context.subscriptions.push(
+    vscode3.commands.registerCommand("callgraph.showPathGraph", async () => {
+      const editor = vscode3.window.activeTextEditor;
+      if (!editor) {
+        vscode3.window.showErrorMessage("Call Map: Please open a C/C++ file first.");
+        return;
+      }
+      const mode = await pickOutputMode();
+      if (!mode)
+        return;
+      const maxHops = vscode3.workspace.getConfiguration("callmap").get("maxHops", 4);
+      await buildAndOutput(
+        mode,
+        editor.document.fileName,
+        context.extensionUri,
+        (prog, tok) => buildPathThroughCallGraph(
+          editor.document,
+          editor.selection.active,
+          maxHops,
+          prog,
+          "gtags",
+          tok
+        )
+      );
+    })
+  );
+}
+function deactivate() {
+  CallGraphPanel.currentPanel?.dispose();
+}
+// Annotate the CommonJS export names for ESM import in node:
+0 && (module.exports = {
+  activate,
+  deactivate
+});
+//# sourceMappingURL=extension.js.map

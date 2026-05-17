@@ -34,12 +34,13 @@
   var nodes    = null;
   var edges    = null;
 
-  var nodeInfoMap          = {};   // id → { file, line, source, label, labelFull }
+  var nodeInfoMap          = {};   // id → { file, line, scopeEnd, label, labelFull, source? }
   var defaultNodeColors    = {};
   var canvasFontSize       = DEFAULT_FONT_SIZE;
   var currentNode          = null;
   var connectedEdgesOfNode = new Set();
   var currentSourceNodeId  = null;
+  var pendingSourceNodeId  = null; // ⑥ requestSource 送信済みで応答待ちの nodeId
 
   // ─────────────────────────────────────────────────────────────────────────
   // Extension → WebView メッセージ
@@ -48,9 +49,18 @@
   window.addEventListener('message', function (e) {
     var msg = e.data;
     switch (msg.type) {
-      case 'loading':   showLoading(msg.fileName);        break;
-      case 'graphData': renderGraph(msg);               break;
-      case 'error':     hideLoading(); showErrorInView(msg.message); break;
+      case 'loading':    showLoading(msg.fileName);          break;
+      case 'graphData':  renderGraph(msg);                   break;
+      case 'error':      hideLoading(); showErrorInView(msg.message); break;
+      case 'sourceData':
+        // ⑥ requestSource の応答: source を nodeInfoMap にキャッシュして表示
+        if (nodeInfoMap[msg.nodeId]) {
+          nodeInfoMap[msg.nodeId].source = msg.source;
+        }
+        pendingSourceNodeId = null;
+        // 現在表示中のノードと一致する場合のみ再描画
+        if (msg.nodeId === currentSourceNodeId) _renderSourceContent(msg.nodeId);
+        break;
     }
   });
 
@@ -61,7 +71,7 @@
   function showLoading(fileName) {
     document.getElementById('loading-overlay').style.display = 'flex';
     document.getElementById('loading-msg').textContent =
-      fileName ? ('"' + fileName + '" を解析中...') : '解析中...';
+      fileName ? ('"' + fileName + '"  Analyzing...') : 'Analyzing...';
   }
 
   function hideLoading() {
@@ -82,7 +92,7 @@
       'font-family:monospace;font-size:12px;line-height:1.7;">' +
       escapeHtml(msg) + '</pre>' +
       '<p style="font-size:11px;color:#b2bec3;font-family:monospace;">' +
-      'clangd / gtags が有効か確認してください</p>' +
+      'Check that clangd / gtags is enabled</p>' +
       '</div>';
   }
 
@@ -93,30 +103,105 @@
   function renderGraph(msg) {
     nodeInfoMap = {};
     msg.nodes.forEach(function (n) {
-      // labelFull はソースパネルの関数名表示用、label はグラフ上の表示用
       nodeInfoMap[n.id] = {
         file:      n.file,
         line:      n.line,
-        source:    n.source,
+        scopeEnd:  n.scopeEnd,
         label:     n.label,
         labelFull: n.labelFull || n.label,
+        source:    n.source || null, // ⑥ 通常 null (スタンドアロン HTML 時のみ設定済み)
       };
     });
 
     var inDeg = {};
     msg.edges.forEach(function (e) { inDeg[e.to] = (inDeg[e.to] || 0) + 1; });
 
+    // ─── BFS 最短パスレベル計算 ───────────────────────────────────────────────
+    // vis-network のデフォルト動作 (longest-path) だと、同じ caller から呼ばれた
+    // 兄弟ノードが異なる列に配置される問題がある。
+    // 各ノードに level プロパティ (= root からの最短ホップ数) を明示することで
+    // vis-network に対してレベルを強制し、兄弟を同列に揃える。
+    //
+    // 例:  main → A → X → Z
+    //           → B ──────↗   (B の level は A と同じ 1 に固定)
+    //           → C ──────↗   (C の level は A と同じ 1 に固定)
+    //
+    // 手順:
+    //   1. 入次数 0 のノードを root として level = 0 に設定
+    //   2. BFS で隣接ノードに level = min(現在値, 親level + 1) を伝播
+    //      (複数の親を持つノードは最も浅い親 +1 を採用)
+    var bfsLevel = {};
+    var adjOut = {};   // nodeId → [隣接 to の nodeId]
+    msg.nodes.forEach(function (n) { adjOut[n.id] = []; });
+    msg.edges.forEach(function (e) {
+      if (adjOut[e.from]) adjOut[e.from].push(e.to);
+    });
+
+    // root = 入次数 0 のノード
+    var bfsQueue = [];
+    msg.nodes.forEach(function (n) {
+      if (!inDeg[n.id]) {           // 入次数 0
+        bfsLevel[n.id] = 0;
+        bfsQueue.push(n.id);
+      }
+    });
+    // 孤立ノード保険: root が 0 件なら全ノードを level=0 で初期化して BFS
+    if (bfsQueue.length === 0) {
+      msg.nodes.forEach(function (n) { bfsLevel[n.id] = 0; bfsQueue.push(n.id); });
+    }
+
+    var qi = 0;
+    while (qi < bfsQueue.length) {
+      var cur = bfsQueue[qi++];
+      var nextLevel = bfsLevel[cur] + 1;
+      (adjOut[cur] || []).forEach(function (to) {
+        // 未訪問 OR より浅いパスが見つかった場合にのみ更新
+        if (bfsLevel[to] === undefined || bfsLevel[to] > nextLevel) {
+          bfsLevel[to] = nextLevel;
+          bfsQueue.push(to); // 更新があったので再伝播
+        }
+      });
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ─── level 内の縦順を固定 (order) ───────────────────────────────────────
+    // Same level nodes are sorted by file name then line number so the layout
+    // is deterministic across renders, and functions in the same file cluster together.
+    var levelGroups = {};
+    msg.nodes.forEach(function (n) {
+      var lv = bfsLevel[n.id] !== undefined ? bfsLevel[n.id] : 0;
+      if (!levelGroups[lv]) levelGroups[lv] = [];
+      levelGroups[lv].push(n);
+    });
+    var nodeOrder = {};
+    Object.keys(levelGroups).forEach(function (lv) {
+      levelGroups[lv]
+        .slice()
+        .sort(function (a, b) {
+          var fi = (nodeInfoMap[a.id] ? nodeInfoMap[a.id].file : '') || '';
+          var fj = (nodeInfoMap[b.id] ? nodeInfoMap[b.id].file : '') || '';
+          if (fi !== fj) return fi < fj ? -1 : 1;
+          var li = (nodeInfoMap[a.id] ? nodeInfoMap[a.id].line : 0) || 0;
+          var lj = (nodeInfoMap[b.id] ? nodeInfoMap[b.id].line : 0) || 0;
+          return li - lj;
+        })
+        .forEach(function (n, i) { nodeOrder[n.id] = i; });
+    });
+    // ─────────────────────────────────────────────────────────────────────────
+
     var visNodes = msg.nodes.map(function (n) {
       return {
         id:          n.id,
-        label:       n.label,   // ノード上の表示は常に短縮名
+        label:       n.label,
         title:       n.title,
         color:       n.color,
         size:        Math.min(12 + ((inDeg[n.id] || 0) * 3), 40),
         shape:       'dot',
         borderWidth: n.isCurrentFile ? 2 : 1,
         font:        { size: DEFAULT_FONT_SIZE, face: 'monospace', color: '#2d3436' },
-        shadow:      { enabled: true, size: 4, x: 2, y: 2, color: 'rgba(0,0,0,0.08)' }
+        shadow:      { enabled: true, size: 4, x: 2, y: 2, color: 'rgba(0,0,0,0.08)' },
+        level:       bfsLevel[n.id]  !== undefined ? bfsLevel[n.id]  : 0,
+        order:       nodeOrder[n.id] !== undefined ? nodeOrder[n.id] : 0
       };
     });
 
@@ -164,11 +249,11 @@
     renderLegend(msg.fileLegend);
 
     var errNote = (msg.errors && msg.errors.length > 0)
-      ? ' (警告: ' + msg.errors.length + '件)' : '';
+      ? ' (warnings: ' + msg.errors.length + ')' : '';
     var layoutNote = visNodes.length > HIERARCHICAL_THRESHOLD
       ? ' [physics]' : ' [hierarchical]';
     document.getElementById('build-info').textContent =
-      'ノード: ' + msg.nodes.length + ' / エッジ: ' + msg.edges.length +
+      'Nodes: ' + msg.nodes.length + ' / Edges: ' + msg.edges.length +
       ' / ' + msg.buildTimeMs + 'ms' + layoutNote + errNote;
 
     resetAll();
@@ -187,7 +272,7 @@
     var layoutOpt = useHierarchical
       ? {
           hierarchical: {
-            enabled: true, direction: 'LR', sortMethod: 'directed',
+            enabled: true, direction: 'LR', sortMethod: 'hubsize',
             levelSeparation: 220, nodeSpacing: 70, treeSpacing: 130,
             blockShifting: true, edgeMinimization: true, parentCentralization: true
           }
@@ -249,7 +334,7 @@
       document.getElementById('loading-overlay').style.display = 'flex';
       network.on('stabilizationProgress', function (params) {
         document.getElementById('loading-msg').textContent =
-          'レイアウト計算中... ' + Math.round(params.iterations / params.total * 100) + '%';
+          'Computing layout... ' + Math.round(params.iterations / params.total * 100) + '%';
       });
       network.once('stabilizationIterationsDone', function () {
         network.fit();
@@ -282,7 +367,7 @@
     if (isVscode) {
       vscode.postMessage({ type: 'openFile', file: info.file, line: info.line });
     } else {
-      alert('ファイル: ' + info.file + '\n行番号: ' + info.line);
+      alert('File: ' + info.file + '\nLine: ' + info.line);
     }
   }
 
@@ -403,31 +488,71 @@
   // ソースコードパネル
   // ─────────────────────────────────────────────────────────────────────────
 
-  function showSource(nodeId) {
-    var panel       = document.getElementById('source-panel');
+  // ⑥ ソースパネルの内容を実際に DOM に書き込む (source が既にある場合)
+  function _renderSourceContent(nodeId) {
+    var info        = nodeInfoMap[nodeId] || {};
     var placeholder = document.getElementById('source-placeholder');
     var content     = document.getElementById('source-content');
+    var baseName    = info.file ? info.file.replace(/\\/g, '/').split('/').pop() : '';
+    document.getElementById('source-func-name').textContent = info.labelFull || info.label || nodeId;
+    document.getElementById('source-file-info').textContent =
+      baseName ? (baseName + ' : line ' + info.line) : '';
+    if (info.source !== null && info.source !== undefined) {
+      document.getElementById('source-code').textContent = info.source;
+      placeholder.style.display = 'none';
+      content.style.display     = 'flex';
+    } else {
+      document.getElementById('source-code').textContent = '';
+      placeholder.style.display = 'flex';
+      content.style.display     = 'none';
+    }
+  }
+
+  function showSource(nodeId) {
+    var panel = document.getElementById('source-panel');
     panel.style.display = 'flex';
 
     if (!nodeId) {
-      placeholder.style.display = 'flex';
-      content.style.display     = 'none';
+      document.getElementById('source-placeholder').style.display = 'flex';
+      document.getElementById('source-content').style.display     = 'none';
       currentSourceNodeId = null;
       return;
     }
 
     currentSourceNodeId = nodeId;
-    var info     = nodeInfoMap[nodeId] || {};
-    var baseName = info.file ? info.file.replace(/\\/g, '/').split('/').pop() : '';
+    var info = nodeInfoMap[nodeId] || {};
 
-    // ソースパネルの関数名にはフルシグネチャ (labelFull) を使用する
-    document.getElementById('source-func-name').textContent = info.labelFull || info.label || nodeId;
-    document.getElementById('source-file-info').textContent =
-      baseName ? (baseName + ' : ' + info.line + '行目') : '';
-    document.getElementById('source-code').textContent = info.source || '(ソースが見つかりません)';
+    // キャッシュ済みなら即表示
+    if (info.source !== null && info.source !== undefined) {
+      _renderSourceContent(nodeId);
+      return;
+    }
 
-    placeholder.style.display = 'none';
-    content.style.display     = 'flex';
+    // ⑥ VSCode WebView 環境: requestSource を送って非同期取得
+    if (isVscode && info.file && pendingSourceNodeId !== nodeId) {
+      pendingSourceNodeId = nodeId;
+      // ヘッダ表示だけ先行描画し、ソース部分は "読み込み中..." を表示
+      var baseName = info.file ? info.file.replace(/\\/g, '/').split('/').pop() : '';
+      document.getElementById('source-func-name').textContent = info.labelFull || info.label || nodeId;
+      document.getElementById('source-file-info').textContent =
+        baseName ? (baseName + ' : line ' + info.line) : '';
+      document.getElementById('source-code').textContent = '// Loading...';
+      document.getElementById('source-placeholder').style.display = 'none';
+      document.getElementById('source-content').style.display     = 'flex';
+      vscode.postMessage({
+        type: 'requestSource',
+        nodeId:   nodeId,
+        file:     info.file,
+        line:     info.line,
+        scopeEnd: info.scopeEnd,
+      });
+      return;
+    }
+
+    // スタンドアロン HTML またはファイル情報なし
+    document.getElementById('source-code').textContent = '(Source not found)';
+    document.getElementById('source-placeholder').style.display = 'none';
+    document.getElementById('source-content').style.display     = 'flex';
   }
 
   function closeSrcPanel() {
@@ -455,7 +580,7 @@
     if (isVscode) {
       vscode.postMessage({ type: 'exportHtml' });
     } else {
-      alert('このファイル自体がすでにスタンドアロン HTML です。');
+      alert('This file is already a standalone HTML.');
     }
   });
 
@@ -485,6 +610,46 @@
     document.getElementById('font-size-input').value = DEFAULT_FONT_SIZE;
     applyFontSize();
   });
+  // ＋ / － ボタン: ネイティブスピナーを置き換える
+  document.getElementById('font-size-up').addEventListener('click', function () {
+    var input = document.getElementById('font-size-input');
+    var val   = Math.min(parseInt(input.value, 10) + 1, 64);
+    input.value    = val;
+    canvasFontSize = val;
+    applyFontSize();
+  });
+  document.getElementById('font-size-down').addEventListener('click', function () {
+    var input = document.getElementById('font-size-input');
+    var val   = Math.max(parseInt(input.value, 10) - 1, 6);
+    input.value    = val;
+    canvasFontSize = val;
+    applyFontSize();
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // コントロールパネル 折りたたみ
+  // ─────────────────────────────────────────────────────────────────────────
+  (function () {
+    var toggleBtn  = document.getElementById('controls-toggle');
+    var controls   = document.getElementById('controls');
+    var body       = document.getElementById('controls-body');
+    var collapsed  = false;
+    var openWidth  = '';  // 開いているときの実幅を保持
+    toggleBtn.addEventListener('click', function () {
+      collapsed = !collapsed;
+      if (collapsed) {
+        // 閉じる直前に実幅を取得して固定
+        openWidth          = controls.getBoundingClientRect().width + 'px';
+        controls.style.width = openWidth;
+      } else {
+        // 開いたら固定幅を解除 (CSS の width: 230px に戻る)
+        controls.style.width = '';
+      }
+      body.style.display    = collapsed ? 'none' : '';
+      toggleBtn.textContent = collapsed ? '▶' : '▼';
+      toggleBtn.title       = collapsed ? 'Expand panel' : 'Collapse panel';
+    });
+  }());
 
   // ─────────────────────────────────────────────────────────────────────────
   // 検索

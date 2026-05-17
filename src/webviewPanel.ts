@@ -3,7 +3,7 @@
  *
  * 【変更点 (main ← gtags マージ)】
  *  - buildGraphMsg: labelFull をソースパネル用に維持し label をノード表示に使用
- *  - HTML 凡例の色変更: 選択中 #00b894 → #97c2fc、caller #0984e3 → #00b894
+ *  - HTML 凡例の色変更: selected #00b894 → #97c2fc、caller #0984e3 → #00b894
  *  - HTML から引数表示トグル (sig-toggle) を削除
  *  - CSS の .ctrl-label クラスを削除してインラインスタイルに統一
  *
@@ -23,8 +23,60 @@ import * as vscode from 'vscode';
 import * as path   from 'path';
 import * as fs     from 'fs';
 import * as crypto from 'crypto';
-import * as os     from 'os';   // ★ ⑦: os.homedir() 用
-import { GraphData } from './callGraphBuilder';
+import * as os     from 'os';
+import { GraphData, MAX_SOURCE_LINES } from './callGraphBuilder';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// パスセキュリティユーティリティ
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * WebView から渡されたファイルパスを安全に正規化する。
+ *
+ * path.normalize のみでは "../../etc/passwd" のような相対パスを
+ * startsWith でのワークスペースチェックが弾けない場合がある。
+ * path.resolve で絶対パスに変換した上で比較することで
+ * ディレクトリトラバーサルを確実に防ぐ。
+ *
+ * Windows では大文字小文字を統一するため toLowerCase() を適用する。
+ */
+function resolveAndNormalize(p: string): string {
+  const resolved = path.resolve(p); // 相対パスを絶対パスに変換
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+/**
+ * filePath がワークスペースルートのいずれかの配下にあるか検証する。
+ *
+ * Security① 修正:
+ *   旧実装は wsRoots が空（単一ファイル編集モード）のとき無条件で true を返していたため、
+ *   WebView から任意のパス（/etc/passwd 等）を要求できる脆弱性があった。
+ *   allowedFiles（現グラフに含まれるファイルのみ）を第三引数で受け取り、
+ *   wsRoots が空の場合はそちらにフォールバックする。
+ */
+function isPathInWorkspace(
+  filePath:     string,
+  wsRoots:      string[],
+  allowedFiles: ReadonlySet<string>
+): boolean {
+  const fileResolved = resolveAndNormalize(filePath);
+  // ワークスペースが開いている場合: フォルダ配下かどうかで判断
+  if (wsRoots.length > 0) {
+    return wsRoots.some(r => {
+      const rResolved = resolveAndNormalize(r);
+      return fileResolved === rResolved
+        || fileResolved.startsWith(rResolved + path.sep)
+        || fileResolved.startsWith(rResolved + '/');
+    });
+  }
+  // ワークスペースなし（単一ファイル編集モード）:
+  // グラフに含まれるファイルのみ許可する（Security① 修正）
+  if (allowedFiles.size > 0) {
+    return allowedFiles.has(fileResolved);
+  }
+  // グラフもまだ無い状態（初期化中）: 安全のため拒否
+  return false;
+}
 
 const FILE_COLORS_BASE = [
   { background: '#ffeaa7', border: '#fdcb6e' },
@@ -56,14 +108,14 @@ function buildGraphMsg(data: GraphData): object {
     type: 'graphData',
     nodes: data.nodes.map(n => ({
       id:            n.id,
-      label:         n.label,     // 表示用 (短縮名)
-      labelFull:     n.labelFull, // ソースパネル用 (フルシグネチャ)
+      label:         n.label,
+      labelFull:     n.labelFull,
       file:          n.file,
       line:          n.line,
-      source:        n.source,
+      scopeEnd:      n.scopeEnd,   // ⑥ lazy source 用 (source は送らない)
       isCurrentFile: n.isCurrentFile,
       color:  colorMap[n.file] ?? FILE_COLORS_BASE[FILE_COLORS_BASE.length - 1],
-      title:  `${n.label}\n${path.basename(n.file)} : ${n.line}行`,
+      title:  `${n.label}\n${path.basename(n.file)} : line ${n.line}`,
     })),
     edges: data.edges, fileLegend,
     buildTimeMs: data.buildTimeMs, errors: data.errors,
@@ -111,6 +163,9 @@ export class CallGraphPanel {
   //   両メッセージが順番通りに届くようにする。
   private _pendingMessages: object[] = [];
   private _lastGraphData:  GraphData | null = null;
+  // Security①: グラフに含まれるファイルパス（正規化済み）のセット。
+  //   wsRoots が空の単一ファイル編集モードでのアクセス制限に使用する。
+  private _allowedFiles: Set<string> = new Set();
 
   private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri) {
     this._panel        = panel;
@@ -130,9 +185,37 @@ export class CallGraphPanel {
           case 'openFile':
             if (msg.file && msg.line !== undefined) await this._openFileAtLine(msg.file, msg.line);
             break;
+          case 'requestSource': {
+            // ⑥ ソース遅延読み込み: ノードクリック時にファイルを読んで返す
+            const { nodeId, file, line, scopeEnd } = msg as {
+              nodeId: string; file: string; line: number; scopeEnd?: number;
+            };
+            // Bug① 修正: !line は line===0 でも true になるため line !== undefined に変更
+            if (!file || line === undefined) break;
+            // Security①: resolveAndNormalize + isPathInWorkspace (allowedFiles フォールバック付き)
+            const wsRoots = vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? [];
+            if (!isPathInWorkspace(file, wsRoots, this._allowedFiles)) break;
+            // 検証済みの正規化パスを使ってファイルを読む
+            const resolvedFile = path.resolve(file);
+            try {
+              const content = await fs.promises.readFile(resolvedFile, 'utf-8');
+              const lines   = content.split('\n');
+              const startIdx = Math.max(0, line - 1);
+              // Bug③ 修正: 120 (ハードコード) → MAX_SOURCE_LINES に統一
+              //   callGraphBuilder.ts の scopeEnd 計算 (start + MAX_SOURCE_LINES - 1) と一致させる
+              const endIdx   = scopeEnd !== undefined
+                ? Math.min(scopeEnd, startIdx + MAX_SOURCE_LINES, lines.length)
+                : Math.min(startIdx + MAX_SOURCE_LINES, lines.length);
+              const source = lines.slice(startIdx, endIdx).join('\n');
+              this._panel.webview.postMessage({ type: 'sourceData', nodeId, source });
+            } catch {
+              this._panel.webview.postMessage({ type: 'sourceData', nodeId, source: '// Could not read source' });
+            }
+            break;
+          }
           case 'exportHtml':
             if (this._lastGraphData) await CallGraphPanel.exportHtmlFile(this._extensionUri, this._lastGraphData);
-            else vscode.window.showWarningMessage('エクスポートするグラフがありません。');
+            else vscode.window.showWarningMessage('No graph data to export.');
             break;
         }
       },
@@ -155,18 +238,20 @@ export class CallGraphPanel {
   }
 
   public setLoading(fileName: string): void {
-    this._panel.title = 'Call Map — 解析中...';
+    this._panel.title = 'Call Map — Analyzing...';
     this._postOrQueue({ type: 'loading', fileName });
   }
 
   public updateGraph(data: GraphData): void {
     this._lastGraphData = data;
     this._panel.title   = `Call Map — ${data.fileName}`;
+    // Security①: グラフに含まれるファイルを許可リストとして更新
+    this._allowedFiles = new Set(data.nodes.map(n => resolveAndNormalize(n.file)));
     this._postOrQueue(buildGraphMsg(data));
   }
 
   public showError(message: string): void {
-    this._panel.title = 'Call Map — エラー';
+    this._panel.title = 'Call Map — Error';
     this._postOrQueue({ type: 'error', message });
   }
 
@@ -180,7 +265,7 @@ export class CallGraphPanel {
 
     const saveUri = await vscode.window.showSaveDialog({
       defaultUri,
-      filters: { 'HTML ファイル': ['html'] },
+      filters: { 'HTML File': ['html'] },
     });
     if (!saveUri) return;
 
@@ -188,11 +273,11 @@ export class CallGraphPanel {
       const html = generateStandaloneHtml(extensionUri, data);
       await vscode.workspace.fs.writeFile(saveUri, Buffer.from(html, 'utf-8'));
       const open = await vscode.window.showInformationMessage(
-        `保存完了: ${path.basename(saveUri.fsPath)}`, 'ブラウザで開く'
+        `Saved: ${path.basename(saveUri.fsPath)}`, 'Open in Browser'
       );
-      if (open === 'ブラウザで開く') await vscode.env.openExternal(saveUri);
+      if (open === 'Open in Browser') await vscode.env.openExternal(saveUri);
     } catch (e) {
-      vscode.window.showErrorMessage(`保存に失敗しました: ${e}`);
+      vscode.window.showErrorMessage(`Failed to save: ${e}`);
     }
   }
 
@@ -209,26 +294,23 @@ export class CallGraphPanel {
   }
 
   private async _openFileAtLine(filePath: string, line: number): Promise<void> {
-    // ★ ⑤: webview メッセージ経由で任意パスが渡される可能性を防ぐ。
-    //   ワークスペースフォルダのいずれかの配下にあるファイルのみ許可する。
-    //   ワークスペースが未設定の場合は制限なし (単一ファイル編集モード)。
+    // Security①: isPathInWorkspace に _allowedFiles を渡し、
+    //   単一ファイル編集モードでもグラフ外のファイルを開けないようにする。
     const wsRoots = (vscode.workspace.workspaceFolders ?? []).map(f => f.uri.fsPath);
-    const inWorkspace = wsRoots.length === 0
-      || wsRoots.some(r => filePath === r
-          || filePath.startsWith(r + path.sep)
-          || filePath.startsWith(r + '/'));
-    if (!inWorkspace) {
+    if (!isPathInWorkspace(filePath, wsRoots, this._allowedFiles)) {
       vscode.window.showErrorMessage(
-        `Call Map: ワークスペース外のファイルは開けません:\n${filePath}`);
+        `Call Map: Cannot open file outside workspace:\n${filePath}`);
       return;
     }
+    // 検証済みの正規化パスで URI を生成する
+    const resolvedPath = path.resolve(filePath);
     try {
-      const uri = vscode.Uri.file(filePath);
+      const uri = vscode.Uri.file(resolvedPath);
       const pos = new vscode.Position(Math.max(0, line - 1), 0);
       const doc = await vscode.workspace.openTextDocument(uri);
       await vscode.window.showTextDocument(doc, { selection: new vscode.Range(pos, pos), viewColumn: vscode.ViewColumn.One });
     } catch {
-      vscode.window.showErrorMessage(`ファイルを開けませんでした: ${filePath}`);
+      vscode.window.showErrorMessage(`Could not open file: ${resolvedPath}`);
     }
   }
 
@@ -267,7 +349,7 @@ function htmlTemplate(mode: HtmlTemplateMode, scripts: string): string {
          content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline';">`;
 
   return `<!DOCTYPE html>
-<html lang="ja">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 ${cspMeta}
@@ -293,7 +375,7 @@ div.vis-network div.vis-navigation div.vis-button.vis-zoomOut     { left: 122px 
   background: rgba(255,255,255,0.95); border: 1px solid #ddd;
   border-radius: 8px; padding: 12px 14px; font-family: monospace;
   font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.12);
-  min-width: 230px; line-height: 1.8;
+  width: auto; line-height: 1.8;
 }
 #search-box {
   width: 100%; padding: 5px 8px; border: 1px solid #b2bec3;
@@ -318,35 +400,53 @@ div.vis-network div.vis-navigation div.vis-button.vis-zoomOut     { left: 122px 
 }
 .spinner { width: 36px; height: 36px; border: 3px solid #dfe6e9; border-top-color: #00b894; border-radius: 50%; animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+/* ネイティブ number スピナーを非表示にして見切れを防ぐ */
+#font-size-input::-webkit-inner-spin-button,
+#font-size-input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+#font-size-input { -moz-appearance: textfield; text-align: center; }
+/* コントロールパネル折りたたみ */
+#controls-toggle {
+  background: none; border: none; cursor: pointer;
+  font-size: 12px; color: #636e72; padding: 0 2px; line-height: 1;
+  transition: transform 0.15s;
+}
+#controls-toggle.collapsed { transform: rotate(-90deg); }
+#controls-body { overflow: hidden; }
 </style>
 </head>
 <body>
 <div id="network"></div>
 
 <div id="controls">
-  <b style="font-size:13px;">📞 Call Map</b>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+    <b style="font-size:13px;">📞 Call Map</b>
+    <button id="controls-toggle" title="Collapse panel">▼</button>
+  </div>
+  <div id="controls-body">
   <div style="color:#636e72;font-size:11px;margin:2px 0 8px;">
-    <b style="color:#97c2fc;">●</b> 選択中 &nbsp;
+    <b style="color:#97c2fc;">●</b> selected &nbsp;
     <b style="color:#e17055;">●</b> callee &nbsp;
     <b style="color:#00b894;">●</b> caller &nbsp;
-    <span style="color:#aaa;font-size:10px;">Ctrl+クリック→ジャンプ</span>
+    <span style="color:#aaa;font-size:10px;">Ctrl+Click to jump</span>
   </div>
-  <input id="search-box" type="text" placeholder="🔍 関数名を検索">
+  <input id="search-box" type="text" placeholder="🔍 Search function">
 
   <label style="cursor:pointer;display:flex;align-items:center;gap:6px;font-size:11px;color:#2d3436;margin-bottom:4px;">
-    <input id="src-toggle" type="checkbox" style="cursor:pointer;"> ソースコードパネルを表示
+    <input id="src-toggle" type="checkbox" style="cursor:pointer;"> Show source panel
   </label>
-  <div style="display:flex;align-items:center;gap:5px;font-size:11px;color:#636e72;margin-bottom:6px;">
-    <label for="font-size-input" style="white-space:nowrap;">文字サイズ:</label>
+  <div style="display:flex;align-items:center;gap:4px;font-size:11px;color:#636e72;margin-bottom:6px;">
+    <label for="font-size-input" style="white-space:nowrap;">Font size:</label>
+    <button id="font-size-down" style="width:22px;height:22px;border:1px solid #b2bec3;border-radius:4px;background:#f0f0f0;font-size:13px;line-height:1;cursor:pointer;color:#636e72;padding:0;display:flex;align-items:center;justify-content:center;">－</button>
     <input id="font-size-input" type="number" value="11" min="6" max="64"
-      style="width:46px;padding:2px 5px;border:1px solid #b2bec3;border-radius:4px;font-family:monospace;font-size:11px;text-align:center;outline:none;">
-    <button id="font-size-reset" style="padding:2px 7px;border:1px solid #b2bec3;border-radius:4px;background:#f0f0f0;font-family:monospace;font-size:11px;cursor:pointer;color:#636e72;">Default</button>
+      style="width:38px;height:22px;padding:0 2px;border:1px solid #b2bec3;border-radius:4px;font-family:monospace;font-size:11px;outline:none;">
+    <button id="font-size-up" style="width:22px;height:22px;border:1px solid #b2bec3;border-radius:4px;background:#f0f0f0;font-size:13px;line-height:1;cursor:pointer;color:#636e72;padding:0;display:flex;align-items:center;justify-content:center;">＋</button>
+    <button id="font-size-reset" style="padding:2px 7px;height:22px;border:1px solid #b2bec3;border-radius:4px;background:#f0f0f0;font-family:monospace;font-size:11px;cursor:pointer;color:#636e72;">Reset</button>
   </div>
   <button id="export-btn" style="width:100%;padding:5px 0;margin-bottom:6px;border:1px solid #b2bec3;border-radius:4px;background:#f8f9fa;font-family:monospace;font-size:11px;cursor:pointer;color:#2d3436;">
-    💾 HTML として保存
+    💾 Save as HTML
   </button>
   <div id="hop-panel" style="display:none;margin-top:2px;">
-    <div style="color:#636e72;font-size:11px;margin-bottom:4px;">表示範囲（ホップ数）:</div>
+    <div style="color:#636e72;font-size:11px;margin-bottom:4px;">Hop filter:</div>
     <div style="display:flex;gap:5px;">
       <button class="hop-btn" data-hop="1">1</button>
       <button class="hop-btn" data-hop="2">2</button>
@@ -355,17 +455,18 @@ div.vis-network div.vis-navigation div.vis-button.vis-zoomOut     { left: 122px 
     </div>
   </div>
   <div style="margin-top:10px;border-top:1px solid #ddd;padding-top:8px;">
-    <div style="color:#636e72;font-size:11px;margin-bottom:5px;">ファイル凡例:</div>
+    <div style="color:#636e72;font-size:11px;margin-bottom:5px;">File legend:</div>
     <div id="legend-items"></div>
   </div>
   <div id="build-info" style="margin-top:8px;border-top:1px solid #ddd;padding-top:6px;color:#b2bec3;font-size:10px;"></div>
+  </div><!-- #controls-body -->
 </div>
 
 <div id="source-panel">
   <div id="source-placeholder">
     <span style="font-size:28px;">←</span>
-    <span style="font-size:13px;">ノードをクリックしてください</span>
-    <span style="font-size:11px;color:#6c7086;">Ctrl+クリックでエディタへジャンプ</span>
+    <span style="font-size:13px;">Click a node</span>
+    <span style="font-size:11px;color:#6c7086;">Ctrl+Click to jump to editor</span>
   </div>
   <div id="source-content">
     <div style="padding:10px 16px;background:#181825;border-bottom:1px solid #45475a;display:flex;justify-content:space-between;align-items:flex-start;flex-shrink:0;">
@@ -374,7 +475,7 @@ div.vis-network div.vis-navigation div.vis-button.vis-zoomOut     { left: 122px 
         <span id="source-file-info" style="color:#6c7086;font-size:11px;"></span>
       </div>
       <div style="display:flex;gap:8px;align-items:center;margin-left:8px;">
-        <button id="goto-btn" style="background:#313244;border:1px solid #45475a;color:#cdd6f4;cursor:pointer;padding:4px 10px;border-radius:4px;font-family:monospace;font-size:11px;">▷ ソースへジャンプ</button>
+        <button id="goto-btn" style="background:#313244;border:1px solid #45475a;color:#cdd6f4;cursor:pointer;padding:4px 10px;border-radius:4px;font-family:monospace;font-size:11px;">▷ Go to source</button>
         <button id="src-close-btn" style="background:none;border:none;color:#6c7086;cursor:pointer;font-size:16px;">✕</button>
       </div>
     </div>
@@ -384,7 +485,7 @@ div.vis-network div.vis-navigation div.vis-button.vis-zoomOut     { left: 122px 
 
 <div id="loading-overlay">
   <div class="spinner"></div>
-  <div id="loading-msg" style="font-family:monospace;color:#636e72;font-size:13px;">解析中...</div>
+  <div id="loading-msg" style="font-family:monospace;color:#636e72;font-size:13px;">Analyzing...</div>
 </div>
 
 ${scripts}

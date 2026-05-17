@@ -3,11 +3,12 @@
   "displayName": "Call Map",
   "publisher": "uta-orange-1214",
   "description": "Interactive C/C++ call graph viewer using LSP Call Hierarchy or GNU GLOBAL (gtags). / LSP または GNU GLOBAL (gtags) を使った C/C++ インタラクティブコールグラフビューア。",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/uta1214/call-map"
   },
+  "icon": "icon.png",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -46,7 +47,22 @@
         "command": "callgraph.showWorkspaceGraph",
         "title": "Call Map: Analyze Workspace",
         "icon": "$(search)"
+      },
+      {
+        "command": "callgraph.showFolderGraph",
+        "title": "Call Map: Analyze Folder",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "callgraph.showPathGraph",
+        "title": "Call Map: Show Path-Through Graph (gtags)",
+        "icon": "$(git-merge)"
       }
+    ],
+    "keybindings": [
+      { "command": "callgraph.showFileGraph",     "key": "ctrl+alt+M", "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp" },
+      { "command": "callgraph.showFunctionGraph", "key": "ctrl+alt+F", "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp" },
+      { "command": "callgraph.showPathGraph",     "key": "ctrl+alt+P", "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp" }
     ],
     "menus": {
       "editor/context": [
@@ -64,6 +80,23 @@
           "command": "callgraph.showWorkspaceGraph",
           "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp",
           "group": "9_callgraph@3"
+        },
+        {
+          "command": "callgraph.showFolderGraph",
+          "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp",
+          "group": "9_callgraph@4"
+        },
+        {
+          "command": "callgraph.showPathGraph",
+          "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp",
+          "group": "9_callgraph@5"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "callgraph.showFolderGraph",
+          "when": "explorerResourceIsFolder",
+          "group": "9_callgraph@1"
         }
       ],
       "editor/title": [
@@ -76,8 +109,39 @@
           "command": "callgraph.showWorkspaceGraph",
           "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp",
           "group": "navigation@2"
+        },
+        {
+          "command": "callgraph.showFolderGraph",
+          "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp",
+          "group": "navigation@3"
         }
       ]
+    },
+    "configuration": {
+      "type": "object",
+      "title": "Call Map Settings",
+      "properties": {
+        "callmap.defaultBackend": {
+          "type": "string",
+          "enum": ["lsp", "gtags"],
+          "default": "lsp",
+          "enumDescriptions": [
+            "Use LSP (clangd / C/C++ extension) for high-accuracy analysis / LSP (clangd / C/C++ 拡張) を使用した高精度解析",
+            "Use GNU GLOBAL (gtags) for fast analysis / GNU GLOBAL (gtags) を使用した高速解析"
+          ],
+          "description": "Default backend for call graph analysis. / コールグラフ解析のデフォルトバックエンド。"
+        },
+        "callmap.maxHops": {
+          "type": "number",
+          "default": 4,
+          "description": "Maximum number of BFS hops for Function Graph. / Function Graph の BFS 最大ホップ数。"
+        },
+        "callmap.warnThreshold": {
+          "type": "number",
+          "default": 30,
+          "description": "Warn when the number of files to analyze exceeds this threshold. / 解析対象ファイル数がこの閾値を超えたときに警告を表示する。"
+        }
+      }
     }
   }
 }
