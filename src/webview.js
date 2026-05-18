@@ -558,6 +558,9 @@
   function closeSrcPanel() {
     document.getElementById('src-toggle').checked         = false;
     document.getElementById('source-panel').style.display = 'none';
+    // ④ 修正: パネルを閉じた後も currentSourceNodeId が残ると
+    //   別ノードクリック時に _renderSourceContent が誤って呼ばれる問題を修正。
+    currentSourceNodeId = null;
   }
 
   document.getElementById('src-close-btn').addEventListener('click', closeSrcPanel);
@@ -656,7 +659,10 @@
   // ─────────────────────────────────────────────────────────────────────────
 
   var searchBox = document.getElementById('search-box');
+  // Low-3: 検索 Enter で次ヒットへ順番に移動するためのカウンタ
+  var searchHitIndex = 0;
   searchBox.addEventListener('input', function () {
+    searchHitIndex = 0; // 入力変更時はカウンタをリセット
     if (!nodes) return;
     var q = this.value.trim().toLowerCase();
     if (!q) { resetAll(); return; }
@@ -687,9 +693,25 @@
                  (info.labelFull || '').toLowerCase().indexOf(q) !== -1;
         }
       });
-      if (hits.length) network.focus(hits[0].id, { scale: 1.5, animation: { duration: 400 } });
+      if (hits.length) {
+        // Low-3: Shift+Enter で前へ、Enter で次へ循環移動
+        if (e.shiftKey) {
+          searchHitIndex = (searchHitIndex - 1 + hits.length) % hits.length;
+        } else {
+          searchHitIndex = searchHitIndex % hits.length;
+        }
+        network.focus(hits[searchHitIndex].id, { scale: 1.5, animation: { duration: 400 } });
+        // 次回 Enter に備えてインクリメント（Shift 時はデクリメント済みなので +1）
+        if (!e.shiftKey) searchHitIndex++;
+      }
     }
-    if (e.key === 'Escape') resetAll();
+    if (e.key === 'Escape') {
+      // ① 修正: document の keydown ハンドラも Escape を捕捉するため
+      //   stopPropagation で伝播を止めて resetAll の二重呼び出しを防ぐ。
+      e.stopPropagation();
+      searchHitIndex = 0;
+      resetAll();
+    }
   });
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -697,8 +719,12 @@
   // ─────────────────────────────────────────────────────────────────────────
 
   function resetAll() {
-    currentNode = null;
+    currentNode          = null;
     connectedEdgesOfNode = new Set();
+    // High-1 修正: resetAll 後に同じノードを再クリックしても
+    // pendingSourceNodeId が残っていると requestSource が再送されず
+    // ソースパネルが空のまま固まる問題を修正。
+    pendingSourceNodeId  = null;
     if (network) network.unselectAll();
     if (nodes) {
       nodes.update(nodes.getIds().map(function (id) {

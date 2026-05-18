@@ -69,7 +69,7 @@ https://github.com/uta1214/call-map
 | Click node | Highlight callers (green) and callees (orange) |
 | Ctrl + Click node | Jump to source in editor |
 | Hop buttons (1 / 2 / 3 / All) | Show only nodes within N hops of selected node |
-| 🔍 Search box | Filter by function name (Enter to focus, Esc to reset) |
+| 🔍 Search box | Filter by function name (Enter to focus next hit, Shift+Enter for previous, Esc to reset) |
 | Source panel checkbox | Toggle the source code panel |
 | ▼ / ▶ toggle button | Collapse / expand the control panel |
 | Double-click / Esc | Deselect and reset |
@@ -243,7 +243,7 @@ https://github.com/uta1214/call-map
 | ノードクリック | caller（緑）と callee（橙）をハイライト |
 | Ctrl + クリック | エディタのソースへジャンプ |
 | ホップ数ボタン（1 / 2 / 3 / All） | 選択ノードから N ホップ以内のみ表示 |
-| 🔍 検索ボックス | 関数名でフィルタ（Enter でフォーカス移動、Esc でリセット） |
+| 🔍 検索ボックス | 関数名でフィルタ（Enter で次のヒットへ移動、Shift+Enter で前へ、Esc でリセット） |
 | ソースコードパネル チェックボックス | 右パネルを表示・非表示 |
 | ▼ / ▶ トグルボタン | コントロールパネルを折りたたむ・展開する |
 | ダブルクリック / Esc | 選択解除・リセット |

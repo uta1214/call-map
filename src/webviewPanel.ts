@@ -122,10 +122,15 @@ function buildGraphMsg(data: GraphData): object {
   };
 }
 
-function generateStandaloneHtml(extensionUri: vscode.Uri, data: GraphData): string {
+async function generateStandaloneHtml(extensionUri: vscode.Uri, data: GraphData): Promise<string> {
   const distDir   = vscode.Uri.joinPath(extensionUri, 'dist').fsPath;
-  const visJs     = fs.readFileSync(path.join(distDir, 'vis-network.min.js'), 'utf-8');
-  const webviewJs = fs.readFileSync(path.join(distDir, 'webview.js'), 'utf-8');
+  // Mid-4 修正: readFileSync → readFile (非同期) に変更。
+  //   約 1MB の vis-network.min.js を同期読み込みすると VS Code 拡張機能ホストの
+  //   イベントループをブロックするため、Promise.all で並列非同期読み込みに変更する。
+  const [visJs, webviewJs] = await Promise.all([
+    fs.promises.readFile(path.join(distDir, 'vis-network.min.js'), 'utf-8'),
+    fs.promises.readFile(path.join(distDir, 'webview.js'), 'utf-8'),
+  ]);
   const graphMsg  = buildGraphMsg(data);
 
   // ★ セキュリティ: JSON.stringify は </script> をエスケープしないため
@@ -270,7 +275,7 @@ export class CallGraphPanel {
     if (!saveUri) return;
 
     try {
-      const html = generateStandaloneHtml(extensionUri, data);
+      const html = await generateStandaloneHtml(extensionUri, data);
       await vscode.workspace.fs.writeFile(saveUri, Buffer.from(html, 'utf-8'));
       const open = await vscode.window.showInformationMessage(
         `Saved: ${path.basename(saveUri.fsPath)}`, 'Open in Browser'

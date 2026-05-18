@@ -83,17 +83,21 @@ const BATCH_DELAY_INIT = 20;   // 初期遅延 ms
 const BATCH_DELAY_MIN  = 0;    // 最小遅延 ms
 const BATCH_DELAY_MAX  = 150;  // Canceled 急増時の上限 ms
 
-// ② LSP ワークスペース: ファイルレベル並列処理数
-const WORKSPACE_FILE_CONCURRENCY = 6;
-
 // caller としてスキャンするソース拡張子 (ヘッダー除外)
 const CC_SOURCE_EXTENSIONS = new Set(['.c', '.cpp', '.cc', '.cxx', '.cu', '.cuh']);
 
-// findFiles 用グロブ (extension.ts でも共有)
-const CC_SOURCE_GLOB      = '**/*.{c,cpp,cc,cxx,cu,cuh}';
+// ⑤ 修正: CC_SOURCE_GLOB / WORKSPACE_FILE_CONCURRENCY は未使用のため削除。
 // Precision ③: ヘッダーを callee ノードとして収集するための広域グロブ
 const CC_ALL_GLOB         = '**/*.{c,cpp,cc,cxx,cu,cuh,h,hpp,hxx}';
-export const EXCLUDE_GLOB = '{**/node_modules/**,**/build/**,**/dist/**,**/out/**,**/.git/**}';
+// ③ 修正: EXCLUDE_DIRS (extension.ts) に追加した CMake/ツール系ディレクトリを同期。
+//   vscode.workspace.findFiles の excludePattern はここを参照するため、
+//   EXCLUDE_DIRS と揃えないと CMakeFiles 以下の生成ファイルが収集対象に混入する。
+export const EXCLUDE_GLOB = [
+  '**/node_modules/**', '**/build/**', '**/dist/**', '**/out/**', '**/.git/**',
+  '**/CMakeFiles/**', '**/_build/**', '**/_deps/**',
+  '**/cmake-build-debug/**', '**/cmake-build-release/**',
+  '**/.cache/**', '**/.ccls-cache/**', '**/vendor/**', '**/.deps/**',
+].join(',').replace(/^/, '{').replace(/$/, '}');
 
 // ④ global -rx 並列バッチ設定
 const GLOBAL_RX_BATCH    = 100;  // 1プロセスあたりの関数名上限
@@ -115,6 +119,26 @@ const CACHE_TTL_MS      = 5 * 60_000; // 5 分: TTL 超過エントリは再ビ�
 interface GraphCacheEntry { data: GraphData; timestamp: number; }
 const graphDataCache = new Map<string, GraphCacheEntry>();
 
+// ─── パフォーマンス改善: gtags タグキャッシュ ─────────────────────────────
+// 問題: collectGtags (global -x -e '.') はプロジェクト全体を走査するため
+//   大規模プロジェクトでは数十秒かかる。GraphData キャッシュとは独立して
+//   タグマップをキャッシュすることで、2回目以降をほぼ一瞬にする。
+// TTL: GTAGS_UPDATE_TTL (30s) と揃える。global -u 後に自動的に再収集する。
+const TAGS_CACHE_TTL_MS = GTAGS_UPDATE_TTL; // 30 s
+interface TagsCacheEntry {
+  tags:           Map<string, GtagEntry[]>;
+  ambiguousNames: string[];
+  timestamp:      number;
+}
+const tagsCache = new Map<string, TagsCacheEntry>(); // wsRoot → entry
+
+// ─── パフォーマンス改善: findFiles キャッシュ ────────────────────────────
+// vscode.workspace.findFiles は大規模プロジェクトで数秒かかる。
+// 短い TTL でキャッシュして collectGtags の前コストを削減する。
+const FILES_CACHE_TTL_MS = 10_000; // 10 s
+interface FilesCacheEntry { uris: vscode.Uri[]; timestamp: number; }
+const filesCache = new Map<string, FilesCacheEntry>(); // wsRoot → entry
+
 /** ⑦ 上限付きキャッシュ書き込み: 上限超過時は最古エントリを削除 */
 function setGraphCache(key: string, entry: GraphCacheEntry): void {
   if (graphDataCache.size >= MAX_CACHE_ENTRIES) {
@@ -135,12 +159,21 @@ function setGraphCache(key: string, entry: GraphCacheEntry): void {
  * extension.ts の FileSystemWatcher から呼ばれる。
  */
 export function invalidateCache(filePath?: string): void {
-  if (!filePath) { graphDataCache.clear(); return; }
+  if (!filePath) {
+    graphDataCache.clear();
+    // パフォーマンス改善: tagsCache / filesCache も全削除
+    tagsCache.clear();
+    filesCache.clear();
+    return;
+  }
   // パス正規化して比較（Fix 5）
   const norm = normalizeFsPath(filePath);
   for (const key of graphDataCache.keys()) {
     if (key.includes(norm) || key.includes(filePath)) graphDataCache.delete(key);
   }
+  // ファイル変更時はタグが古くなる可能性があるため tagsCache を全削除
+  // (wsRoot 単位での部分削除は複雑で効果が薄いため全削除で安全側に倒す)
+  tagsCache.clear();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -238,6 +271,11 @@ class Pct {
     const done  = Math.max(0, total - pending.length);
     this.to(total === 0 ? end : start + (end - start) * done / total);
   }
+
+  /** ④ パフォーマンス改善: パーセントを変えずにメッセージだけ更新する */
+  report(message: string): void {
+    this.p?.report({ message, increment: 0 });
+  }
 }
 
 function getWorkspaceRoot(fallbackUri?: vscode.Uri): string | undefined {
@@ -257,20 +295,23 @@ function getWorkspaceRoots(fallbackUri?: vscode.Uri): string[] {
  * どのフォルダにも属さない場合はフォールバック順で返す:
  *   1. workspaceFolders[0] (GTAGS が最初のルートにある想定)
  *   2. fileUri の親ディレクトリ
+ *
+ * Mid-1 修正: Windows はファイルシステムがケースインセンシティブなため
+ *   startsWith による大文字小文字の不一致を防ぐため normalizeFsPath で比較する。
  */
 function getWorkspaceRootForFile(fileUri: vscode.Uri): string | undefined {
-  const filePath = fileUri.fsPath;
+  const filePath = normalizeFsPath(fileUri.fsPath);
   const folders  = vscode.workspace.workspaceFolders ?? [];
   for (const folder of folders) {
-    const root = folder.uri.fsPath;
+    const root = normalizeFsPath(folder.uri.fsPath);
     if (filePath === root
       || filePath.startsWith(root + path.sep)
       || filePath.startsWith(root + '/')) {
-      return root;
+      return folder.uri.fsPath; // 元のパス（正規化前）を返す
     }
   }
   // どのフォルダにも属さない場合: 最初のフォルダか親ディレクトリ
-  return folders[0]?.uri.fsPath ?? path.dirname(filePath);
+  return folders[0]?.uri.fsPath ?? path.dirname(fileUri.fsPath);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -278,7 +319,9 @@ function getWorkspaceRootForFile(fileUri: vscode.Uri): string | undefined {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function gtagsAvailable(): Promise<boolean> {
-  try { await execFileAsync('gtags', ['--version']); return true; }
+  // High-2 修正: タイムアウトなしだと WSL 環境や PATH 異常で
+  // gtags がハングしたとき resolveBackend('auto') が無期限にブロックする。
+  try { await execFileAsync('gtags', ['--version'], { timeout: 5_000 }); return true; }
   catch { return false; }
 }
 
@@ -899,6 +942,48 @@ async function buildWorkspaceCallGraphLsp(
   };
 }
 
+/**
+ * パフォーマンス改善②: vscode.workspace.findFiles の結果を FILES_CACHE_TTL_MS キャッシュする。
+ * wsRoot ごとに独立したキャッシュエントリを持つ。
+ */
+async function findFilesCached(wsRoot: string): Promise<vscode.Uri[]> {
+  const now    = Date.now();
+  const cached = filesCache.get(wsRoot);
+  if (cached && now - cached.timestamp < FILES_CACHE_TTL_MS) return cached.uris;
+  const uris = await vscode.workspace.findFiles(CC_ALL_GLOB, EXCLUDE_GLOB);
+  filesCache.set(wsRoot, { uris, timestamp: now });
+  return uris;
+}
+
+/**
+ * パフォーマンス改善①: collectGtags の結果を TAGS_CACHE_TTL_MS キャッシュする。
+ *
+ * 【Before】毎回 global -x -e '.' を実行 → 大規模プロジェクトで数十秒
+ * 【After】 2回目以降はキャッシュから即座に返す → ほぼ 0ms
+ *
+ * lineCache は毎回空で返す (ファイル内容はビルド関数側で都度読む)。
+ * タグマップ自体は読み取り専用で参照するため共有しても安全。
+ */
+async function collectGtagsCached(wsRoot: string): Promise<{
+  tags:           Map<string, GtagEntry[]>;
+  lineCache:      Map<string, string[]>;
+  ambiguousNames: string[];
+}> {
+  const now    = Date.now();
+  const cached = tagsCache.get(wsRoot);
+  if (cached && now - cached.timestamp < TAGS_CACHE_TTL_MS) {
+    return { tags: cached.tags, lineCache: new Map(), ambiguousNames: cached.ambiguousNames };
+  }
+  const allUris = await findFilesCached(wsRoot);
+  const result  = await collectGtags(allUris.map(u => u.fsPath), wsRoot);
+  tagsCache.set(wsRoot, {
+    tags:           result.tags,
+    ambiguousNames: result.ambiguousNames,
+    timestamp:      now,
+  });
+  return result;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // gtags バックエンド  ─  型定義
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1065,12 +1150,17 @@ function readFileLinesCached(filePath: string, cache: Map<string, string[]>): st
  * GNU Global 5.0 以降が必要 (-e で POSIX ERE を有効化)。
  * ソース行は global 出力に含まれるためファイルを読まない。
  * 出力形式: name<ws>line<ws>file<ws>source_line
+ *
+ * 【High-3 修正】maxBuffer を 200MB → 50MB に削減。
+ *   大規模プロジェクトで 200MB を確保すると VS Code ホストがメモリ枯渇でクラッシュする。
+ *   50MB を超えた場合は ENOBUFS として上位の collectGtags に伝播し、
+ *   per-file global -f フォールバックへ自動的に切り替わるため安全。
  */
 async function runGlobalXAll(
   wsRoot: string
 ): Promise<Array<{ name: string; line: number; file: string; sourceLine: string }>> {
   const { stdout } = await execFileAsync('global', ['-x', '-e', '.'], {
-    cwd: wsRoot, maxBuffer: 200 * 1024 * 1024, timeout: 120_000,
+    cwd: wsRoot, maxBuffer: 50 * 1024 * 1024, timeout: 120_000,
   });
   return stdout.split('\n').flatMap(raw => {
     const trimmed = raw.trimEnd();
@@ -1511,11 +1601,8 @@ async function buildFileCallGraphGtags(
 
   // ★ Precision ③: ヘッダーも含めてタグを収集 (inline 関数・テンプレートを callee ノードとして登録)
   pct.to(5);
-  const allUris  = await vscode.workspace.findFiles(CC_ALL_GLOB, EXCLUDE_GLOB);
-
-  pct.to(8);
-  checkCancellation(token);
-  const { tags, lineCache, ambiguousNames } = await collectGtags(allUris.map(u => u.fsPath), wsRoot);
+  pct.report?.('📂 Loading tags...');
+  const { tags, lineCache, ambiguousNames } = await collectGtagsCached(wsRoot);
   if (!tags.size) throw new Error(
     'No tags found.\nPlease verify that gtags is installed and GTAGS exists.');
 
@@ -1727,8 +1814,8 @@ async function buildFunctionCallGraphGtags(
   // ★ Precision ③: ヘッダーも callee ノードとして登録するため CC_ALL_GLOB で収集
   pct.to(5);
   checkCancellation(token);
-  const allUris = await vscode.workspace.findFiles(CC_ALL_GLOB, EXCLUDE_GLOB);
-  const { tags, lineCache, ambiguousNames } = await collectGtags(allUris.map(u => u.fsPath), wsRoot);
+  pct.report?.('📂 Loading tags...');
+  const { tags, lineCache, ambiguousNames } = await collectGtagsCached(wsRoot);
   if (!tags.size) throw new Error('No tags found.');
 
   if (ambiguousNames.length > 0) {
@@ -1769,6 +1856,7 @@ async function buildFunctionCallGraphGtags(
   const edgeSet = new Set<string>();
 
   // 下方向 BFS (extractCallsFromLines を使用)
+  pct.report?.('🔍 Building call graph...');
   //
   // 【BugFix G】visited (処理完了) と queued (投入済み) を分離して退行バグを修正。
   //   旧実装は callee を visited に先行登録していたため、pop 時に「処理済み」と
@@ -1834,71 +1922,182 @@ async function buildWorkspaceCallGraphGtags(
     .filter(u => CC_SOURCE_EXTENSIONS.has(path.extname(u.fsPath).toLowerCase()));
   if (!uniqueUris.length) throw new Error('No C/C++ source files found.');
 
-  const wsRoot = getWorkspaceRootForFile(uniqueUris[0]);
-  if (!wsRoot) throw new Error('No workspace folder is open.');
-  const pct = new Pct(progress);
+  // Mid-3 修正: マルチルートワークスペース対応。
+  //   旧実装は uniqueUris[0] のルートのみ参照するため、
+  //   2番目以降のワークスペースフォルダのファイルが sanitizeToWsRoot に弾かれていた。
+  //   ルートごとに URI をグループ化し、各 GTAGS を個別参照して結果をマージする。
 
+  // ルートごとに URI をグループ化
+  const rootGroups = new Map<string, vscode.Uri[]>();
+  for (const uri of uniqueUris) {
+    const root = getWorkspaceRootForFile(uri);
+    if (!root) continue;
+    if (!rootGroups.has(root)) rootGroups.set(root, []);
+    rootGroups.get(root)!.push(uri);
+  }
+  if (!rootGroups.size) throw new Error('No workspace folder is open.');
+
+  const pct = new Pct(progress);
   pct.to(0);
   checkCancellation(token);
-  { const w = await ensureGtagsDb(wsRoot); if (w) errs.push(w); }
 
-  // ★ Precision ③: ヘッダーも callee ノードとして登録するため CC_ALL_GLOB で収集
-  pct.to(5);
-  checkCancellation(token);
-  const allUris = await vscode.workspace.findFiles(CC_ALL_GLOB, EXCLUDE_GLOB);
-  const { tags, lineCache, ambiguousNames } = await collectGtags(allUris.map(u => u.fsPath), wsRoot);
+  // 全ルートの tags / scopeMap をマージするためのコンテナ
+  const mergedTags     = new Map<string, GtagEntry[]>();
+  const mergedScopeMap = new Map<string, ScopeMapEntry>();
+  const callerFiles    = new Set<string>();
+  const nodes          = new Map<string, GraphNode>();
 
-  // Bug② 修正: workspace でも tags が空のときは早期終了する
-  if (!tags.size) throw new Error('No tags found. Run `gtags` in the workspace root, or check that GTAGS/GRTAGS/GPATH files exist.');
-
-  if (ambiguousNames.length > 0) {
-    const preview = ambiguousNames.slice(0, 5).join(', ');
-    const suffix  = ambiguousNames.length > 5 ? ` and ${ambiguousNames.length - 5} more` : '';
-    errs.push(`[gtags] Duplicate function names across files (resolved by callerFile priority): ${preview}${suffix}`);
-  }
-
-  const scopeMap    = buildGtagsScopeMap(tags);
-  const nodes       = new Map<string, GraphNode>();
-  // G: GTAGS が返すパスと VSCode URI パスの両方を callerFiles に含める
-  const callerFiles = new Set<string>();
-  for (const uri of uniqueUris) {
-    callerFiles.add(uri.fsPath);
-    callerFiles.add(normalizeFsPath(uri.fsPath));
-  }
-
-  // ノード登録: uniqueUris に含まれるソースファイルの関数のみ caller ノードとして登録
-  pct.to(20);
-  for (const uri of uniqueUris) {
+  // ルートごとに GTAGS を参照 (並列処理)
+  const rootList     = Array.from(rootGroups.entries());
+  const rootCount    = rootList.length;
+  for (let ri = 0; ri < rootList.length; ri++) {
+    const [wsRoot, rootUris] = rootList[ri];
     checkCancellation(token);
-    // G: findScopeMapEntry でパス差異に対応
-    const fileScopes = findScopeMapEntry(scopeMap, uri.fsPath)?.list ?? [];
-    for (const scope of fileScopes) {
-      const entry = tags.get(scope.name)?.find(
-        e => normalizeFsPath(e.file) === normalizeFsPath(uri.fsPath) && e.isFunc);
-      if (!entry) continue;
-      // G: GTAGS の実パスも callerFiles に追加
-      callerFiles.add(entry.file);
-      const nodeId = makeGtagsNodeId(entry.file, scope.name, entry.line);
-      if (!nodes.has(nodeId)) nodes.set(nodeId, gtagsEntryToNode(scope.name, entry, scope, ''));
+    pct.range(0, 20, ri, rootCount);
+
+    { const w = await ensureGtagsDb(wsRoot); if (w) errs.push(w); }
+
+    // ヘッダーも callee ノードとして登録するため CC_ALL_GLOB で収集
+    const allUris = await findFilesCached(wsRoot);
+    // このルートのファイルのみ対象に絞る（他ルートのファイルを誤って混入させない）
+    const rootNorm    = normalizeFsPath(wsRoot);
+    const rootAllUris = allUris.filter(u =>
+      normalizeFsPath(u.fsPath).startsWith(rootNorm + path.sep) ||
+      normalizeFsPath(u.fsPath).startsWith(rootNorm + '/')
+    );
+
+    let rootTags: Map<string, GtagEntry[]>;
+    let rootAmbiguousNames: string[];
+    try {
+      // パフォーマンス改善①: collectGtagsCached でルートのタグをキャッシュ
+      const result = await collectGtagsCached(wsRoot);
+      rootTags           = result.tags;
+      rootAmbiguousNames = result.ambiguousNames;
+    } catch (e) {
+      errs.push(`[gtags] Failed to collect tags for ${wsRoot}: ${e}`);
+      continue;
+    }
+
+    if (!rootTags.size) {
+      errs.push(`[gtags] No tags found in ${wsRoot}. Run \`gtags\` in that folder.`);
+      continue;
+    }
+    if (rootAmbiguousNames.length > 0) {
+      const preview = rootAmbiguousNames.slice(0, 5).join(', ');
+      const suffix  = rootAmbiguousNames.length > 5 ? ` and ${rootAmbiguousNames.length - 5} more` : '';
+      errs.push(`[gtags] Duplicate function names in ${path.basename(wsRoot)}: ${preview}${suffix}`);
+    }
+
+    // タグをマージ (同名関数のエントリを結合)
+    for (const [name, entries] of rootTags) {
+      if (!mergedTags.has(name)) mergedTags.set(name, []);
+      mergedTags.get(name)!.push(...entries);
+    }
+
+    // スコープマップを構築してマージ
+    const rootScopeMap = buildGtagsScopeMap(rootTags);
+    for (const [fp, entry] of rootScopeMap) {
+      mergedScopeMap.set(fp, entry);
+    }
+
+    // callerFiles と caller ノードを登録
+    for (const uri of rootUris) {
+      callerFiles.add(uri.fsPath);
+      callerFiles.add(normalizeFsPath(uri.fsPath));
+      const fileScopes = findScopeMapEntry(mergedScopeMap, uri.fsPath)?.list ?? [];
+      for (const scope of fileScopes) {
+        const entry = rootTags.get(scope.name)?.find(
+          e => normalizeFsPath(e.file) === normalizeFsPath(uri.fsPath) && e.isFunc);
+        if (!entry) continue;
+        callerFiles.add(entry.file);
+        const nodeId = makeGtagsNodeId(entry.file, scope.name, entry.line);
+        if (!nodes.has(nodeId)) nodes.set(nodeId, gtagsEntryToNode(scope.name, entry, scope, ''));
+      }
     }
   }
 
-  // ★ Precision ①: global -rx でエッジを一括構築
-  pct.to(30);
+  if (!mergedTags.size) throw new Error('No tags found. Run `gtags` in each workspace root.');
+
+  // ルートごとに global -rx でエッジを構築 (callerFiles フィルタで混在を防ぐ)
+  const edgeSet = new Set<string>();
+  pct.to(20);
   checkCancellation(token);
-  const edgeSet = await buildEdgesGlobalRx(callerFiles, tags, scopeMap, wsRoot, token, pct, 30, 90);
+  for (let ri = 0; ri < rootList.length; ri++) {
+    const [wsRoot, rootUris] = rootList[ri];
+    checkCancellation(token);
+    const rootCallerFiles = new Set<string>();
+    for (const uri of rootUris) {
+      rootCallerFiles.add(uri.fsPath);
+      rootCallerFiles.add(normalizeFsPath(uri.fsPath));
+    }
+    const rootEdges = await buildEdgesGlobalRx(
+      rootCallerFiles, mergedTags, mergedScopeMap, wsRoot, token, pct,
+      20 + Math.floor(ri * 70 / rootList.length),
+      20 + Math.floor((ri + 1) * 70 / rootList.length)
+    );
+    for (const e of rootEdges) edgeSet.add(e);
+  }
 
   // edgeSet に含まれる callee ノードを追加登録 (ヘッダー inline 関数を含む)
   for (const edgeKey of edgeSet) {
     const calleeId = edgeKey.split('|||')[1];
     if (nodes.has(calleeId)) continue;
     const { file: calleeFile, name: calleeName } = parseGtagsNodeId(calleeId);
-    const calleeEntry = tags.get(calleeName)?.find(e => e.file === calleeFile && e.isFunc);
+    const calleeEntry = mergedTags.get(calleeName)?.find(e => e.file === calleeFile && e.isFunc);
     if (!calleeEntry) continue;
-    // Bug④: resolveCalleeScope (findScopeAtLine 優先)
-    const calleeScope = resolveCalleeScope(scopeMap, calleeFile, calleeName, calleeEntry.line);
+    const calleeScope = resolveCalleeScope(mergedScopeMap, calleeFile, calleeName, calleeEntry.line);
     if (!calleeScope) continue;
     nodes.set(calleeId, gtagsEntryToNode(calleeName, calleeEntry, calleeScope, ''));
+  }
+
+  // ── 下方向 BFS 再帰展開 ────────────────────────────────────────────────
+  // Mid-2 修正: buildEdgesGlobalRx で発見されたヘッダー inline callee ノードから
+  //   さらに呼ばれる関数のエッジが欠落していた問題を修正。
+  //   buildFileCallGraphGtags と同じ下方向 BFS を追加してエッジを補完する。
+  pct.to(90);
+  {
+    // ② 修正: new Map() を毎ループ渡すとキャッシュが一切効かないため
+    //   BFS スコープ全体で共有するキャッシュを1つ定義する。
+    const bfsLineCache = new Map<string, string[]>();
+    const knownTags   = new Set(mergedTags.keys());
+    const downVisited = new Set<string>(nodes.keys()); // 登録済みノードは全て処理済みとしてマーク
+    // ソースファイルの関数は buildEdgesGlobalRx が処理済みなので除外
+    // ヘッダー由来など callerFiles に含まれないノードのみキューに積む
+    type DownItem = { name: string; entry: GtagEntry; scope: ScopeEntry };
+    const downQueue: DownItem[] = [];
+    for (const nodeId of nodes.keys()) {
+      const { file: nFile, name: nName } = parseGtagsNodeId(nodeId);
+      if (callerFiles.has(nFile)) continue; // ソースファイル由来はスキップ
+      const entry = mergedTags.get(nName)?.find(e => e.file === nFile && e.isFunc);
+      if (!entry) continue;
+      const scope = resolveCalleeScope(mergedScopeMap, nFile, nName, entry.line);
+      if (!scope) continue;
+      downQueue.push({ name: nName, entry, scope });
+    }
+
+    while (downQueue.length > 0) {
+      checkCancellation(token);
+      const { name, entry, scope } = downQueue.shift()!;
+      const callerId = makeGtagsNodeId(entry.file, name, entry.line);
+      const lines    = readFileLinesCached(entry.file, bfsLineCache);
+      const callees  = extractCallsFromLines(lines, scope.start, scope.end, knownTags, name);
+
+      for (const callee of callees) {
+        const calleeEntry = resolveCallee(mergedTags.get(callee), entry.file);
+        if (!calleeEntry || !calleeEntry.isFunc) continue;
+        const calleeScope = resolveCalleeScope(mergedScopeMap, calleeEntry.file, callee, calleeEntry.line);
+        if (!calleeScope) continue;
+        const calleeId = makeGtagsNodeId(calleeEntry.file, callee, calleeEntry.line);
+        edgeSet.add(`${callerId}|||${calleeId}`);
+        if (!nodes.has(calleeId)) {
+          nodes.set(calleeId, gtagsEntryToNode(callee, calleeEntry, calleeScope, ''));
+        }
+        if (!downVisited.has(calleeId)) {
+          downVisited.add(calleeId);
+          downQueue.push({ name: callee, entry: calleeEntry, scope: calleeScope });
+        }
+      }
+    }
   }
 
   const label = uniqueUris.length === 1
@@ -1975,9 +2174,9 @@ async function buildPathThroughCallGraphGtags(
 
   pct.to(5);
   checkCancellation(token);
-  const allUris = await vscode.workspace.findFiles(CC_ALL_GLOB, EXCLUDE_GLOB);
+  pct.report?.('📂 Loading tags...');
   const { tags, lineCache, ambiguousNames } =
-    await collectGtags(allUris.map(u => u.fsPath), wsRoot);
+    await collectGtagsCached(wsRoot);
   if (!tags.size) throw new Error('No tags found.');
 
   if (ambiguousNames.length > 0) {
@@ -2144,7 +2343,10 @@ export async function buildFunctionCallGraph(
   backend:   Backend = 'auto',
   token?:    vscode.CancellationToken
 ): Promise<GraphData> {
-  const key    = makeCacheKey('func', document.uri.fsPath, String(position.line));
+  // Low-1 修正: 同一行に複数関数シンボルが並ぶ場合 (マクロ展開など) に
+  //   position.character を含めることでキャッシュの誤ヒットを防ぐ。
+  const key    = makeCacheKey('func', document.uri.fsPath,
+    `${position.line}:${position.character}`);
   const cached = graphDataCache.get(key);
   if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) return cached.data;
   // Bug⑤ + Feat① 修正:

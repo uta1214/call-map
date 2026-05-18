@@ -46,7 +46,16 @@ type OutputMode = 'webview' | 'html';
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** 除外するディレクトリ名 (EXCLUDE_GLOB に対応) */
-const EXCLUDE_DIRS = new Set(['node_modules', 'build', 'dist', 'out', '.git']);
+// Low-2 修正: CMake / Ninja / ccache 等が生成するディレクトリを追加。
+//   これらに生成ファイル (.c/.cpp) が含まれると解析結果に混入する。
+const EXCLUDE_DIRS = new Set([
+  // 共通
+  'node_modules', 'build', 'dist', 'out', '.git',
+  // CMake 系
+  'CMakeFiles', '_build', '_deps', 'cmake-build-debug', 'cmake-build-release',
+  // ツール系
+  '.cache', '.ccls-cache', 'vendor', '.deps',
+]);
 
 /**
  * folderUri 配下のファイルを再帰的に収集して extensions でフィルタする。
