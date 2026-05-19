@@ -100,7 +100,6 @@ export const EXCLUDE_GLOB = [
 ].join(',').replace(/^/, '{').replace(/$/, '}');
 
 // ④ global -rx 並列バッチ設定
-const GLOBAL_RX_BATCH    = 100;  // 1プロセスあたりの関数名上限
 const GLOBAL_RX_PARALLEL = 4;    // 同時実行バッチ数
 
 // ⑤ GTAGS 更新 TTL: この時間内の再実行は global -u をスキップ
@@ -139,6 +138,19 @@ const FILES_CACHE_TTL_MS = 10_000; // 10 s
 interface FilesCacheEntry { uris: vscode.Uri[]; timestamp: number; }
 const filesCache = new Map<string, FilesCacheEntry>(); // wsRoot → entry
 
+// ─── 遅延ローディング用キャッシュ (buildFunctionCallGraphGtags 専用) ──────
+// buildFunctionCallGraphGtags は全ダンプを行わず訪問した関数・ファイルだけをクエリする。
+// ビルドをまたいでキャッシュすることで 2 回目以降を更に高速化する。
+// TTL は GTAGS_UPDATE_TTL と揃え、ファイル変更時は invalidateCache() で全削除する。
+// lineCache はビルド内ローカルのまま (document.getText() の未保存変更を反映するため)。
+const LAZY_CACHE_TTL_MS = GTAGS_UPDATE_TTL; // 30 s
+
+interface LazyTagCacheEntry   { entries: Map<string, GtagEntry[]>;   timestamp: number; }
+interface LazyScopeCacheEntry { scopes:  Map<string, ScopeMapEntry>; timestamp: number; }
+
+const lazyTagCache   = new Map<string, LazyTagCacheEntry>();   // wsRoot → entry
+const lazyScopeCache = new Map<string, LazyScopeCacheEntry>(); // wsRoot → entry
+
 /** ⑦ 上限付きキャッシュ書き込み: 上限超過時は最古エントリを削除 */
 function setGraphCache(key: string, entry: GraphCacheEntry): void {
   if (graphDataCache.size >= MAX_CACHE_ENTRIES) {
@@ -161,9 +173,10 @@ function setGraphCache(key: string, entry: GraphCacheEntry): void {
 export function invalidateCache(filePath?: string): void {
   if (!filePath) {
     graphDataCache.clear();
-    // パフォーマンス改善: tagsCache / filesCache も全削除
     tagsCache.clear();
     filesCache.clear();
+    lazyTagCache.clear();   // I-2
+    lazyScopeCache.clear(); // I-2
     return;
   }
   // パス正規化して比較（Fix 5）
@@ -171,9 +184,11 @@ export function invalidateCache(filePath?: string): void {
   for (const key of graphDataCache.keys()) {
     if (key.includes(norm) || key.includes(filePath)) graphDataCache.delete(key);
   }
-  // ファイル変更時はタグが古くなる可能性があるため tagsCache を全削除
+  // ファイル変更時はタグが古くなる可能性があるため全削除
   // (wsRoot 単位での部分削除は複雑で効果が薄いため全削除で安全側に倒す)
   tagsCache.clear();
+  lazyTagCache.clear();   // I-2
+  lazyScopeCache.clear(); // I-2
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1297,7 +1312,7 @@ function buildGtagsScopeMap(tags: Map<string, GtagEntry[]>): Map<string, ScopeMa
  */
 function extractCallsFromLines(
   lines: string[], start: number, end: number,
-  knownTags: Set<string>, selfName: string
+  selfName: string, knownTags?: Set<string>
 ): Set<string> {
   const callees        = new Set<string>();
   const re             = /\b([A-Za-z_]\w*)\s*\(/g;
@@ -1390,7 +1405,8 @@ function extractCallsFromLines(
     let m: RegExpExecArray | null;
     while ((m = re.exec(processed)) !== null) {
       const callee = m[1];
-      if (callee !== selfName && knownTags.has(callee)) callees.add(callee);
+      // knownTags が指定されている場合のみフィルタ (省略時は全候補を返す)
+      if (callee !== selfName && (!knownTags || knownTags.has(callee))) callees.add(callee);
     }
   }
   return callees;
@@ -1470,8 +1486,8 @@ function findScopeAtLine(list: ScopeEntry[], refLine: number): ScopeEntry | unde
 }
 
 /**
- * 【Precision ①】global -rx -e 'func1|func2|...' を GLOBAL_RX_BATCH 個ずつバッチ処理し、
- * callerFiles 内の参照からエッジセットを構築する。
+ * 【Precision ①】global -rx -e '^(func1|func2|...)$' を buildPatternBatches で動的分割し、
+ * GLOBAL_RX_PARALLEL 個ずつ並列実行してエッジセットを構築する。
  *
  * ソーステキストの正規表現スキャンではなく GNU Global のシンボル DB を使うため、
  * コメント・文字列リテラル・マクロ名との誤混同がなくなり false positive が大幅減少する。
@@ -1504,19 +1520,17 @@ async function buildEdgesGlobalRx(
     .filter(([, entries]) => entries.some(e => e.isFunc))
     .map(([name]) => name);
 
-  // ④ バッチを GLOBAL_RX_PARALLEL 個ずつ並列実行して高速化
-  const batchArrays: string[][] = [];
-  for (let i = 0; i < funcNames.length; i += GLOBAL_RX_BATCH) {
-    batchArrays.push(funcNames.slice(i, i + GLOBAL_RX_BATCH));
-  }
-  const totalGroups = Math.ceil(batchArrays.length / GLOBAL_RX_PARALLEL);
+  // ④ buildPatternBatches で動的長さベース分割 + GLOBAL_RX_PARALLEL 個ずつ並列実行
+  // 旧実装: 固定件数 GLOBAL_RX_BATCH=100 で分割 → 長い C++ テンプレート名で MAX_PATTERN_LENGTH 超過の恐れ
+  // 新実装: buildPatternBatches で長さベース分割 (S-3 完全適用) + アンカー付き (B-2 完全適用)
+  const patterns    = buildPatternBatches(funcNames);
+  const totalGroups = Math.ceil(patterns.length / GLOBAL_RX_PARALLEL);
 
-  for (let gi = 0; gi < batchArrays.length; gi += GLOBAL_RX_PARALLEL) {
+  for (let gi = 0; gi < patterns.length; gi += GLOBAL_RX_PARALLEL) {
     checkCancellation(token);
     pct?.range(startPct, endPct, Math.floor(gi / GLOBAL_RX_PARALLEL), totalGroups);
 
-    await Promise.all(batchArrays.slice(gi, gi + GLOBAL_RX_PARALLEL).map(async batch => {
-      const pattern = batch.map(escapeRegexForGlobal).join('|');
+    await Promise.all(patterns.slice(gi, gi + GLOBAL_RX_PARALLEL).map(async pattern => {
       let stdout = '';
       try {
         ({ stdout } = await execFileAsync('global', ['-rx', '-e', pattern], {
@@ -1699,7 +1713,7 @@ async function buildFileCallGraphGtags(
       const callerId = makeGtagsNodeId(entry.file, name, entry.line);
 
       const lines   = readFileLinesCached(entry.file, lineCache);
-      const callees = extractCallsFromLines(lines, scope.start, scope.end, knownTags, name);
+      const callees = extractCallsFromLines(lines, scope.start, scope.end, name, knownTags);
 
       for (const callee of callees) {
         const calleeEntry = resolveCallee(tags.get(callee), entry.file);
@@ -1729,6 +1743,7 @@ async function buildFileCallGraphGtags(
   // ファイル内の全コア関数を起点に global -rx で呼び出し元を遡る。
   // 深さ制限なし（upVisited でサイクル防止）。main() などルートまで到達したら終了。
   // buildPathThroughCallGraphGtags の上方向 BFS と同じロジックを使用。
+  // I-1: runGlobalRxSingle (1 関数ずつシリアル) → runGlobalRxBatch (レベル単位バッチ) に変更。
   pct.to(88);
   {
     type UpItem = {
@@ -1736,9 +1751,9 @@ async function buildFileCallGraphGtags(
       calleeId: string;  // エッジの下流側 nodeId
     };
 
-    // コアノード（ファイル内関数）を全てキューの初期値として積む
+    // コアノード（ファイル内関数）を全て初期レベルとして積む
     const upVisited = new Set<string>();
-    const upQueue:   UpItem[] = [];
+    let upCurrentLevel: UpItem[] = [];
 
     for (const scope of fileScopes) {
       const entry = tags.get(scope.name)?.find(
@@ -1746,45 +1761,49 @@ async function buildFileCallGraphGtags(
       if (!entry) continue;
       const coreId = makeGtagsNodeId(entry.file, scope.name, entry.line);
       upVisited.add(coreId);
-      upQueue.push({ funcName: scope.name, calleeId: coreId });
+      upCurrentLevel.push({ funcName: scope.name, calleeId: coreId });
     }
 
-    while (upQueue.length > 0) {
+    // レベル別 BFS: 1 レベル = 1 バッチクエリ (runGlobalRxSingle × N → runGlobalRxBatch × 1)
+    while (upCurrentLevel.length > 0) {
       checkCancellation(token);
-      const { funcName, calleeId } = upQueue.shift()!;
 
-      for (const { refFile, refLine } of await runGlobalRxSingle(funcName, wsRoot)) {
-        checkCancellation(token);
+      const levelFuncNames = upCurrentLevel.map(item => item.funcName);
+      const refMap = await runGlobalRxBatch(levelFuncNames, wsRoot);
+      const upNextLevel: UpItem[] = [];
 
-        const fileScopeEntry = scopeMap.get(refFile);
-        if (!fileScopeEntry) continue;
-        const callerScope = findScopeAtLine(fileScopeEntry.list, refLine);
-        if (!callerScope || callerScope.name === funcName) continue; // 自己再帰を除外
+      for (const { funcName, calleeId } of upCurrentLevel) {
+        for (const { refFile, refLine } of refMap.get(funcName) ?? []) {
+          checkCancellation(token);
 
-        // Precision ②: refFile 優先で caller エントリを解決
-        const callerEntry =
-          tags.get(callerScope.name)?.find(e => e.file === refFile && e.isFunc)
-          ?? resolveCallee(tags.get(callerScope.name), refFile);
-        if (!callerEntry) continue;
+          const fileScopeEntry = scopeMap.get(refFile);
+          if (!fileScopeEntry) continue;
+          const callerScope = findScopeAtLine(fileScopeEntry.list, refLine);
+          if (!callerScope || callerScope.name === funcName) continue; // 自己再帰を除外
 
-        const callerId = makeGtagsNodeId(callerEntry.file, callerScope.name, callerEntry.line);
+          // Precision ②: refFile 優先で caller エントリを解決
+          const callerEntry =
+            tags.get(callerScope.name)?.find(e => e.file === refFile && e.isFunc)
+            ?? resolveCallee(tags.get(callerScope.name), refFile);
+          if (!callerEntry) continue;
 
-        // エッジ: callerNode → calleeNode
-        edgeSet.add(`${callerId}|||${calleeId}`);
+          const callerId = makeGtagsNodeId(callerEntry.file, callerScope.name, callerEntry.line);
+          edgeSet.add(`${callerId}|||${calleeId}`);
 
-        // caller ノード未登録なら追加
-        if (!nodes.has(callerId)) {
-          nodes.set(callerId, gtagsEntryToNode(
-            callerScope.name, callerEntry, callerScope, currentFile));
-        }
+          if (!nodes.has(callerId)) {
+            nodes.set(callerId, gtagsEntryToNode(
+              callerScope.name, callerEntry, callerScope, currentFile));
+          }
 
-        // さらに上へ展開（未 visited なら）
-        if (!upVisited.has(callerId)) {
-          upVisited.add(callerId);
-          upQueue.push({ funcName: callerScope.name, calleeId: callerId });
+          if (!upVisited.has(callerId)) {
+            upVisited.add(callerId);
+            upNextLevel.push({ funcName: callerScope.name, calleeId: callerId });
+          }
         }
       }
-      pct.bfsQ(88, 100, upVisited, upQueue);
+
+      pct.bfsQ(88, 100, upVisited, upNextLevel);
+      upCurrentLevel = upNextLevel;
     }
   }
 
@@ -1794,6 +1813,162 @@ async function buildFileCallGraphGtags(
     buildTimeMs: Date.now() - t0,
     errors:      errs,
   };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// gtags バックエンド  ─  遅延ローディング用ヘルパー (buildFunctionCallGraphGtags 専用)
+//
+// 【高速化】buildFunctionCallGraphGtags の旧実装は collectGtagsCached (global -x -e '.')
+//   と buildGtagsScopeMap でプロジェクト全体を事前ロードしていたため、
+//   大規模プロジェクトでは 1 関数起点のグラフでも 2 分以上かかっていた。
+//
+//   新実装は BFS を進めながら必要な関数・ファイルだけをオンデマンドでクエリする:
+//     runGlobalXNames  : global -x -e 'func1|func2|...' で複数定義を一括取得
+//     buildScopeForFileCached : global -f <file> でそのファイルのスコープだけ構築
+//     extractRawCallCandidates: knownTags フィルタなしで候補抽出 → runGlobalXNames で検証
+//
+//   これにより訪問した関数・ファイル数に比例した処理量に抑え、数秒以内を目指す。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * B-2 + S-3: アンカー付き ERE パターンのバッチ配列を生成する。
+ *
+ * - ^ と $ アンカーで部分一致を防止する (B-2)。
+ *   例: 'func1' が 'func1_helper' にマッチしなくなる。
+ * - MAX_PATTERN_LENGTH を超えないよう動的分割することで OS の ARG_MAX 超過を防ぐ (S-3)。
+ * - runGlobalXNames と runGlobalRxBatch の両方で共用する。
+ *
+ * NOTE: ^ と $ アンカーは GNU Global 5.0 以降の POSIX ERE で動作する。
+ */
+const MAX_PATTERN_LENGTH = 50_000; // OS の ARG_MAX に対して十分な余裕を持たせた上限
+
+function buildPatternBatches(names: string[]): string[] {
+  if (names.length === 0) return [];
+  const batches: string[] = [];
+  let batch: string[] = [];
+  let len = 0; // '|' 区切りの合計長
+
+  for (const name of names) {
+    const escaped = escapeRegexForGlobal(name);
+    const add     = (batch.length > 0 ? 1 : 0) + escaped.length; // 1 = '|' セパレータ
+    if (len + add > MAX_PATTERN_LENGTH && batch.length > 0) {
+      batches.push('^(' + batch.join('|') + ')$');
+      batch = []; len = 0;
+    }
+    batch.push(escaped);
+    len += add;
+  }
+  if (batch.length > 0) batches.push('^(' + batch.join('|') + ')$');
+  return batches;
+}
+
+/**
+ * 指定した関数名リストの定義エントリを global -x -e '^(func1|func2|...)$' で一括取得する。
+ * runGlobalXAll の全ダンプ版に対する、部分クエリ版。
+ * buildPatternBatches で動的分割した複数パターンを並列実行し Map<name, GtagEntry[]> で返す。
+ */
+async function runGlobalXNames(
+  names:  string[],
+  wsRoot: string,
+): Promise<Map<string, GtagEntry[]>> {
+  const result = new Map<string, GtagEntry[]>();
+  if (names.length === 0) return result;
+
+  const patterns = buildPatternBatches(names); // B-2+S-3
+
+  await Promise.all(patterns.map(async pattern => {
+    let stdout = '';
+    try {
+      ({ stdout } = await execFileAsync('global', ['-x', '-e', pattern], {
+        cwd: wsRoot, maxBuffer: 10 * 1024 * 1024, timeout: 30_000,
+      }));
+    } catch { return; }
+
+    for (const raw of stdout.split('\n')) {
+      const trimmed = raw.trimEnd();
+      if (!trimmed) continue;
+      const m = trimmed.match(/^(\S+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+      if (!m) continue;
+      const [, name, lineStr, fileStr, sourceLine] = m;
+      const line = parseInt(lineStr, 10);
+      if (isNaN(line)) continue;
+      const file = sanitizeToWsRoot(fileStr, wsRoot); // Security H
+      if (!file) continue;
+      const entry: GtagEntry = { name, file, line, sourceLine, isFunc: isLikelyFuncDef(sourceLine) };
+      if (!result.has(name)) result.set(name, []);
+      result.get(name)!.push(entry);
+    }
+  }));
+
+  return result;
+}
+
+/**
+ * tagCache に name のエントリがあれば返し、なければ runGlobalXNames でフェッチしてキャッシュする。
+ * キャッシュミス時の二重フェッチを防ぐため、未ヒット時は空配列もキャッシュする。
+ */
+async function resolveOrFetchTag(
+  name:     string,
+  wsRoot:   string,
+  tagCache: Map<string, GtagEntry[]>,
+): Promise<GtagEntry[] | undefined> {
+  if (tagCache.has(name)) {
+    const cached = tagCache.get(name)!;
+    return cached.length > 0 ? cached : undefined;
+  }
+  const resolved = await runGlobalXNames([name], wsRoot);
+  const entries  = resolved.get(name) ?? [];
+  tagCache.set(name, entries); // 空配列もキャッシュして再フェッチを防止
+  return entries.length > 0 ? entries : undefined;
+}
+
+/**
+ * global -f <file> を使って fileScopeCache に ScopeMapEntry を構築して返す。
+ * isFunc 判定のため lineCache からファイル行を読む（未保存変更も反映される）。
+ *
+ * @param file         対象ファイルの絶対パス
+ * @param wsRoot       GTAGS のあるワークスペースルート
+ * @param scopeCache   ビルド内で共有するスコープキャッシュ
+ * @param lineCache    ビルド内で共有する行キャッシュ
+ */
+async function buildScopeForFileCached(
+  file:       string,
+  wsRoot:     string,
+  scopeCache: Map<string, ScopeMapEntry>,
+  lineCache:  Map<string, string[]>,
+): Promise<ScopeMapEntry | undefined> {
+  const norm = normalizeFsPath(file);
+  const hit  = scopeCache.get(norm) ?? scopeCache.get(file);
+  if (hit) return hit;
+
+  const tagEntries = await runGlobalF(file, wsRoot);
+  if (!tagEntries.length) return undefined;
+
+  const lines = readFileLinesCached(file, lineCache);
+  // B-3: 正規化パスも lineCache に登録してキャッシュヒット率を向上させる
+  if (norm !== file && !lineCache.has(norm)) lineCache.set(norm, lines);
+  const funcEntries: { name: string; line: number }[] = [];
+  for (const { name, line } of tagEntries) {
+    const sourceLine = lines[line - 1]?.trimEnd() ?? '';
+    if (isLikelyFuncDef(sourceLine)) funcEntries.push({ name, line });
+  }
+  if (!funcEntries.length) return undefined;
+
+  funcEntries.sort((a, b) => a.line - b.line);
+  const list: ScopeEntry[] = funcEntries.map((e, i) => ({
+    name:  e.name,
+    start: e.line,
+    end:   i + 1 < funcEntries.length ? funcEntries[i + 1].line - 1 : Number.MAX_SAFE_INTEGER,
+  }));
+  const byName = new Map<string, ScopeEntry>();
+  for (const s of list) {
+    if (!byName.has(s.name)) byName.set(s.name, s); // 先勝ち (行番号が小さい定義を優先)
+  }
+  const entry: ScopeMapEntry = { list, byName };
+  // 正規化・非正規化の両キーで登録してヒット率を上げる
+  scopeCache.set(norm, entry);
+  scopeCache.set(file, entry);
+  return entry;
 }
 
 async function buildFunctionCallGraphGtags(
@@ -1811,60 +1986,70 @@ async function buildFunctionCallGraphGtags(
   checkCancellation(token);
   { const w = await ensureGtagsDb(wsRoot); if (w) errs.push(w); }
 
-  // ★ Precision ③: ヘッダーも callee ノードとして登録するため CC_ALL_GLOB で収集
+  // ── モジュールレベルキャッシュを取得 (I-2) ──────────────────────────────────
+  // TTL 内であれば前回ビルドの tagCache / fileScopeCache が再利用され 2 回目以降が高速化される。
+  // lineCache はビルド内ローカルのまま (document.getText() の未保存変更を反映するため)。
+  const now = Date.now();
+  let lazyTagEntry = lazyTagCache.get(wsRoot);
+  if (!lazyTagEntry || now - lazyTagEntry.timestamp > LAZY_CACHE_TTL_MS) {
+    lazyTagEntry = { entries: new Map(), timestamp: now };
+    lazyTagCache.set(wsRoot, lazyTagEntry);
+  }
+  const tagCache = lazyTagEntry.entries;
+
+  let lazyScopeEntry = lazyScopeCache.get(wsRoot);
+  if (!lazyScopeEntry || now - lazyScopeEntry.timestamp > LAZY_CACHE_TTL_MS) {
+    lazyScopeEntry = { scopes: new Map(), timestamp: now };
+    lazyScopeCache.set(wsRoot, lazyScopeEntry);
+  }
+  const fileScopeCache = lazyScopeEntry.scopes;
+
+  const lineCache: Map<string, string[]> = new Map(); // ビルド内ローカル
+
+  // 現在ファイルの行は document から取得 (未保存変更を反映)
+  const currentFile     = document.uri.fsPath;
+  const currentFileNorm = normalizeFsPath(currentFile);
+  const currentLines    = document.getText().split('\n');
+  lineCache.set(currentFile, currentLines);
+  lineCache.set(currentFileNorm, currentLines);
+
+  // ── 起点関数を特定 ──────────────────────────────────────────────────────────
   pct.to(5);
   checkCancellation(token);
-  pct.report?.('📂 Loading tags...');
-  const { tags, lineCache, ambiguousNames } = await collectGtagsCached(wsRoot);
-  if (!tags.size) throw new Error('No tags found.');
+  pct.report?.('🔍 Finding start function...');
 
-  if (ambiguousNames.length > 0) {
-    const preview = ambiguousNames.slice(0, 5).join(', ');
-    const suffix  = ambiguousNames.length > 5 ? ` and ${ambiguousNames.length - 5} more` : '';
-    errs.push(`[gtags] Duplicate function names across files (resolved by callerFile priority): ${preview}${suffix}`);
-  }
+  // global -f で現在ファイルのスコープのみ構築 (全ダンプ不要)
+  const startFileScopeEntry = await buildScopeForFileCached(
+    currentFile, wsRoot, fileScopeCache, lineCache);
+  if (!startFileScopeEntry?.list.length) throw new Error(
+    'No functions found in this file.');
 
-  // 現在ファイルの内容を上書き (未保存変更を反映)
-  // Fix 3: 両キーで登録
-  const currentFile = document.uri.fsPath;
-  const currentLines = document.getText().split('\n');
-  lineCache.set(currentFile, currentLines);
-  lineCache.set(normalizeFsPath(currentFile), currentLines);
-
-  const knownTags = new Set(tags.keys());
-  const scopeMap  = buildGtagsScopeMap(tags);
-
-  // カーソル行を含むスコープを起点にする (1-indexed)
-  // Fix 2: findScopeMapEntry でパス差異に対応
   const cursorLine = position.line + 1;
-  const fileScopes = findScopeMapEntry(scopeMap, currentFile)?.list ?? [];
-  const startScope = fileScopes.find(s => s.start <= cursorLine && cursorLine <= s.end);
+  const startScope = findScopeAtLine(startFileScopeEntry.list, cursorLine);
   if (!startScope) throw new Error(
     'No function found at cursor position.\nPlace the cursor on a function name and try again.');
 
-  // C: startScope はパス正規化済みで解決されているが、tags 内の entry.file は
-  //    GTAGS が返すパスのため、currentFile と異なる可能性がある。
-  //    normalizeFsPath で比較して正しい entry を選ぶ。
-  const currentFileNorm2 = normalizeFsPath(currentFile);
-  const startEntry = tags.get(startScope.name)
-    ?.find(e => normalizeFsPath(e.file) === currentFileNorm2 && e.isFunc)
-    ?? tags.get(startScope.name)?.find(e => e.isFunc)
-    ?? tags.get(startScope.name)?.[0];
+  // global -x で起点関数のエントリだけを取得 (全ダンプ不要)
+  const startCandidates = await resolveOrFetchTag(startScope.name, wsRoot, tagCache);
+  const startEntry =
+    startCandidates?.find(e => normalizeFsPath(e.file) === currentFileNorm && e.isFunc)
+    ?? startCandidates?.find(e => e.isFunc)
+    ?? startCandidates?.[0];
   if (!startEntry) throw new Error('Tag info for the start function was not found.');
 
   const nodes   = new Map<string, GraphNode>();
   const edgeSet = new Set<string>();
 
-  // 下方向 BFS (extractCallsFromLines を使用)
-  pct.report?.('🔍 Building call graph...');
-  //
-  // 【BugFix G】visited (処理完了) と queued (投入済み) を分離して退行バグを修正。
-  //   旧実装は callee を visited に先行登録していたため、pop 時に「処理済み」と
-  //   誤判定されノードが未登録になり「ノード1つ・エッジ2本」現象が発生していた。
+  // ── 下方向 BFS (callee) ──────────────────────────────────────────────────────
+  // 【BugFix G 維持】visited (処理完了) と queued (投入済み) を分離して退行バグを防止。
+  pct.to(15);
+  pct.report?.('⬇ Building callee graph...');
+  checkCancellation(token);
+
   const startNodeId = makeGtagsNodeId(startEntry.file, startScope.name, startEntry.line);
   type Q = { name: string; entry: GtagEntry; scope: ScopeEntry; hop: number };
-  const visited = new Set<string>();                // pop して処理完了した nodeId
-  const queued  = new Set<string>([startNodeId]);   // queue に積んだ nodeId (重複投入防止)
+  const visited = new Set<string>();
+  const queued  = new Set<string>([startNodeId]);
   const queue: Q[] = [{ name: startScope.name, entry: startEntry, scope: startScope, hop: 0 }];
 
   while (queue.length > 0) {
@@ -1872,33 +2057,112 @@ async function buildFunctionCallGraphGtags(
     const { name, entry, scope, hop } = queue.shift()!;
     const nodeId = makeGtagsNodeId(entry.file, name, entry.line);
     if (visited.has(nodeId)) continue;
-    visited.add(nodeId); // ← pop 時にのみ登録
+    visited.add(nodeId);
 
     const lines = readFileLinesCached(entry.file, lineCache);
     nodes.set(nodeId, gtagsEntryToNode(name, entry, scope, currentFile));
     if (hop >= maxHops) continue;
 
-    const callees = extractCallsFromLines(lines, scope.start, scope.end, knownTags, name);
-    for (const callee of callees) {
-      // Precision ②: callerFile 優先でエントリを解決
-      const calleeEntry = resolveCallee(tags.get(callee), entry.file);
-      // ★ Fix②: resolveCallee の最終フォールバックが isFunc=false（宣言のみ）エントリを
-      //   返す場合がある。その場合 scopeMap にエントリが存在しないためサイレントスキップされ、
-      //   callee が BFS キューに追加されない。isFunc=false は定義なしとして明示的に除外する。
-      if (!calleeEntry || !calleeEntry.isFunc) continue;
-      // Bug④: resolveCalleeScope (findScopeAtLine 優先)
-      const calleeScope = resolveCalleeScope(scopeMap, calleeEntry.file, callee, calleeEntry.line);
+    // ① knownTags なしで callee 候補識別子を抽出 → runGlobalXNames で後検証
+    const rawCandidates = extractCallsFromLines(lines, scope.start, scope.end, name);
+    if (rawCandidates.size === 0) continue;
+
+    // ② キャッシュ未ヒット分だけ global -x でバッチ取得 (buildPatternBatches で動的分割・並列実行)
+    const uncached = [...rawCandidates].filter(c => !tagCache.has(c));
+    if (uncached.length > 0) {
+      const freshMap = await runGlobalXNames(uncached, wsRoot);
+      for (const [n, entries] of freshMap) tagCache.set(n, entries);
+      // GTAGS に存在しなかった候補は空エントリをキャッシュして再クエリを防止
+      for (const n of uncached) { if (!tagCache.has(n)) tagCache.set(n, []); }
+    }
+
+    // ③ 解決済みエントリからエッジを生成 (I-3: ファイルスコープを並列プリフェッチ)
+    type ResolvedCallee = { callee: string; calleeEntry: GtagEntry };
+    const resolvedCallees: ResolvedCallee[] = [];
+    for (const callee of rawCandidates) {
+      const calleeEntry = resolveCallee(tagCache.get(callee), entry.file);
+      if (!calleeEntry?.isFunc) continue;
+      resolvedCallees.push({ callee, calleeEntry });
+    }
+
+    // 必要なファイルのスコープを並列プリフェッチ (キャッシュ済みなら即返る)
+    const uniqueCalleeFiles = [...new Set(resolvedCallees.map(c => c.calleeEntry.file))];
+    await Promise.all(uniqueCalleeFiles.map(f =>
+      buildScopeForFileCached(f, wsRoot, fileScopeCache, lineCache)));
+
+    // エッジ生成 (スコープは全てキャッシュ済みのため await なし)
+    for (const { callee, calleeEntry } of resolvedCallees) {
+      const calleeScopeEntry =
+        fileScopeCache.get(normalizeFsPath(calleeEntry.file))
+        ?? fileScopeCache.get(calleeEntry.file);
+      if (!calleeScopeEntry) continue;
+      // Bug④ 維持: findScopeAtLine 優先, byName フォールバック
+      const calleeScope =
+        findScopeAtLine(calleeScopeEntry.list, calleeEntry.line)
+        ?? calleeScopeEntry.byName.get(callee);
       if (!calleeScope) continue;
 
       const calleeId = makeGtagsNodeId(calleeEntry.file, callee, calleeEntry.line);
       edgeSet.add(`${nodeId}|||${calleeId}`);
-      // queued で重複投入を防止 (visited への先行登録は行わない)
       if (!queued.has(calleeId)) {
         queued.add(calleeId);
         queue.push({ name: callee, entry: calleeEntry, scope: calleeScope, hop: hop + 1 });
       }
     }
-    pct.bfsQ(20, 100, queued, queue);
+    pct.bfsQ(15, 65, queued, queue);
+  }
+
+  // ── 上方向 BFS (caller): level-by-level バッチ処理 (I-1) ──────────────────
+  // 旧実装: 関数 1 つにつき runGlobalRxSingle を 1 回 → N 回のプロセス起動
+  // 新実装: BFS の各レベルを runGlobalRxBatch で一括クエリ → レベル数回のプロセス起動
+  pct.to(65);
+  pct.report?.('⬆ Building caller graph...');
+  checkCancellation(token);
+
+  type UpItem = { funcName: string; calleeId: string };
+  const upVisited = new Set<string>([startNodeId]);
+  let upCurrentLevel: UpItem[] = [{ funcName: startScope.name, calleeId: startNodeId }];
+
+  for (let hop = 0; hop < maxHops && upCurrentLevel.length > 0; hop++) {
+    checkCancellation(token);
+
+    // 現レベルの全関数名を一括 global -rx でクエリ
+    const levelFuncNames = upCurrentLevel.map(item => item.funcName);
+    const refMap = await runGlobalRxBatch(levelFuncNames, wsRoot);
+    const upNextLevel: UpItem[] = [];
+
+    for (const { funcName, calleeId } of upCurrentLevel) {
+      for (const { refFile, refLine } of refMap.get(funcName) ?? []) {
+        checkCancellation(token);
+
+        const callerFileScopeEntry = await buildScopeForFileCached(
+          refFile, wsRoot, fileScopeCache, lineCache);
+        if (!callerFileScopeEntry) continue;
+        const callerScope = findScopeAtLine(callerFileScopeEntry.list, refLine);
+        if (!callerScope || callerScope.name === funcName) continue;
+
+        const callerEntries = await resolveOrFetchTag(callerScope.name, wsRoot, tagCache);
+        const callerEntry   =
+          callerEntries?.find(e => e.file === refFile && e.isFunc)
+          ?? resolveCallee(callerEntries, refFile);
+        if (!callerEntry) continue;
+
+        const callerId = makeGtagsNodeId(callerEntry.file, callerScope.name, callerEntry.line);
+        edgeSet.add(`${callerId}|||${calleeId}`);
+
+        if (!nodes.has(callerId)) {
+          nodes.set(callerId, gtagsEntryToNode(
+            callerScope.name, callerEntry, callerScope, currentFile));
+        }
+        if (!upVisited.has(callerId)) {
+          upVisited.add(callerId);
+          upNextLevel.push({ funcName: callerScope.name, calleeId: callerId });
+        }
+      }
+    }
+
+    pct.range(65, 100, hop + 1, maxHops);
+    upCurrentLevel = upNextLevel;
   }
 
   return {
@@ -2080,7 +2344,7 @@ async function buildWorkspaceCallGraphGtags(
       const { name, entry, scope } = downQueue.shift()!;
       const callerId = makeGtagsNodeId(entry.file, name, entry.line);
       const lines    = readFileLinesCached(entry.file, bfsLineCache);
-      const callees  = extractCallsFromLines(lines, scope.start, scope.end, knownTags, name);
+      const callees  = extractCallsFromLines(lines, scope.start, scope.end, name, knownTags);
 
       for (const callee of callees) {
         const calleeEntry = resolveCallee(mergedTags.get(callee), entry.file);
@@ -2139,6 +2403,47 @@ async function runGlobalRxSingle(
   } catch {
     return [];
   }
+}
+
+/**
+ * I-1: 複数の関数名に対する参照を global -rx -e '^(func1|func2|...)$' で一括取得する。
+ * runGlobalRxSingle の複数関数バッチ版。
+ * 上方向 BFS のプロセス起動回数を「関数数 N 回」→「レベル数回」に削減する。
+ * buildPatternBatches で ARG_MAX 対策済み (S-3)、アンカーで部分一致防止 (B-2)。
+ *
+ * @returns Map<funcName, {refFile, refLine}[]>
+ */
+async function runGlobalRxBatch(
+  funcNames: string[],
+  wsRoot:    string,
+): Promise<Map<string, Array<{ refFile: string; refLine: number }>>> {
+  const result = new Map<string, Array<{ refFile: string; refLine: number }>>();
+  for (const n of funcNames) result.set(n, []);
+  if (funcNames.length === 0) return result;
+
+  const patterns = buildPatternBatches(funcNames); // B-2+S-3
+
+  await Promise.all(patterns.map(async pattern => {
+    let stdout = '';
+    try {
+      ({ stdout } = await execFileAsync('global', ['-rx', '-e', pattern], {
+        cwd: wsRoot, maxBuffer: 50 * 1024 * 1024, timeout: 60_000,
+      }));
+    } catch { return; }
+
+    for (const raw of stdout.split('\n')) {
+      const parts = raw.trim().split(/\s+/);
+      if (parts.length < 3) continue;
+      const name    = parts[0];
+      const refLine = parseInt(parts[1], 10);
+      if (!name || isNaN(refLine)) continue;
+      const refFile = sanitizeToWsRoot(parts[2], wsRoot); // Security H
+      if (!refFile) continue;
+      result.get(name)?.push({ refFile, refLine });
+    }
+  }));
+
+  return result;
 }
 
 /**
@@ -2231,7 +2536,7 @@ async function buildPathThroughCallGraphGtags(
       nodes.set(nodeId, gtagsEntryToNode(name, entry, scope, currentFile));
       if (hop >= maxHops) continue;
 
-      for (const callee of extractCallsFromLines(lines, scope.start, scope.end, knownTags, name)) {
+      for (const callee of extractCallsFromLines(lines, scope.start, scope.end, name, knownTags)) {
         const calleeEntry = resolveCallee(tags.get(callee), entry.file);
         if (!calleeEntry) continue;
         // Bug④: resolveCalleeScope (findScopeAtLine 優先)
@@ -2251,56 +2556,56 @@ async function buildPathThroughCallGraphGtags(
   // ── 上方向 BFS (caller) ──────────────────────────────────────────────────
   // global -rx <funcName> で参照箇所を逆辿りし、scopeMap で caller スコープを特定する。
   // ancEdges は「ancNode → ancNode/F」のみ収集されるため sibling は自然に除外される。
+  // I-1: runGlobalRxSingle (1 関数ずつシリアル) → runGlobalRxBatch (レベル単位バッチ) に変更。
   pct.to(55);
   {
     type UpItem = {
       funcName: string;   // この関数への参照を global -rx で探す
       calleeId: string;   // エッジの下流側 nodeId
-      hop:      number;
     };
     const queued = new Set<string>([startNodeId]);
-    const queue: UpItem[] = [{
-      funcName: startScope.name, calleeId: startNodeId, hop: 0,
-    }];
+    let upCurrentLevel: UpItem[] = [{ funcName: startScope.name, calleeId: startNodeId }];
 
-    while (queue.length > 0) {
+    for (let hop = 0; hop < maxHops && upCurrentLevel.length > 0; hop++) {
       checkCancellation(token);
-      const { funcName, calleeId, hop } = queue.shift()!;
-      if (hop >= maxHops) continue;
 
-      for (const { refFile, refLine } of await runGlobalRxSingle(funcName, wsRoot)) {
-        checkCancellation(token);
+      const levelFuncNames = upCurrentLevel.map(item => item.funcName);
+      const refMap = await runGlobalRxBatch(levelFuncNames, wsRoot);
+      const upNextLevel: UpItem[] = [];
 
-        // 参照行が含まれる caller スコープを二分探索で特定
-        const fileScopeEntry = scopeMap.get(refFile);
-        if (!fileScopeEntry) continue;
-        const callerScope = findScopeAtLine(fileScopeEntry.list, refLine);
-        if (!callerScope || callerScope.name === funcName) continue; // 自己再帰を除外
+      for (const { funcName, calleeId } of upCurrentLevel) {
+        for (const { refFile, refLine } of refMap.get(funcName) ?? []) {
+          checkCancellation(token);
 
-        // Precision ②: refFile 優先で caller エントリを解決
-        const callerEntry =
-          tags.get(callerScope.name)?.find(e => e.file === refFile && e.isFunc)
-          ?? resolveCallee(tags.get(callerScope.name), refFile);
-        if (!callerEntry) continue;
+          // 参照行が含まれる caller スコープを二分探索で特定
+          const fileScopeEntry = scopeMap.get(refFile);
+          if (!fileScopeEntry) continue;
+          const callerScope = findScopeAtLine(fileScopeEntry.list, refLine);
+          if (!callerScope || callerScope.name === funcName) continue; // 自己再帰を除外
 
-        const callerId = makeGtagsNodeId(callerEntry.file, callerScope.name, callerEntry.line);
+          // Precision ②: refFile 優先で caller エントリを解決
+          const callerEntry =
+            tags.get(callerScope.name)?.find(e => e.file === refFile && e.isFunc)
+            ?? resolveCallee(tags.get(callerScope.name), refFile);
+          if (!callerEntry) continue;
 
-        // エッジ: callerNode → calleeNode (下流側はすでに nodes に登録済み or 起点)
-        edgeSet.add(`${callerId}|||${calleeId}`);
+          const callerId = makeGtagsNodeId(callerEntry.file, callerScope.name, callerEntry.line);
+          edgeSet.add(`${callerId}|||${calleeId}`);
 
-        // caller ノード未登録なら追加
-        if (!nodes.has(callerId)) {
-          nodes.set(callerId, gtagsEntryToNode(
-            callerScope.name, callerEntry, callerScope, currentFile));
-        }
+          if (!nodes.has(callerId)) {
+            nodes.set(callerId, gtagsEntryToNode(
+              callerScope.name, callerEntry, callerScope, currentFile));
+          }
 
-        // さらに上へ展開
-        if (!queued.has(callerId)) {
-          queued.add(callerId);
-          queue.push({ funcName: callerScope.name, calleeId: callerId, hop: hop + 1 });
+          if (!queued.has(callerId)) {
+            queued.add(callerId);
+            upNextLevel.push({ funcName: callerScope.name, calleeId: callerId });
+          }
         }
       }
-      pct.bfsQ(55, 100, queued, queue);
+
+      pct.range(55, 100, hop + 1, maxHops);
+      upCurrentLevel = upNextLevel;
     }
   }
 

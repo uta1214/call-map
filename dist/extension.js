@@ -73,7 +73,6 @@ var EXCLUDE_GLOB = [
   "**/vendor/**",
   "**/.deps/**"
 ].join(",").replace(/^/, "{").replace(/$/, "}");
-var GLOBAL_RX_BATCH = 100;
 var GLOBAL_RX_PARALLEL = 4;
 var GTAGS_UPDATE_TTL = 3e4;
 var gtagsUpdateCache = /* @__PURE__ */ new Map();
@@ -84,6 +83,9 @@ var TAGS_CACHE_TTL_MS = GTAGS_UPDATE_TTL;
 var tagsCache = /* @__PURE__ */ new Map();
 var FILES_CACHE_TTL_MS = 1e4;
 var filesCache = /* @__PURE__ */ new Map();
+var LAZY_CACHE_TTL_MS = GTAGS_UPDATE_TTL;
+var lazyTagCache = /* @__PURE__ */ new Map();
+var lazyScopeCache = /* @__PURE__ */ new Map();
 function setGraphCache(key, entry) {
   if (graphDataCache.size >= MAX_CACHE_ENTRIES) {
     let oldestKey = "";
@@ -104,6 +106,8 @@ function invalidateCache(filePath) {
     graphDataCache.clear();
     tagsCache.clear();
     filesCache.clear();
+    lazyTagCache.clear();
+    lazyScopeCache.clear();
     return;
   }
   const norm = normalizeFsPath(filePath);
@@ -112,6 +116,8 @@ function invalidateCache(filePath) {
       graphDataCache.delete(key);
   }
   tagsCache.clear();
+  lazyTagCache.clear();
+  lazyScopeCache.clear();
 }
 function normalizeFsPath(p) {
   const normalized = path.normalize(p);
@@ -945,7 +951,7 @@ function buildGtagsScopeMap(tags) {
   }
   return scopeMap;
 }
-function extractCallsFromLines(lines, start, end, knownTags, selfName) {
+function extractCallsFromLines(lines, start, end, selfName, knownTags) {
   const callees = /* @__PURE__ */ new Set();
   const re = /\b([A-Za-z_]\w*)\s*\(/g;
   let inBlockComment = false;
@@ -1035,7 +1041,7 @@ function extractCallsFromLines(lines, start, end, knownTags, selfName) {
     let m;
     while ((m = re.exec(processed)) !== null) {
       const callee = m[1];
-      if (callee !== selfName && knownTags.has(callee))
+      if (callee !== selfName && (!knownTags || knownTags.has(callee)))
         callees.add(callee);
     }
   }
@@ -1082,16 +1088,12 @@ function findScopeAtLine(list, refLine) {
 async function buildEdgesGlobalRx(callerFiles, tags, scopeMap, wsRoot, token, pct, startPct = 20, endPct = 75) {
   const edgeSet = /* @__PURE__ */ new Set();
   const funcNames = Array.from(tags.entries()).filter(([, entries]) => entries.some((e) => e.isFunc)).map(([name]) => name);
-  const batchArrays = [];
-  for (let i = 0; i < funcNames.length; i += GLOBAL_RX_BATCH) {
-    batchArrays.push(funcNames.slice(i, i + GLOBAL_RX_BATCH));
-  }
-  const totalGroups = Math.ceil(batchArrays.length / GLOBAL_RX_PARALLEL);
-  for (let gi = 0; gi < batchArrays.length; gi += GLOBAL_RX_PARALLEL) {
+  const patterns = buildPatternBatches(funcNames);
+  const totalGroups = Math.ceil(patterns.length / GLOBAL_RX_PARALLEL);
+  for (let gi = 0; gi < patterns.length; gi += GLOBAL_RX_PARALLEL) {
     checkCancellation(token);
     pct?.range(startPct, endPct, Math.floor(gi / GLOBAL_RX_PARALLEL), totalGroups);
-    await Promise.all(batchArrays.slice(gi, gi + GLOBAL_RX_PARALLEL).map(async (batch) => {
-      const pattern = batch.map(escapeRegexForGlobal).join("|");
+    await Promise.all(patterns.slice(gi, gi + GLOBAL_RX_PARALLEL).map(async (pattern) => {
       let stdout = "";
       try {
         ({ stdout } = await execFileAsync("global", ["-rx", "-e", pattern], {
@@ -1251,7 +1253,7 @@ async function buildFileCallGraphGtags(document, progress, token) {
       const { name, entry, scope } = downQueue.shift();
       const callerId = makeGtagsNodeId(entry.file, name, entry.line);
       const lines = readFileLinesCached(entry.file, lineCache);
-      const callees = extractCallsFromLines(lines, scope.start, scope.end, knownTags, name);
+      const callees = extractCallsFromLines(lines, scope.start, scope.end, name, knownTags);
       for (const callee of callees) {
         const calleeEntry = resolveCallee(tags.get(callee), entry.file);
         if (!calleeEntry || !calleeEntry.isFunc)
@@ -1275,7 +1277,7 @@ async function buildFileCallGraphGtags(document, progress, token) {
   pct.to(88);
   {
     const upVisited = /* @__PURE__ */ new Set();
-    const upQueue = [];
+    let upCurrentLevel = [];
     for (const scope of fileScopes) {
       const entry = tags.get(scope.name)?.find(
         (e) => normalizeFsPath(e.file) === currentFileNorm && e.isFunc
@@ -1284,38 +1286,43 @@ async function buildFileCallGraphGtags(document, progress, token) {
         continue;
       const coreId = makeGtagsNodeId(entry.file, scope.name, entry.line);
       upVisited.add(coreId);
-      upQueue.push({ funcName: scope.name, calleeId: coreId });
+      upCurrentLevel.push({ funcName: scope.name, calleeId: coreId });
     }
-    while (upQueue.length > 0) {
+    while (upCurrentLevel.length > 0) {
       checkCancellation(token);
-      const { funcName, calleeId } = upQueue.shift();
-      for (const { refFile, refLine } of await runGlobalRxSingle(funcName, wsRoot)) {
-        checkCancellation(token);
-        const fileScopeEntry = scopeMap.get(refFile);
-        if (!fileScopeEntry)
-          continue;
-        const callerScope = findScopeAtLine(fileScopeEntry.list, refLine);
-        if (!callerScope || callerScope.name === funcName)
-          continue;
-        const callerEntry = tags.get(callerScope.name)?.find((e) => e.file === refFile && e.isFunc) ?? resolveCallee(tags.get(callerScope.name), refFile);
-        if (!callerEntry)
-          continue;
-        const callerId = makeGtagsNodeId(callerEntry.file, callerScope.name, callerEntry.line);
-        edgeSet.add(`${callerId}|||${calleeId}`);
-        if (!nodes.has(callerId)) {
-          nodes.set(callerId, gtagsEntryToNode(
-            callerScope.name,
-            callerEntry,
-            callerScope,
-            currentFile
-          ));
-        }
-        if (!upVisited.has(callerId)) {
-          upVisited.add(callerId);
-          upQueue.push({ funcName: callerScope.name, calleeId: callerId });
+      const levelFuncNames = upCurrentLevel.map((item) => item.funcName);
+      const refMap = await runGlobalRxBatch(levelFuncNames, wsRoot);
+      const upNextLevel = [];
+      for (const { funcName, calleeId } of upCurrentLevel) {
+        for (const { refFile, refLine } of refMap.get(funcName) ?? []) {
+          checkCancellation(token);
+          const fileScopeEntry = scopeMap.get(refFile);
+          if (!fileScopeEntry)
+            continue;
+          const callerScope = findScopeAtLine(fileScopeEntry.list, refLine);
+          if (!callerScope || callerScope.name === funcName)
+            continue;
+          const callerEntry = tags.get(callerScope.name)?.find((e) => e.file === refFile && e.isFunc) ?? resolveCallee(tags.get(callerScope.name), refFile);
+          if (!callerEntry)
+            continue;
+          const callerId = makeGtagsNodeId(callerEntry.file, callerScope.name, callerEntry.line);
+          edgeSet.add(`${callerId}|||${calleeId}`);
+          if (!nodes.has(callerId)) {
+            nodes.set(callerId, gtagsEntryToNode(
+              callerScope.name,
+              callerEntry,
+              callerScope,
+              currentFile
+            ));
+          }
+          if (!upVisited.has(callerId)) {
+            upVisited.add(callerId);
+            upNextLevel.push({ funcName: callerScope.name, calleeId: callerId });
+          }
         }
       }
-      pct.bfsQ(88, 100, upVisited, upQueue);
+      pct.bfsQ(88, 100, upVisited, upNextLevel);
+      upCurrentLevel = upNextLevel;
     }
   }
   return {
@@ -1325,6 +1332,111 @@ async function buildFileCallGraphGtags(document, progress, token) {
     buildTimeMs: Date.now() - t0,
     errors: errs
   };
+}
+var MAX_PATTERN_LENGTH = 5e4;
+function buildPatternBatches(names) {
+  if (names.length === 0)
+    return [];
+  const batches = [];
+  let batch = [];
+  let len = 0;
+  for (const name of names) {
+    const escaped = escapeRegexForGlobal(name);
+    const add = (batch.length > 0 ? 1 : 0) + escaped.length;
+    if (len + add > MAX_PATTERN_LENGTH && batch.length > 0) {
+      batches.push("^(" + batch.join("|") + ")$");
+      batch = [];
+      len = 0;
+    }
+    batch.push(escaped);
+    len += add;
+  }
+  if (batch.length > 0)
+    batches.push("^(" + batch.join("|") + ")$");
+  return batches;
+}
+async function runGlobalXNames(names, wsRoot) {
+  const result = /* @__PURE__ */ new Map();
+  if (names.length === 0)
+    return result;
+  const patterns = buildPatternBatches(names);
+  await Promise.all(patterns.map(async (pattern) => {
+    let stdout = "";
+    try {
+      ({ stdout } = await execFileAsync("global", ["-x", "-e", pattern], {
+        cwd: wsRoot,
+        maxBuffer: 10 * 1024 * 1024,
+        timeout: 3e4
+      }));
+    } catch {
+      return;
+    }
+    for (const raw of stdout.split("\n")) {
+      const trimmed = raw.trimEnd();
+      if (!trimmed)
+        continue;
+      const m = trimmed.match(/^(\S+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+      if (!m)
+        continue;
+      const [, name, lineStr, fileStr, sourceLine] = m;
+      const line = parseInt(lineStr, 10);
+      if (isNaN(line))
+        continue;
+      const file = sanitizeToWsRoot(fileStr, wsRoot);
+      if (!file)
+        continue;
+      const entry = { name, file, line, sourceLine, isFunc: isLikelyFuncDef(sourceLine) };
+      if (!result.has(name))
+        result.set(name, []);
+      result.get(name).push(entry);
+    }
+  }));
+  return result;
+}
+async function resolveOrFetchTag(name, wsRoot, tagCache) {
+  if (tagCache.has(name)) {
+    const cached = tagCache.get(name);
+    return cached.length > 0 ? cached : void 0;
+  }
+  const resolved = await runGlobalXNames([name], wsRoot);
+  const entries = resolved.get(name) ?? [];
+  tagCache.set(name, entries);
+  return entries.length > 0 ? entries : void 0;
+}
+async function buildScopeForFileCached(file, wsRoot, scopeCache, lineCache) {
+  const norm = normalizeFsPath(file);
+  const hit = scopeCache.get(norm) ?? scopeCache.get(file);
+  if (hit)
+    return hit;
+  const tagEntries = await runGlobalF(file, wsRoot);
+  if (!tagEntries.length)
+    return void 0;
+  const lines = readFileLinesCached(file, lineCache);
+  if (norm !== file && !lineCache.has(norm))
+    lineCache.set(norm, lines);
+  const funcEntries = [];
+  for (const { name, line } of tagEntries) {
+    const sourceLine = lines[line - 1]?.trimEnd() ?? "";
+    if (isLikelyFuncDef(sourceLine))
+      funcEntries.push({ name, line });
+  }
+  if (!funcEntries.length)
+    return void 0;
+  funcEntries.sort((a, b) => a.line - b.line);
+  const list = funcEntries.map((e, i) => ({
+    name: e.name,
+    start: e.line,
+    end: i + 1 < funcEntries.length ? funcEntries[i + 1].line - 1 : Number.MAX_SAFE_INTEGER
+  }));
+  const byName = /* @__PURE__ */ new Map();
+  for (const s of list) {
+    if (!byName.has(s.name))
+      byName.set(s.name, s);
+  }
+  const entry = { list, byName };
+  scopeCache.set(norm, entry);
+  scopeCache.set(file, entry);
+  return entry;
 }
 async function buildFunctionCallGraphGtags(document, position, maxHops = 4, progress, token) {
   const t0 = Date.now();
@@ -1340,37 +1452,53 @@ async function buildFunctionCallGraphGtags(document, position, maxHops = 4, prog
     if (w)
       errs.push(w);
   }
-  pct.to(5);
-  checkCancellation(token);
-  pct.report?.("\u{1F4C2} Loading tags...");
-  const { tags, lineCache, ambiguousNames } = await collectGtagsCached(wsRoot);
-  if (!tags.size)
-    throw new Error("No tags found.");
-  if (ambiguousNames.length > 0) {
-    const preview = ambiguousNames.slice(0, 5).join(", ");
-    const suffix = ambiguousNames.length > 5 ? ` and ${ambiguousNames.length - 5} more` : "";
-    errs.push(`[gtags] Duplicate function names across files (resolved by callerFile priority): ${preview}${suffix}`);
+  const now = Date.now();
+  let lazyTagEntry = lazyTagCache.get(wsRoot);
+  if (!lazyTagEntry || now - lazyTagEntry.timestamp > LAZY_CACHE_TTL_MS) {
+    lazyTagEntry = { entries: /* @__PURE__ */ new Map(), timestamp: now };
+    lazyTagCache.set(wsRoot, lazyTagEntry);
   }
+  const tagCache = lazyTagEntry.entries;
+  let lazyScopeEntry = lazyScopeCache.get(wsRoot);
+  if (!lazyScopeEntry || now - lazyScopeEntry.timestamp > LAZY_CACHE_TTL_MS) {
+    lazyScopeEntry = { scopes: /* @__PURE__ */ new Map(), timestamp: now };
+    lazyScopeCache.set(wsRoot, lazyScopeEntry);
+  }
+  const fileScopeCache = lazyScopeEntry.scopes;
+  const lineCache = /* @__PURE__ */ new Map();
   const currentFile = document.uri.fsPath;
+  const currentFileNorm = normalizeFsPath(currentFile);
   const currentLines = document.getText().split("\n");
   lineCache.set(currentFile, currentLines);
-  lineCache.set(normalizeFsPath(currentFile), currentLines);
-  const knownTags = new Set(tags.keys());
-  const scopeMap = buildGtagsScopeMap(tags);
+  lineCache.set(currentFileNorm, currentLines);
+  pct.to(5);
+  checkCancellation(token);
+  pct.report?.("\u{1F50D} Finding start function...");
+  const startFileScopeEntry = await buildScopeForFileCached(
+    currentFile,
+    wsRoot,
+    fileScopeCache,
+    lineCache
+  );
+  if (!startFileScopeEntry?.list.length)
+    throw new Error(
+      "No functions found in this file."
+    );
   const cursorLine = position.line + 1;
-  const fileScopes = findScopeMapEntry(scopeMap, currentFile)?.list ?? [];
-  const startScope = fileScopes.find((s) => s.start <= cursorLine && cursorLine <= s.end);
+  const startScope = findScopeAtLine(startFileScopeEntry.list, cursorLine);
   if (!startScope)
     throw new Error(
       "No function found at cursor position.\nPlace the cursor on a function name and try again."
     );
-  const currentFileNorm2 = normalizeFsPath(currentFile);
-  const startEntry = tags.get(startScope.name)?.find((e) => normalizeFsPath(e.file) === currentFileNorm2 && e.isFunc) ?? tags.get(startScope.name)?.find((e) => e.isFunc) ?? tags.get(startScope.name)?.[0];
+  const startCandidates = await resolveOrFetchTag(startScope.name, wsRoot, tagCache);
+  const startEntry = startCandidates?.find((e) => normalizeFsPath(e.file) === currentFileNorm && e.isFunc) ?? startCandidates?.find((e) => e.isFunc) ?? startCandidates?.[0];
   if (!startEntry)
     throw new Error("Tag info for the start function was not found.");
   const nodes = /* @__PURE__ */ new Map();
   const edgeSet = /* @__PURE__ */ new Set();
-  pct.report?.("\u{1F50D} Building call graph...");
+  pct.to(15);
+  pct.report?.("\u2B07 Building callee graph...");
+  checkCancellation(token);
   const startNodeId = makeGtagsNodeId(startEntry.file, startScope.name, startEntry.line);
   const visited = /* @__PURE__ */ new Set();
   const queued = /* @__PURE__ */ new Set([startNodeId]);
@@ -1386,12 +1514,33 @@ async function buildFunctionCallGraphGtags(document, position, maxHops = 4, prog
     nodes.set(nodeId, gtagsEntryToNode(name, entry, scope, currentFile));
     if (hop >= maxHops)
       continue;
-    const callees = extractCallsFromLines(lines, scope.start, scope.end, knownTags, name);
-    for (const callee of callees) {
-      const calleeEntry = resolveCallee(tags.get(callee), entry.file);
-      if (!calleeEntry || !calleeEntry.isFunc)
+    const rawCandidates = extractCallsFromLines(lines, scope.start, scope.end, name);
+    if (rawCandidates.size === 0)
+      continue;
+    const uncached = [...rawCandidates].filter((c) => !tagCache.has(c));
+    if (uncached.length > 0) {
+      const freshMap = await runGlobalXNames(uncached, wsRoot);
+      for (const [n, entries] of freshMap)
+        tagCache.set(n, entries);
+      for (const n of uncached) {
+        if (!tagCache.has(n))
+          tagCache.set(n, []);
+      }
+    }
+    const resolvedCallees = [];
+    for (const callee of rawCandidates) {
+      const calleeEntry = resolveCallee(tagCache.get(callee), entry.file);
+      if (!calleeEntry?.isFunc)
         continue;
-      const calleeScope = resolveCalleeScope(scopeMap, calleeEntry.file, callee, calleeEntry.line);
+      resolvedCallees.push({ callee, calleeEntry });
+    }
+    const uniqueCalleeFiles = [...new Set(resolvedCallees.map((c) => c.calleeEntry.file))];
+    await Promise.all(uniqueCalleeFiles.map((f) => buildScopeForFileCached(f, wsRoot, fileScopeCache, lineCache)));
+    for (const { callee, calleeEntry } of resolvedCallees) {
+      const calleeScopeEntry = fileScopeCache.get(normalizeFsPath(calleeEntry.file)) ?? fileScopeCache.get(calleeEntry.file);
+      if (!calleeScopeEntry)
+        continue;
+      const calleeScope = findScopeAtLine(calleeScopeEntry.list, calleeEntry.line) ?? calleeScopeEntry.byName.get(callee);
       if (!calleeScope)
         continue;
       const calleeId = makeGtagsNodeId(calleeEntry.file, callee, calleeEntry.line);
@@ -1401,7 +1550,54 @@ async function buildFunctionCallGraphGtags(document, position, maxHops = 4, prog
         queue.push({ name: callee, entry: calleeEntry, scope: calleeScope, hop: hop + 1 });
       }
     }
-    pct.bfsQ(20, 100, queued, queue);
+    pct.bfsQ(15, 65, queued, queue);
+  }
+  pct.to(65);
+  pct.report?.("\u2B06 Building caller graph...");
+  checkCancellation(token);
+  const upVisited = /* @__PURE__ */ new Set([startNodeId]);
+  let upCurrentLevel = [{ funcName: startScope.name, calleeId: startNodeId }];
+  for (let hop = 0; hop < maxHops && upCurrentLevel.length > 0; hop++) {
+    checkCancellation(token);
+    const levelFuncNames = upCurrentLevel.map((item) => item.funcName);
+    const refMap = await runGlobalRxBatch(levelFuncNames, wsRoot);
+    const upNextLevel = [];
+    for (const { funcName, calleeId } of upCurrentLevel) {
+      for (const { refFile, refLine } of refMap.get(funcName) ?? []) {
+        checkCancellation(token);
+        const callerFileScopeEntry = await buildScopeForFileCached(
+          refFile,
+          wsRoot,
+          fileScopeCache,
+          lineCache
+        );
+        if (!callerFileScopeEntry)
+          continue;
+        const callerScope = findScopeAtLine(callerFileScopeEntry.list, refLine);
+        if (!callerScope || callerScope.name === funcName)
+          continue;
+        const callerEntries = await resolveOrFetchTag(callerScope.name, wsRoot, tagCache);
+        const callerEntry = callerEntries?.find((e) => e.file === refFile && e.isFunc) ?? resolveCallee(callerEntries, refFile);
+        if (!callerEntry)
+          continue;
+        const callerId = makeGtagsNodeId(callerEntry.file, callerScope.name, callerEntry.line);
+        edgeSet.add(`${callerId}|||${calleeId}`);
+        if (!nodes.has(callerId)) {
+          nodes.set(callerId, gtagsEntryToNode(
+            callerScope.name,
+            callerEntry,
+            callerScope,
+            currentFile
+          ));
+        }
+        if (!upVisited.has(callerId)) {
+          upVisited.add(callerId);
+          upNextLevel.push({ funcName: callerScope.name, calleeId: callerId });
+        }
+      }
+    }
+    pct.range(65, 100, hop + 1, maxHops);
+    upCurrentLevel = upNextLevel;
   }
   return {
     nodes: Array.from(nodes.values()),
@@ -1558,7 +1754,7 @@ async function buildWorkspaceCallGraphGtags(uris, progress, token) {
       const { name, entry, scope } = downQueue.shift();
       const callerId = makeGtagsNodeId(entry.file, name, entry.line);
       const lines = readFileLinesCached(entry.file, bfsLineCache);
-      const callees = extractCallsFromLines(lines, scope.start, scope.end, knownTags, name);
+      const callees = extractCallsFromLines(lines, scope.start, scope.end, name, knownTags);
       for (const callee of callees) {
         const calleeEntry = resolveCallee(mergedTags.get(callee), entry.file);
         if (!calleeEntry || !calleeEntry.isFunc)
@@ -1587,28 +1783,39 @@ async function buildWorkspaceCallGraphGtags(uris, progress, token) {
     errors: errs
   };
 }
-async function runGlobalRxSingle(funcName, wsRoot) {
-  try {
-    const { stdout } = await execFileAsync(
-      "global",
-      ["-rx", funcName],
-      { cwd: wsRoot, maxBuffer: 10 * 1024 * 1024, timeout: 3e4 }
-    );
-    return stdout.split("\n").flatMap((line) => {
-      const parts = line.trim().split(/\s+/);
+async function runGlobalRxBatch(funcNames, wsRoot) {
+  const result = /* @__PURE__ */ new Map();
+  for (const n of funcNames)
+    result.set(n, []);
+  if (funcNames.length === 0)
+    return result;
+  const patterns = buildPatternBatches(funcNames);
+  await Promise.all(patterns.map(async (pattern) => {
+    let stdout = "";
+    try {
+      ({ stdout } = await execFileAsync("global", ["-rx", "-e", pattern], {
+        cwd: wsRoot,
+        maxBuffer: 50 * 1024 * 1024,
+        timeout: 6e4
+      }));
+    } catch {
+      return;
+    }
+    for (const raw of stdout.split("\n")) {
+      const parts = raw.trim().split(/\s+/);
       if (parts.length < 3)
-        return [];
+        continue;
+      const name = parts[0];
       const refLine = parseInt(parts[1], 10);
-      if (isNaN(refLine))
-        return [];
+      if (!name || isNaN(refLine))
+        continue;
       const refFile = sanitizeToWsRoot(parts[2], wsRoot);
       if (!refFile)
-        return [];
-      return [{ refFile, refLine }];
-    });
-  } catch {
-    return [];
-  }
+        continue;
+      result.get(name)?.push({ refFile, refLine });
+    }
+  }));
+  return result;
 }
 async function buildPathThroughCallGraphGtags(document, position, maxHops = 4, progress, token) {
   const t0 = Date.now();
@@ -1671,7 +1878,7 @@ async function buildPathThroughCallGraphGtags(document, position, maxHops = 4, p
       nodes.set(nodeId, gtagsEntryToNode(name, entry, scope, currentFile));
       if (hop >= maxHops)
         continue;
-      for (const callee of extractCallsFromLines(lines, scope.start, scope.end, knownTags, name)) {
+      for (const callee of extractCallsFromLines(lines, scope.start, scope.end, name, knownTags)) {
         const calleeEntry = resolveCallee(tags.get(callee), entry.file);
         if (!calleeEntry)
           continue;
@@ -1691,43 +1898,42 @@ async function buildPathThroughCallGraphGtags(document, position, maxHops = 4, p
   pct.to(55);
   {
     const queued = /* @__PURE__ */ new Set([startNodeId]);
-    const queue = [{
-      funcName: startScope.name,
-      calleeId: startNodeId,
-      hop: 0
-    }];
-    while (queue.length > 0) {
+    let upCurrentLevel = [{ funcName: startScope.name, calleeId: startNodeId }];
+    for (let hop = 0; hop < maxHops && upCurrentLevel.length > 0; hop++) {
       checkCancellation(token);
-      const { funcName, calleeId, hop } = queue.shift();
-      if (hop >= maxHops)
-        continue;
-      for (const { refFile, refLine } of await runGlobalRxSingle(funcName, wsRoot)) {
-        checkCancellation(token);
-        const fileScopeEntry = scopeMap.get(refFile);
-        if (!fileScopeEntry)
-          continue;
-        const callerScope = findScopeAtLine(fileScopeEntry.list, refLine);
-        if (!callerScope || callerScope.name === funcName)
-          continue;
-        const callerEntry = tags.get(callerScope.name)?.find((e) => e.file === refFile && e.isFunc) ?? resolveCallee(tags.get(callerScope.name), refFile);
-        if (!callerEntry)
-          continue;
-        const callerId = makeGtagsNodeId(callerEntry.file, callerScope.name, callerEntry.line);
-        edgeSet.add(`${callerId}|||${calleeId}`);
-        if (!nodes.has(callerId)) {
-          nodes.set(callerId, gtagsEntryToNode(
-            callerScope.name,
-            callerEntry,
-            callerScope,
-            currentFile
-          ));
-        }
-        if (!queued.has(callerId)) {
-          queued.add(callerId);
-          queue.push({ funcName: callerScope.name, calleeId: callerId, hop: hop + 1 });
+      const levelFuncNames = upCurrentLevel.map((item) => item.funcName);
+      const refMap = await runGlobalRxBatch(levelFuncNames, wsRoot);
+      const upNextLevel = [];
+      for (const { funcName, calleeId } of upCurrentLevel) {
+        for (const { refFile, refLine } of refMap.get(funcName) ?? []) {
+          checkCancellation(token);
+          const fileScopeEntry = scopeMap.get(refFile);
+          if (!fileScopeEntry)
+            continue;
+          const callerScope = findScopeAtLine(fileScopeEntry.list, refLine);
+          if (!callerScope || callerScope.name === funcName)
+            continue;
+          const callerEntry = tags.get(callerScope.name)?.find((e) => e.file === refFile && e.isFunc) ?? resolveCallee(tags.get(callerScope.name), refFile);
+          if (!callerEntry)
+            continue;
+          const callerId = makeGtagsNodeId(callerEntry.file, callerScope.name, callerEntry.line);
+          edgeSet.add(`${callerId}|||${calleeId}`);
+          if (!nodes.has(callerId)) {
+            nodes.set(callerId, gtagsEntryToNode(
+              callerScope.name,
+              callerEntry,
+              callerScope,
+              currentFile
+            ));
+          }
+          if (!queued.has(callerId)) {
+            queued.add(callerId);
+            upNextLevel.push({ funcName: callerScope.name, calleeId: callerId });
+          }
         }
       }
-      pct.bfsQ(55, 100, queued, queue);
+      pct.range(55, 100, hop + 1, maxHops);
+      upCurrentLevel = upNextLevel;
     }
   }
   return {
