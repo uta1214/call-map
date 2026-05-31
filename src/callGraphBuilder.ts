@@ -40,6 +40,7 @@
 import * as vscode   from 'vscode';
 import * as path     from 'path';
 import * as fs       from 'fs';
+import * as os       from 'os';
 import { execFile }  from 'child_process';
 import { promisify } from 'util';
 
@@ -92,15 +93,17 @@ const CC_ALL_GLOB         = '**/*.{c,cpp,cc,cxx,cu,cuh,h,hpp,hxx}';
 // ③ 修正: EXCLUDE_DIRS (extension.ts) に追加した CMake/ツール系ディレクトリを同期。
 //   vscode.workspace.findFiles の excludePattern はここを参照するため、
 //   EXCLUDE_DIRS と揃えないと CMakeFiles 以下の生成ファイルが収集対象に混入する。
-export const EXCLUDE_GLOB = [
+export const EXCLUDE_GLOB = '{'  + [
   '**/node_modules/**', '**/build/**', '**/dist/**', '**/out/**', '**/.git/**',
   '**/CMakeFiles/**', '**/_build/**', '**/_deps/**',
   '**/cmake-build-debug/**', '**/cmake-build-release/**',
   '**/.cache/**', '**/.ccls-cache/**', '**/vendor/**', '**/.deps/**',
-].join(',').replace(/^/, '{').replace(/$/, '}');
+].join(',') + '}';
 
-// ④ global -rx 並列バッチ設定
-const GLOBAL_RX_PARALLEL = 4;    // 同時実行バッチ数
+// PERF-02 修正: global は I/O 集中型のため CPU コア数 × 2 まで並列度を引き上げる。
+// 従来は最大 8 固定だったが、コア数が多い環境（開発ワークステーション等）では
+// より高い並列数でスループットが改善する。最低 4 / 最大 cpus*2 (上限 32)。
+const GLOBAL_RX_PARALLEL = Math.max(4, Math.min(os.cpus().length * 2, 32)); // 同時実行バッチ数
 
 // ⑤ GTAGS 更新 TTL: この時間内の再実行は global -u をスキップ
 // ②: FileSystemWatcher が変更時に invalidateCache() を呼ぶため、
@@ -130,6 +133,8 @@ const TAGS_CACHE_TTL_MS = GTAGS_UPDATE_TTL; // 5 分 (GTAGS_UPDATE_TTL と同期
 interface TagsCacheEntry {
   tags:           Map<string, GtagEntry[]>;
   ambiguousNames: string[];
+  // B: scopeMap を一緒にキャッシュ。buildGtagsScopeMap の再計算を省略できる。
+  scopeMap:       Map<string, ScopeMapEntry>;
   timestamp:      number;
 }
 const tagsCache = new Map<string, TagsCacheEntry>(); // wsRoot → entry
@@ -148,7 +153,7 @@ const filesCache = new Map<string, FilesCacheEntry>(); // wsRoot → entry
 // ビルドをまたいでキャッシュすることで 2 回目以降を更に高速化する。
 // TTL は GTAGS_UPDATE_TTL と揃え、ファイル変更時は invalidateCache() で全削除する。
 // lineCache はビルド内ローカルのまま (document.getText() の未保存変更を反映するため)。
-const LAZY_CACHE_TTL_MS = GTAGS_UPDATE_TTL; // 30 s
+const LAZY_CACHE_TTL_MS = GTAGS_UPDATE_TTL; // 5 min (GTAGS_UPDATE_TTL と同期)
 
 interface LazyTagCacheEntry   { entries: Map<string, GtagEntry[]>;   timestamp: number; }
 interface LazyScopeCacheEntry { scopes:  Map<string, ScopeMapEntry>; timestamp: number; }
@@ -158,22 +163,32 @@ const lazyScopeCache = new Map<string, LazyScopeCacheEntry>(); // wsRoot → ent
 
 // H: realpathSync 結果キャッシュ (sanitizeToWsRoot / findScopeMapEntry のホットパスを最適化)
 // wsRoot はビルドをまたいで同一。ファイルパスも繰り返し出現するため効果が大きい。
+// BUG-7 修正: 大規模プロジェクトでエントリが無制限に蓄積するメモリリークを防ぐため上限を設ける。
+// 上限超過時は全クリア（LRU より実装シンプル、かつ次のビルドで再ウォームアップされる）。
+const REALPATH_CACHE_MAX = 500;
 const realpathCache = new Map<string, string>(); // rawPath → resolved realpath
 
-// B: gtagsAvailable キャッシュ (セッション内永続)
-// gtags のインストール状態はセッション中に変わることはほぼない。
-// 5 秒タイムアウト付き execFileAsync を毎回実行するコストを回避する。
-let _gtagsAvailableCache: boolean | undefined;
+/** realpathCache への書き込みヘルパー。上限を超えた場合にクリアしてから追加する。 */
+function setRealpathCache(key: string, value: string): void {
+  if (realpathCache.size >= REALPATH_CACHE_MAX) realpathCache.clear();
+  realpathCache.set(key, value);
+}
 
-/** ⑦ 上限付きキャッシュ書き込み: 上限超過時は最古エントリを削除 */
+// B: gtagsAvailable キャッシュ (セッション内永続)
+// gtags のインストール状態のキャッシュは gtagsAvailable() 関数内で管理する (BUG-20 参照)
+
+/** BUG-03 修正: FIFO キャッシュ書き込み（Map の挿入順を利用）。
+ * 旧実装は O(n) 線形スキャンで最古タイムスタンプを探していたが、
+ * JS の Map はキーの挿入順を保証するため先頭エントリ削除で O(1) の FIFO を実現できる。
+ * LRU より FIFO の方が実装シンプルかつ実運用（1ファイル反復編集）でも実害なし。
+ */
 function setGraphCache(key: string, entry: GraphCacheEntry): void {
+  // すでに存在するキーは削除して再挿入（挿入順を末尾に更新）
+  if (graphDataCache.has(key)) graphDataCache.delete(key);
   if (graphDataCache.size >= MAX_CACHE_ENTRIES) {
-    let oldestKey = '';
-    let oldestTs  = Infinity;
-    for (const [k, v] of graphDataCache) {
-      if (v.timestamp < oldestTs) { oldestTs = v.timestamp; oldestKey = k; }
-    }
-    if (oldestKey) graphDataCache.delete(oldestKey);
+    // Map の先頭エントリ（最も古い挿入）を O(1) で削除
+    const firstKey = graphDataCache.keys().next().value;
+    if (firstKey !== undefined) graphDataCache.delete(firstKey);
   }
   graphDataCache.set(key, entry);
 }
@@ -195,8 +210,14 @@ export function invalidateCache(filePath?: string): void {
     return;
   }
   const norm = normalizeFsPath(filePath);
+  // BUG-03 修正: key.includes(norm) は部分文字列一致のため '/src/a.c' が '/src/a.c.bak' にも
+  //   マッチして無関係なキャッシュを削除していた。
+  //   makeCacheKey の形式 'type::filePath::backend' を前提に :: 区切りで
+  //   ファイルパスのセグメント完全一致に切り替える。
   for (const key of graphDataCache.keys()) {
-    if (key.includes(norm) || key.includes(filePath)) graphDataCache.delete(key);
+    const segments = key.split('::');
+    const keyPath  = segments[1] ?? '';
+    if (keyPath === norm || keyPath === filePath) graphDataCache.delete(key);
   }
   // E: 変更ファイルが属する wsRoot のキャッシュだけ削除。
   // マルチルートワークスペースで別プロジェクトのキャッシュを巻き添えにしない。
@@ -222,7 +243,11 @@ export function invalidateCache(filePath?: string): void {
     }
     filesCache.clear(); // F: filesCache のキーは wsRoot で区別できないため全削除
   }
-  realpathCache.clear(); // H: シンボリックリンク変更に備えて都度クリア
+  // SEC-2 修正: realpathCache はフルクリアする。
+  // 変更ファイルのエントリのみ削除する旧実装では、シンボリックリンクの向き先が変更された場合に
+  // 古いキャッシュ値でワークスペース外参照チェック (Security H) を通過できてしまう。
+  // realpathCache のエントリは文字列のみで小さく、フルクリアのコスト増は無視できる。
+  realpathCache.clear();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -238,6 +263,25 @@ export function invalidateCache(filePath?: string): void {
 function normalizeFsPath(p: string): string {
   const normalized = path.normalize(p);
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+/**
+ * BUG-07 修正: findScopeMapEntry の大文字小文字無視フォールバック (macOS/Windows) を O(1) 化。
+ * WeakMap を使うことで scopeMap のライフタイムに紐付けたキャッシュを実現し、
+ * scopeMap インスタンスが GC されると自動的に回収される（メモリリークなし）。
+ */
+const lowerScopeIndexCache = new WeakMap<Map<string, ScopeMapEntry>, Map<string, ScopeMapEntry>>();
+
+function getLowerScopeIndex(scopeMap: Map<string, ScopeMapEntry>): Map<string, ScopeMapEntry> {
+  const cached = lowerScopeIndexCache.get(scopeMap);
+  if (cached) return cached;
+  const lower = new Map<string, ScopeMapEntry>();
+  for (const [k, v] of scopeMap) {
+    const lk = normalizeFsPath(k).toLowerCase();
+    if (!lower.has(lk)) lower.set(lk, v); // 先勝ち
+  }
+  lowerScopeIndexCache.set(scopeMap, lower);
+  return lower;
 }
 
 /**
@@ -257,18 +301,17 @@ function findScopeMapEntry(
   entry = scopeMap.get(norm);
   if (entry) return entry;
 
-  // 3. 大文字小文字無視 (macOS / Windows)
+  // 3. BUG-07 修正: 大文字小文字無視 (macOS / Windows) — WeakMap キャッシュで O(1) に高速化
   if (process.platform !== 'linux') {
     const lower = norm.toLowerCase();
-    for (const [k, v] of scopeMap) {
-      if (normalizeFsPath(k).toLowerCase() === lower) return v;
-    }
+    entry = getLowerScopeIndex(scopeMap).get(lower);
+    if (entry) return entry;
   }
 
   // 4. realpath でシンボリックリンクを解決 (H: realpathCache でキャッシュ)
   try {
     const real = realpathCache.get(filePath) ?? (() => {
-      const r = fs.realpathSync(filePath); realpathCache.set(filePath, r); return r;
+      const r = fs.realpathSync(filePath); setRealpathCache(filePath, r); return r;
     })();
     entry = scopeMap.get(real);
     if (entry) return entry;
@@ -293,6 +336,35 @@ function splitEdges(edgeSet: Set<string>): GraphEdge[] {
 }
 
 function delay(ms: number) { return new Promise<void>(r => setTimeout(r, ms)); }
+
+/**
+ * D: adaptive delay を更新するヘルパー。
+ *
+ * 従来実装: 毎バッチ固定係数 (0.85倍 - 2ms) で収束 → 初期 20ms から 0 まで 6〜7 バッチ必要。
+ * 新実装  : 連続成功 3 回以上で係数を 0.5 倍に切り替え → 安定環境では 3〜4 バッチで収束。
+ *           エラー発生時は streak をリセットして従来と同じ増加ロジックを適用。
+ *
+ * @param current      現在の遅延 ms
+ * @param hasErrors    このバッチでエラーが発生したか
+ * @param streak       連続成功バッチ数を保持するオブジェクト (参照渡し)
+ */
+function nextAdaptiveDelay(
+  current:   number,
+  hasErrors: boolean,
+  streak:    { val: number },
+): number {
+  if (hasErrors) {
+    streak.val = 0;
+    return Math.min(Math.round(current * 1.5) + 10, BATCH_DELAY_MAX);
+  }
+  streak.val++;
+  // 連続成功 3 回以上 → 急速収束 (0.5 倍)
+  if (streak.val >= 3) {
+    return Math.max(Math.round(current * 0.5), BATCH_DELAY_MIN);
+  }
+  // 通常収束 (0.85 倍 − 2ms)
+  return Math.max(Math.round(current * 0.85) - 2, BATCH_DELAY_MIN);
+}
 
 /**
  * 進捗バーをパーセント表示で制御するヘルパー。
@@ -327,11 +399,6 @@ class Pct {
   report(message: string): void {
     this.p?.report({ message, increment: 0 });
   }
-}
-
-function getWorkspaceRoot(fallbackUri?: vscode.Uri): string | undefined {
-  return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
-    ?? (fallbackUri ? path.dirname(fallbackUri.fsPath) : undefined);
 }
 
 function getWorkspaceRoots(fallbackUri?: vscode.Uri): string[] {
@@ -369,15 +436,25 @@ function getWorkspaceRootForFile(fileUri: vscode.Uri): string | undefined {
 // バックエンド解決
 // ─────────────────────────────────────────────────────────────────────────────
 
+let _gtagsAvailableCache:     boolean   | undefined;
+let _gtagsAvailableFalseTs:   number    | undefined; // BUG-20: false キャッシュのタイムスタンプ
+const GTAGS_FALSE_TTL = 30_000; // 30秒後に再チェック
+
 async function gtagsAvailable(): Promise<boolean> {
-  // B: セッション内キャッシュ。gtags の有無はセッション中に変わらないと仮定し、
-  // 5 秒タイムアウト付き execFileAsync の繰り返し実行を防ぐ。
-  if (_gtagsAvailableCache !== undefined) return _gtagsAvailableCache;
+  // BUG-20 修正: true は永続キャッシュ（インストール済み gtags が突然消えることはない）。
+  // false は 30秒 TTL で再チェック可能にする。
+  // ユーザーが gtags をインストールしてから PATH を更新しても VS Code 再起動なしに認識できる。
+  if (_gtagsAvailableCache === true) return true;
+  if (_gtagsAvailableCache === false && _gtagsAvailableFalseTs !== undefined) {
+    if (Date.now() - _gtagsAvailableFalseTs < GTAGS_FALSE_TTL) return false;
+  }
   try {
     await execFileAsync('gtags', ['--version'], { timeout: 5_000 });
-    _gtagsAvailableCache = true;
+    _gtagsAvailableCache   = true;
+    _gtagsAvailableFalseTs = undefined;
   } catch {
-    _gtagsAvailableCache = false;
+    _gtagsAvailableCache   = false;
+    _gtagsAvailableFalseTs = Date.now();
   }
   return _gtagsAvailableCache;
 }
@@ -392,7 +469,7 @@ export async function resolveBackend(backend: Backend): Promise<'lsp' | 'gtags'>
 // LSP バックエンド  ─  内部ユーティリティ
 // ─────────────────────────────────────────────────────────────────────────────
 
-function hasCppSourceExtension(uri: vscode.Uri): boolean {
+export function hasCppSourceExtension(uri: vscode.Uri): boolean {
   return CC_SOURCE_EXTENSIONS.has(path.extname(uri.fsPath).toLowerCase());
 }
 
@@ -402,22 +479,43 @@ function isInWorkspace(uri: vscode.Uri, roots: string[]): boolean {
   return roots.some(r => p === r || p.startsWith(r + path.sep) || p.startsWith(r + '/'));
 }
 
+/**
+ * BUG-01 修正: callee として受け入れるかを判定。
+ * `isInWorkspace` は単一ファイルモード（wsRoots が空）で `true` を返す設計だが、
+ * `shouldIncludeCallee` でワークスペース外の任意ファイルまで取り込むのは過剰。
+ * wsRoots が空のとき（フォルダ未開放の単一ファイル編集）は
+ * ワークスペース境界が確定できないため callee の取り込みを拒否する。
+ * これにより LSP がシステムヘッダー等を callee として返しても無視される。
+ */
+
+/** callee として受け入れる拡張子 (ソース + ヘッダー)
+ *
+ * 🐛 ファイルグラフ修正: CC_SOURCE_EXTENSIONS (.h/.hpp/.hxx を除外) を使っていたため、
+ *   clangd が callee のヘッダー宣言位置を返すプロジェクトでは全エッジがスキップされ、
+ *   全ノードが level=0 (縦1列) + ファイル内関数のみ表示になっていた。
+ *   Precision ③ でヘッダーを callee ノードとして収集するよう変更済みの gtags 側と統一する。
+ *   ヘッダーは caller スキャン対象外 (CC_SOURCE_EXTENSIONS フィルタ) のまま維持。
+ */
+const CC_CALLEE_EXTENSIONS = new Set([
+  '.c', '.cpp', '.cc', '.cxx', '.cu', '.cuh',   // ソース (既存)
+  '.h', '.hpp', '.hxx',                           // ヘッダー (追加)
+]);
+
 function shouldIncludeCallee(uri: vscode.Uri, roots: string[]): boolean {
-  return isInWorkspace(uri, roots) && hasCppSourceExtension(uri);
+  if (roots.length === 0) return false; // 境界不明のため安全側に倒す
+  return isInWorkspace(uri, roots)
+    && CC_CALLEE_EXTENSIONS.has(path.extname(uri.fsPath).toLowerCase());
 }
 
-/**
- * ★ 修正: baseNameOf() でノード名を正規化する。
- *
- * clangd は同じ関数に対して
- *   - DocumentSymbolProvider → "add(int a, int b)"  (仮引数名あり)
- *   - provideOutgoingCalls   → "add(int, int)"      (仮引数名なし)
- * と異なる文字列を返すことがある。
- * ノード ID にそのまま使うと同一関数が 2 ノード生成されてしまうため、
- * 両者とも baseName ("add") に正規化してから ID を生成することで一意性を保証する。
+/** BUG-18 修正: LSP ノード ID 生成。
+ * 旧セパレータ `||` は C++ の `operator||` を含む baseName (`operator||`) と組み合わさると
+ * `file||operator||||line` のように `||||` が生じ、splitEdges の `indexOf('|||')` が
+ * エッジセパレータより前で誤マッチしてグラフが壊れていた。
+ * `\x00`（NUL）は関数名・ファイルパスに含まれないため安全。
+ * gtags バックエンドの makeGtagsNodeId と同じ方針に統一する。
  */
 function makeNodeId(uri: vscode.Uri, name: string, line: number): string {
-  return `${uri.fsPath}||${baseNameOf(name)}||${line}`;
+  return `${uri.fsPath}\x00${baseNameOf(name)}\x00${line}`;
 }
 
 /** "func(T1, T2)" → "func" */
@@ -427,12 +525,31 @@ function baseNameOf(name: string): string {
 }
 
 /**
+ * ⑥ Performance 追加: ノードの二次インデックス型。
+ * key = `${file}\x00${baseName}` → nodeId のマッピング。
+ * findExistingCalleeId の O(n) 線形スキャンを O(1) に高速化するために使用する。
+ * nodes Map と同期して更新すること。
+ */
+type NodeIndex = Map<string, string>;
+
+/** NodeIndex への追加ヘルパー。同一キーは先勝ち（行番号の小さい定義を優先）。
+ * BUG-16: この関数は必ず同期のまま維持すること。
+ * buildWorkspaceCallGraphLsp フェーズ1 の Promise.all 内で呼ばれており、
+ * もし async になった場合はコルーチン間の競合でノードが重複登録される。
+ */
+function addToNodeIndex(index: NodeIndex, id: string, node: GraphNode): void {
+  const key = `${node.file}\x00${node.label}`;
+  if (!index.has(key)) index.set(key, id);
+}
+
+/**
  * callee のノード ID を既存マップから探す。
- * 正規化後は完全一致が大部分を占めるが、ヘッダー経由など
- * 行番号が異なるケースに備えてファジーマッチを残す。
+ * ⑥ Performance 修正: ファイル+名前の O(n) 線形スキャン → NodeIndex による O(1) ルックアップ。
+ * ヘッダー経由（ファイル不一致）のケースのみ線形スキャンのフォールバックを残す（稀なパス）。
  */
 function findExistingCalleeId(
   nodes: Map<string, GraphNode>,
+  index: NodeIndex,
   to: vscode.CallHierarchyItem
 ): string | null {
   const exactId = makeNodeId(to.uri, to.name, to.selectionRange.start.line);
@@ -440,9 +557,12 @@ function findExistingCalleeId(
 
   const base = baseNameOf(to.name);
   const fp   = to.uri.fsPath;
-  for (const [id, node] of nodes) {
-    if (node.file === fp && (node.label === base || baseNameOf(node.label) === base)) return id;
-  }
+
+  // O(1): ファイル + baseName による二次インデックス検索
+  const indexed = index.get(`${fp}\x00${base}`);
+  if (indexed) return indexed;
+
+  // ヘッダーファイル経由のフォールバック（稀）: ファイルを問わず baseName で一致検索
   const ext = path.extname(fp).toLowerCase();
   if (['.h', '.hpp', '.hxx'].includes(ext)) {
     for (const [id, node] of nodes) {
@@ -491,10 +611,11 @@ function checkCancellation(token?: vscode.CancellationToken): void {
 /**
  * ★ 指数バックオフ付きリトライ + キャンセル対応
  *   各リトライの前に token を確認し、キャンセル済みなら即座に CancellationError を投げる。
- *   待機時間: 200ms → 400ms → 800ms → 1600ms → 3200ms
+ *   待機時間: 200ms → 400ms → 800ms  (MAX_RETRY=4 のとき最大 3 段)
  */
-const MAX_RETRY     = 6;
-const RETRY_BASE_MS = 200;
+const MAX_RETRY          = 4;    // ③ 6 → 4: 最大待機 200+400+800ms = 1,400ms に短縮
+const RETRY_BASE_MS      = 200;
+const CANCELED_RETRY_DELAY = 3000; // clangd indexing 安定化待ち: ファイルレベルリトライの遅延 ms
 
 async function execWithRetry<T>(
   command: string,
@@ -506,6 +627,10 @@ async function execWithRetry<T>(
     try {
       return await vscode.commands.executeCommand<T>(command, ...args);
     } catch (err) {
+      // Bug3 修正: CancellationError はリトライせず即座に再スロー。
+      //   修正前は 'not found' チェックのみで、CancellationError が 200ms 待機後に
+      //   ようやく checkCancellation で検出されていた。
+      if (err instanceof vscode.CancellationError) throw err;
       const msg = String(err);
       if (msg.includes('not found')) throw err; // コマンド自体が存在しない → 即終了
       // ★ Fix: Canceled に加え、LSP 過負荷による一時エラーも全てリトライ
@@ -513,12 +638,21 @@ async function execWithRetry<T>(
       //   これにより Workspace/Folder モードの並列 LSP 呼び出しで発生する
       //   一時的失敗 (non-Canceled エラー) を救済する。
       if (i < MAX_RETRY - 1) {
-        await delay(RETRY_BASE_MS * Math.pow(2, i)); // 200, 400, 800, 1600, 3200 ms
+        await delay(RETRY_BASE_MS * Math.pow(2, i)); // 200ms, 400ms, 800ms
         continue;
       }
       throw err; // MAX_RETRY 回試しても失敗したら諦める
     }
   }
+}
+
+/**
+ * clangd が indexing 中に返す "Canceled: Canceled" エラーかを判定する。
+ * vscode.CancellationError（ユーザー操作によるキャンセル）とは区別する。
+ * ファイルレベルリトライの対象判定に使用する。
+ */
+function isCanceledByClangd(err: unknown): boolean {
+  return !(err instanceof vscode.CancellationError) && String(err).includes('Canceled');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -550,13 +684,15 @@ async function buildFileCallGraphLsp(
   const functions = flattenFunctions(rawSyms);
   if (!functions.length) throw new Error('No function symbols found in this file.');
 
-  const nodes   = new Map<string, GraphNode>();
-  const edgeSet = new Set<string>();
+  const nodes     = new Map<string, GraphNode>();
+  const edgeSet   = new Set<string>();
+  // ⑥ Performance 追加: ファイル+baseName による O(1) ルックアップ用二次インデックス
+  const nodeIndex: NodeIndex = new Map();
 
   // 現在ファイルの関数ノードを事前登録
   for (const f of functions) {
-    const id = makeNodeId(document.uri, f.name, f.selectionRange.start.line);
-    nodes.set(id, {
+    const id   = makeNodeId(document.uri, f.name, f.selectionRange.start.line);
+    const node: GraphNode = {
       id,
       label:         baseNameOf(f.name),
       labelFull:     f.name,
@@ -564,7 +700,9 @@ async function buildFileCallGraphLsp(
       line:          f.selectionRange.start.line + 1,
       scopeEnd:      f.range.end.line + 1, // ⑥ lazy source 用
       isCurrentFile: true,
-    });
+    };
+    nodes.set(id, node);
+    addToNodeIndex(nodeIndex, id, node);
   }
 
   // ── 下方向 BFS (callee) ──────────────────────────────────────────────────
@@ -581,6 +719,7 @@ async function buildFileCallGraphLsp(
     const downVisited = new Set<string>();
     const downQueue:   DownQ[] = [];
     let   adaptiveDelay = BATCH_DELAY_INIT;
+    const downStreak    = { val: 0 }; // D: 連続成功カウンタ (nextAdaptiveDelay 用)
 
     // ★ Fix 1: coreItemsMap — 上方向 BFS 初期化で prepareCallHierarchy を再呼び出しせず再利用する
     const coreItemsMap = new Map<string, vscode.CallHierarchyItem>(); // coreId → item
@@ -605,9 +744,13 @@ async function buildFileCallGraphLsp(
       pct.range(5, 20, Math.min(i + BATCH_SIZE, functions.length), functions.length);
     }
 
-    while (downQueue.length > 0) {
+    // BUG-19 修正: downQueue.splice(0, N) は配列の先頭シフトで O(n) になる。
+    // qi インデックスポインタ方式で O(1) 取り出しに変更する（他の BFS 関数と統一）。
+    let dqi = 0;
+    while (dqi < downQueue.length) {
       checkCancellation(token);
-      const batch          = downQueue.splice(0, BATCH_SIZE);
+      const batch          = downQueue.slice(dqi, dqi + BATCH_SIZE);
+      dqi += batch.length;
       const processingIds  = new Set<string>();
       let   errorsInBatch  = 0;
 
@@ -619,13 +762,13 @@ async function buildFileCallGraphLsp(
 
           for (const call of outgoing) {
             const { to } = call;
-            let calleeId = findExistingCalleeId(nodes, to);
+            let calleeId = findExistingCalleeId(nodes, nodeIndex, to);
             if (!calleeId) {
               if (!shouldIncludeCallee(to.uri, wsRoots)) continue;
               calleeId = makeNodeId(to.uri, to.name, to.selectionRange.start.line);
               if (!nodes.has(calleeId) && !processingIds.has(calleeId)) {
                 processingIds.add(calleeId);
-                nodes.set(calleeId, {
+                const calleeNode: GraphNode = {
                   id:            calleeId,
                   label:         baseNameOf(to.name),
                   labelFull:     to.name,
@@ -633,7 +776,9 @@ async function buildFileCallGraphLsp(
                   line:          to.selectionRange.start.line + 1,
                   scopeEnd:      to.range.end.line + 1,
                   isCurrentFile: to.uri.fsPath === document.uri.fsPath,
-                });
+                };
+                nodes.set(calleeId, calleeNode);
+                addToNodeIndex(nodeIndex, calleeId, calleeNode);
               }
             }
             edgeSet.add(`${callerId}|||${calleeId}`);
@@ -651,12 +796,8 @@ async function buildFileCallGraphLsp(
         }
       }));
 
-      // ① adaptive delay
-      if (errorsInBatch > 0) {
-        adaptiveDelay = Math.min(Math.round(adaptiveDelay * 1.5) + 10, BATCH_DELAY_MAX);
-      } else {
-        adaptiveDelay = Math.max(Math.round(adaptiveDelay * 0.85) - 2, BATCH_DELAY_MIN);
-      }
+      // ① adaptive delay (D: nextAdaptiveDelay で連続成功時に急速収束)
+      adaptiveDelay = nextAdaptiveDelay(adaptiveDelay, errorsInBatch > 0, downStreak);
       pct.bfsQ(20, 55, downVisited, downQueue);
       if (adaptiveDelay > 0 && downQueue.length > 0) await delay(adaptiveDelay);
     }
@@ -681,11 +822,15 @@ async function buildFileCallGraphLsp(
     }
 
     let upAdaptiveDelay = BATCH_DELAY_INIT;
+    const upStreak      = { val: 0 }; // D: 連続成功カウンタ
 
     // ★ Fix 1: シリアルループ → BATCH_SIZE 並列バッチ + adaptive delay
-    while (upQueue.length > 0) {
+    // BUG-19 修正: upQueue.splice(0, N) → uqi インデックスポインタ方式で O(1) 取り出し
+    let uqi = 0;
+    while (uqi < upQueue.length) {
       checkCancellation(token);
-      const batch         = upQueue.splice(0, BATCH_SIZE);
+      const batch         = upQueue.slice(uqi, uqi + BATCH_SIZE);
+      uqi += batch.length;
       let   errorsInBatch = 0;
 
       await Promise.all(batch.map(async ([calleeItem, calleeId]) => {
@@ -695,13 +840,17 @@ async function buildFileCallGraphLsp(
           if (!incoming?.length) return;
 
           for (const call of incoming) {
-            let callerId = findExistingCalleeId(nodes, call.from);
+            let callerId = findExistingCalleeId(nodes, nodeIndex, call.from);
             if (!callerId) {
+              // 🟡 Bug 3 修正: 下方向 BFS は shouldIncludeCallee で wsRoots=[] のとき false を返して
+              //   安全側に倒しているが、上方向 BFS は isInWorkspace を使っており wsRoots=[] のとき
+              //   true を返すため非対称だった。明示的なガードを追加して対称にする。
+              if (wsRoots.length === 0) continue;
               if (!isInWorkspace(call.from.uri, wsRoots)) continue;
               callerId = makeNodeId(call.from.uri, call.from.name, call.from.selectionRange.start.line);
             }
             if (!nodes.has(callerId)) {
-              nodes.set(callerId, {
+              const callerNode: GraphNode = {
                 id:            callerId,
                 label:         baseNameOf(call.from.name),
                 labelFull:     call.from.name,
@@ -709,7 +858,9 @@ async function buildFileCallGraphLsp(
                 line:          call.from.selectionRange.start.line + 1,
                 scopeEnd:      call.from.range.end.line + 1,
                 isCurrentFile: call.from.uri.fsPath === document.uri.fsPath,
-              });
+              };
+              nodes.set(callerId, callerNode);
+              addToNodeIndex(nodeIndex, callerId, callerNode);
             }
             // エッジ方向: caller → callee
             edgeSet.add(`${callerId}|||${calleeId}`);
@@ -727,12 +878,8 @@ async function buildFileCallGraphLsp(
         }
       }));
 
-      // ① adaptive delay (上方向 BFS にも適用)
-      if (errorsInBatch > 0) {
-        upAdaptiveDelay = Math.min(Math.round(upAdaptiveDelay * 1.5) + 10, BATCH_DELAY_MAX);
-      } else {
-        upAdaptiveDelay = Math.max(Math.round(upAdaptiveDelay * 0.85) - 2, BATCH_DELAY_MIN);
-      }
+      // ① adaptive delay (上方向 BFS にも適用) (D: nextAdaptiveDelay で連続成功時に急速収束)
+      upAdaptiveDelay = nextAdaptiveDelay(upAdaptiveDelay, errorsInBatch > 0, upStreak);
       pct.bfsQ(55, 100, upVisited, upQueue);
       if (upAdaptiveDelay > 0 && upQueue.length > 0) await delay(upAdaptiveDelay);
     }
@@ -747,7 +894,138 @@ async function buildFileCallGraphLsp(
   };
 }
 
+/**
+ * LSP バックエンド版・関数グラフ（下方向 BFS のみ）。
+ *
+ * buildPathThroughCallGraphLsp との違い:
+ *   - 上方向 BFS (provideIncomingCalls) を持たない → callee ツリーのみ
+ *   - fileName に `↕` が付かない
+ *   - gtags 版 buildFunctionCallGraphGtags と動作を揃える
+ */
 async function buildFunctionCallGraphLsp(
+  document: vscode.TextDocument, position: vscode.Position, maxHops = 4,
+  progress?: vscode.Progress<{ message?: string; increment?: number }>,
+  token?:    vscode.CancellationToken
+): Promise<GraphData> {
+  const t0      = Date.now();
+  const errs:   string[] = [];
+  const wsRoots = getWorkspaceRoots(document.uri);
+  const pct     = new Pct(progress);
+
+  pct.to(0);
+  checkCancellation(token);
+  const startItems = await execWithRetry<vscode.CallHierarchyItem[]>(
+    'vscode.prepareCallHierarchy', token, document.uri, position);
+  if (!startItems?.length) throw new Error(
+    'No function found at cursor position.\nPlace the cursor on a function name and try again.');
+
+  const nodes    = new Map<string, GraphNode>();
+  const edgeSet  = new Set<string>();
+  // ⑥ Performance 追加: ファイル+baseName による O(1) ルックアップ用二次インデックス
+  const nodeIndex: NodeIndex = new Map();
+  const visited  = new Set<string>();
+  const startNodeId = makeNodeId(startItems[0].uri, startItems[0].name, startItems[0].selectionRange.start.line);
+  const queued   = new Set<string>([startNodeId]);
+  type Q = [vscode.CallHierarchyItem, number]; // [item, hop]
+  const queue: Q[] = [[startItems[0], 0]];
+  let   qi = 0; // D: shift() O(n) → インデックスポインタ O(1)
+
+  // ── 下方向 BFS (callee) ──────────────────────────────────────────────────
+  let adaptiveDelay = BATCH_DELAY_INIT;
+  const downStreak  = { val: 0 }; // D: 連続成功カウンタ
+
+  while (qi < queue.length) {
+    checkCancellation(token);
+
+    type QItem = { item: vscode.CallHierarchyItem; hop: number; nodeId: string };
+    const batch: QItem[] = [];
+    while (batch.length < BATCH_SIZE && qi < queue.length) {
+      const [item, hop] = queue[qi++];
+      const nodeId = makeNodeId(item.uri, item.name, item.selectionRange.start.line);
+      if (visited.has(nodeId)) continue;
+      visited.add(nodeId);
+
+      if (!nodes.has(nodeId)) {
+        const newNode: GraphNode = {
+          id:            nodeId,
+          label:         baseNameOf(item.name),
+          labelFull:     item.name,
+          file:          item.uri.fsPath,
+          line:          item.selectionRange.start.line + 1,
+          scopeEnd:      item.range.end.line + 1,
+          isCurrentFile: item.uri.fsPath === document.uri.fsPath,
+        };
+        nodes.set(nodeId, newNode);
+        addToNodeIndex(nodeIndex, nodeId, newNode);
+      }
+      if (hop < maxHops) batch.push({ item, hop, nodeId });
+    }
+    if (batch.length === 0) continue;
+
+    let lspErrors = 0;
+    const batchResults = await Promise.all(batch.map(async ({ item, hop, nodeId }) => {
+      try {
+        const outgoing = await execWithRetry<vscode.CallHierarchyOutgoingCall[]>(
+          'vscode.provideOutgoingCalls', token, item);
+        return { nodeId, hop, outgoing: outgoing ?? [] };
+      } catch (err) {
+        if (err instanceof vscode.CancellationError) throw err;
+        errs.push(`${item.name}: ${String(err)}`);
+        lspErrors++;
+        return { nodeId, hop, outgoing: [] as vscode.CallHierarchyOutgoingCall[] };
+      }
+    }));
+
+    for (const { nodeId, hop, outgoing } of batchResults) {
+      for (const call of outgoing) {
+        let calleeId = findExistingCalleeId(nodes, nodeIndex, call.to);
+        if (!calleeId) {
+          // 🟡 Bug 7 修正: 下方向 BFS の境界チェックを shouldIncludeCallee に統一する。
+          //   isInWorkspace は wsRoots=[] で true を返すが shouldIncludeCallee は false を返す（安全側）。
+          //   さらに CC_CALLEE_EXTENSIONS でファイル拡張子も確認する点でより厳しい。
+          //   buildFileCallGraphLsp / buildWorkspaceCallGraphLsp は正しく使っていたが
+          //   buildFunctionCallGraphLsp / buildPathThroughCallGraphLsp だけ漏れていた（Bug 3 の対称問題）。
+          if (!shouldIncludeCallee(call.to.uri, wsRoots)) continue;
+          calleeId = makeNodeId(call.to.uri, call.to.name, call.to.selectionRange.start.line);
+          // BUG-01 修正: callee 発見時に nodes / nodeIndex に登録する。
+          //   未登録のまま次の findExistingCalleeId が呼ばれると O(1) ルックアップが機能せず
+          //   makeNodeId が毎回呼ばれてパフォーマンスが低下する。
+          if (!nodes.has(calleeId)) {
+            const calleeNode: GraphNode = {
+              id:            calleeId,
+              label:         baseNameOf(call.to.name),
+              labelFull:     call.to.name,
+              file:          call.to.uri.fsPath,
+              line:          call.to.selectionRange.start.line + 1,
+              scopeEnd:      call.to.range.end.line + 1,
+              isCurrentFile: call.to.uri.fsPath === document.uri.fsPath,
+            };
+            nodes.set(calleeId, calleeNode);
+            addToNodeIndex(nodeIndex, calleeId, calleeNode);
+          }
+        }
+        edgeSet.add(`${nodeId}|||${calleeId}`);
+        if (!queued.has(calleeId)) {
+          queued.add(calleeId);
+          queue.push([call.to, hop + 1]);
+        }
+      }
+    }
+
+    adaptiveDelay = nextAdaptiveDelay(adaptiveDelay, lspErrors > 0, downStreak);
+    if (adaptiveDelay > 0 && qi < queue.length) await delay(adaptiveDelay);
+    pct.bfsQ(5, 100, queued, { length: queue.length - qi });
+  }
+
+  return {
+    nodes: Array.from(nodes.values()), edges: splitEdges(edgeSet),
+    fileName:    `${baseNameOf(startItems[0].name)} (${path.basename(document.uri.fsPath)})`,
+    buildTimeMs: Date.now() - t0,
+    errors:      errs,
+  };
+}
+
+async function buildPathThroughCallGraphLsp(
   document: vscode.TextDocument, position: vscode.Position, maxHops = 4,
   progress?: vscode.Progress<{ message?: string; increment?: number }>,
   token?:    vscode.CancellationToken
@@ -766,6 +1044,8 @@ async function buildFunctionCallGraphLsp(
 
   const nodes   = new Map<string, GraphNode>();
   const edgeSet = new Set<string>();
+  // ⑥ Performance 追加: ファイル+baseName による O(1) ルックアップ用二次インデックス
+  const nodeIndex: NodeIndex = new Map();
   const visited = new Set<string>();                                 // dequeue 後に処理完了した nodeId
   const startNodeId = makeNodeId(startItems[0].uri, startItems[0].name, startItems[0].selectionRange.start.line);
   const queued  = new Set<string>([startNodeId]);                   // queue に投入済みの nodeId (重複投入防止)
@@ -778,6 +1058,7 @@ async function buildFunctionCallGraphLsp(
   // 旧実装: 1ノードずつ provideOutgoingCalls をシリアル呼び出し
   // 新実装: BATCH_SIZE 個まとめて並列呼び出し → clangd の応答待ちを重ねる
   let adaptiveDelay = BATCH_DELAY_INIT;
+  const downStreak2 = { val: 0 }; // D: 連続成功カウンタ (nextAdaptiveDelay 用)
 
   while (qi < queue.length) {
     checkCancellation(token);
@@ -792,7 +1073,7 @@ async function buildFunctionCallGraphLsp(
       visited.add(nodeId); // 先行マークで並列処理中の重複を防止
 
       if (!nodes.has(nodeId)) {
-        nodes.set(nodeId, {
+        const newNode: GraphNode = {
           id:            nodeId,
           label:         baseNameOf(item.name),
           labelFull:     item.name,
@@ -800,7 +1081,9 @@ async function buildFunctionCallGraphLsp(
           line:          item.selectionRange.start.line + 1,
           scopeEnd:      item.range.end.line + 1,
           isCurrentFile: item.uri.fsPath === document.uri.fsPath,
-        });
+        };
+        nodes.set(nodeId, newNode);
+        addToNodeIndex(nodeIndex, nodeId, newNode);
       }
       if (hop < maxHops) batch.push({ item, hop, nodeId });
     }
@@ -824,10 +1107,31 @@ async function buildFunctionCallGraphLsp(
     // エッジ生成・次ホップをキューに追加
     for (const { nodeId, hop, outgoing } of batchResults) {
       for (const call of outgoing) {
-        let calleeId = findExistingCalleeId(nodes, call.to);
+        let calleeId = findExistingCalleeId(nodes, nodeIndex, call.to);
         if (!calleeId) {
-          if (!isInWorkspace(call.to.uri, wsRoots)) continue;
+          // 🟡 Bug 7 修正: 下方向 BFS の境界チェックを shouldIncludeCallee に統一する。
+          //   isInWorkspace は wsRoots=[] で true を返すが shouldIncludeCallee は false を返す（安全側）。
+          //   さらに CC_CALLEE_EXTENSIONS でファイル拡張子も確認する点でより厳しい。
+          //   buildFileCallGraphLsp / buildWorkspaceCallGraphLsp は正しく使っていたが
+          //   buildFunctionCallGraphLsp / buildPathThroughCallGraphLsp だけ漏れていた（Bug 3 の対称問題）。
+          if (!shouldIncludeCallee(call.to.uri, wsRoots)) continue;
           calleeId = makeNodeId(call.to.uri, call.to.name, call.to.selectionRange.start.line);
+          // BUG-01 修正: callee 発見時に nodes / nodeIndex に登録する。
+          //   未登録のまま次の findExistingCalleeId が呼ばれると O(1) ルックアップが機能せず
+          //   makeNodeId が毎回呼ばれてパフォーマンスが低下する。
+          if (!nodes.has(calleeId)) {
+            const calleeNode: GraphNode = {
+              id:            calleeId,
+              label:         baseNameOf(call.to.name),
+              labelFull:     call.to.name,
+              file:          call.to.uri.fsPath,
+              line:          call.to.selectionRange.start.line + 1,
+              scopeEnd:      call.to.range.end.line + 1,
+              isCurrentFile: call.to.uri.fsPath === document.uri.fsPath,
+            };
+            nodes.set(calleeId, calleeNode);
+            addToNodeIndex(nodeIndex, calleeId, calleeNode);
+          }
         }
         edgeSet.add(`${nodeId}|||${calleeId}`);
         if (!queued.has(calleeId)) {
@@ -837,12 +1141,8 @@ async function buildFunctionCallGraphLsp(
       }
     }
 
-    // adaptiveDelay: clangd 過負荷を防止
-    if (lspErrors > 0) {
-      adaptiveDelay = Math.min(Math.round(adaptiveDelay * 1.5) + 10, BATCH_DELAY_MAX);
-    } else {
-      adaptiveDelay = Math.max(Math.round(adaptiveDelay * 0.85) - 2, BATCH_DELAY_MIN);
-    }
+    // adaptiveDelay: clangd 過負荷を防止 (D: nextAdaptiveDelay で連続成功時に急速収束)
+    adaptiveDelay = nextAdaptiveDelay(adaptiveDelay, lspErrors > 0, downStreak2);
     if (adaptiveDelay > 0 && qi < queue.length) await delay(adaptiveDelay);
     pct.bfsQ(5, 50, queued, { length: queue.length - qi });
   }
@@ -855,6 +1155,7 @@ async function buildFunctionCallGraphLsp(
     const upQueued = new Set<string>([startNodeId]);
     let upCurrentLevel: vscode.CallHierarchyItem[] = [startItems[0]];
     let adaptiveDelay = BATCH_DELAY_INIT;
+    const upStreak2   = { val: 0 }; // D: 連続成功カウンタ (nextAdaptiveDelay 用)
 
     for (let hop = 0; hop < maxHops && upCurrentLevel.length > 0; hop++) {
       checkCancellation(token);
@@ -881,13 +1182,17 @@ async function buildFunctionCallGraphLsp(
         for (const { calleeItem, incoming } of batchResults) {
           const calleeId = makeNodeId(calleeItem.uri, calleeItem.name, calleeItem.selectionRange.start.line);
           for (const call of incoming) {
-            let callerId = findExistingCalleeId(nodes, call.from);
+            let callerId = findExistingCalleeId(nodes, nodeIndex, call.from);
             if (!callerId) {
+              // 🟡 Bug 3 修正: 下方向 BFS は shouldIncludeCallee で wsRoots=[] のとき false を返して
+              //   安全側に倒しているが、上方向 BFS は isInWorkspace を使っており wsRoots=[] のとき
+              //   true を返すため非対称だった。明示的なガードを追加して対称にする。
+              if (wsRoots.length === 0) continue;
               if (!isInWorkspace(call.from.uri, wsRoots)) continue;
               callerId = makeNodeId(call.from.uri, call.from.name, call.from.selectionRange.start.line);
             }
             if (!nodes.has(callerId)) {
-              nodes.set(callerId, {
+              const callerNode: GraphNode = {
                 id:            callerId,
                 label:         baseNameOf(call.from.name),
                 labelFull:     call.from.name,
@@ -895,7 +1200,9 @@ async function buildFunctionCallGraphLsp(
                 line:          call.from.selectionRange.start.line + 1,
                 scopeEnd:      call.from.range.end.line + 1,
                 isCurrentFile: call.from.uri.fsPath === document.uri.fsPath,
-              });
+              };
+              nodes.set(callerId, callerNode);
+              addToNodeIndex(nodeIndex, callerId, callerNode);
             }
             edgeSet.add(`${callerId}|||${calleeId}`);
             if (!upQueued.has(callerId)) {
@@ -905,12 +1212,8 @@ async function buildFunctionCallGraphLsp(
           }
         }
 
-        // adaptiveDelay: Canceled エラーが多いほど遅延を増やし clangd を保護
-        if (lspErrors > 0) {
-          adaptiveDelay = Math.min(Math.round(adaptiveDelay * 1.5) + 10, BATCH_DELAY_MAX);
-        } else {
-          adaptiveDelay = Math.max(Math.round(adaptiveDelay * 0.85) - 2, BATCH_DELAY_MIN);
-        }
+        // adaptiveDelay: Canceled エラーが多いほど遅延を増やし clangd を保護 (D: 連続成功時急速収束)
+        adaptiveDelay = nextAdaptiveDelay(adaptiveDelay, lspErrors > 0, upStreak2);
         if (adaptiveDelay > 0 && (i + BATCH_SIZE < upCurrentLevel.length || upNextLevel.length > 0)) {
           await delay(adaptiveDelay);
         }
@@ -936,83 +1239,111 @@ async function buildWorkspaceCallGraphLsp(
 ): Promise<GraphData> {
   const t0         = Date.now();
   const errs:      string[] = [];
+  // FILE_PARALLEL: フェーズ1・フェーズ2 共通の並列数定数。関数先頭で宣言して両フェーズで参照する。
+  const FILE_PARALLEL = 3;
   const uniqueUris = Array.from(new Map(uris.map(u => [u.fsPath, u])).values())
     .filter(u => hasCppSourceExtension(u));
+  // BUG-02 修正: gtags 版と同様に空チェックを追加（uniqueUris[0] への未防衛アクセスを防ぐ）
+  if (!uniqueUris.length) throw new Error('No C/C++ source files found.');
   const wsRoots = getWorkspaceRoots(uniqueUris[0]);
   const nodes   = new Map<string, GraphNode>();
   const edgeSet = new Set<string>();
+  // ⑥ Performance 追加: ファイル+baseName による O(1) ルックアップ用二次インデックス
+  const nodeIndex: NodeIndex = new Map();
   const pct     = new Pct(progress);
 
   // ★ Fix: 2フェーズに分離して最大並列 LSP 呼び出し数を 36 → BATCH_SIZE(6) に削減。
   //   フェーズ1: 全ファイルのシンボル取得を並列実行 (軽量・CallHierarchy未使用)
   //   フェーズ2: ファイル単位で順次・関数内は BATCH_SIZE 並列で OutgoingCalls を取得
   //
-  // フェーズ1: シンボル取得 + ノード事前登録 (並列 OK)
+  // フェーズ1: シンボル取得 + ノード事前登録
+  // BUG-11/PERF-08 修正: 旧実装は全ファイルを Promise.all で完全並列に LSP へ投入していた。
+  // ファイル数が多い場合（100+）に clangd が過負荷になり Canceled エラーが多発する。
+  // フェーズ2 と同じく FILE_PARALLEL (= 3) 個ずつバッチ化してスループットを維持しながら
+  // LSP への同時リクエスト数を制限する。
   type FileEntry = { uri: vscode.Uri; functions: vscode.DocumentSymbol[] };
   const fileEntries: FileEntry[] = [];
 
-  await Promise.all(uniqueUris.map(async (uri, idx) => {
+  for (let si = 0; si < uniqueUris.length; si += FILE_PARALLEL) {
     checkCancellation(token);
-    let rawSyms: vscode.DocumentSymbol[] | undefined;
-    try {
-      rawSyms = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
-        'vscode.executeDocumentSymbolProvider', uri);
-    } catch { return; }
-    if (!rawSyms?.length) return;
+    await Promise.all(uniqueUris.slice(si, si + FILE_PARALLEL).map(async uri => {
+      let rawSyms: vscode.DocumentSymbol[] | undefined;
+      try {
+        rawSyms = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
+          'vscode.executeDocumentSymbolProvider', uri);
+      } catch { return; }
+      if (!rawSyms?.length) return;
 
-    const functions = flattenFunctions(rawSyms);
-    // シンボル取得と同時にノードを事前登録 (後続フェーズ2で findExistingCalleeId がヒットできるよう)
-    for (const f of functions) {
-      const id = makeNodeId(uri, f.name, f.selectionRange.start.line);
-      if (!nodes.has(id)) {
-        nodes.set(id, {
-          id,
-          label:         baseNameOf(f.name),
-          labelFull:     f.name,
-          file:          uri.fsPath,
-          line:          f.selectionRange.start.line + 1,
-          scopeEnd:      f.range.end.line + 1,
-          isCurrentFile: false,
-        });
+      const functions = flattenFunctions(rawSyms);
+      for (const f of functions) {
+        const id = makeNodeId(uri, f.name, f.selectionRange.start.line);
+        if (!nodes.has(id)) {
+          const newNode: GraphNode = {
+            id,
+            label:         baseNameOf(f.name),
+            labelFull:     f.name,
+            file:          uri.fsPath,
+            line:          f.selectionRange.start.line + 1,
+            scopeEnd:      f.range.end.line + 1,
+            isCurrentFile: false,
+          };
+          nodes.set(id, newNode);
+          addToNodeIndex(nodeIndex, id, newNode);
+        }
       }
-    }
-    pct.range(0, 40, idx + 1, uniqueUris.length);
-    fileEntries.push({ uri, functions });
-  }));
+      fileEntries.push({ uri, functions });
+    }));
+    pct.range(0, 40, Math.min(si + FILE_PARALLEL, uniqueUris.length), uniqueUris.length);
+  }
 
-  // フェーズ2: ファイル単位で順次実行 (max BATCH_SIZE=6 並列 / ファイル)
-  for (let fi = 0; fi < fileEntries.length; fi++) {
+  // フェーズ2: ファイルを FILE_PARALLEL 個ずつ並列で処理する。
+  // A: 従来はファイルをシリアル処理していたが、FILE_PARALLEL=3 の並列化で
+  //    大規模プロジェクトでは最大 ~3x のスループット向上が見込める。
+  //    各ファイルの adaptive delay は独立して管理するため、エラー回復も正常に動作する。
+  //    JS は単一スレッドなので nodes/edgeSet への同時書き込みも安全（race なし）。
+  // BUG-11: FILE_PARALLEL は関数先頭で宣言済み。
+
+  // ★ Fix-Canceled: clangd が indexing 中に "Canceled" を返した関数をファイル単位で収集し、
+  //   フェーズ2 完了後に CANCELED_RETRY_DELAY ms 待機してから再処理する。
+  //   これにより indexing 完了前の一時的な Canceled ワーニングを解消する。
+  const canceledFuncsByFile = new Map<string, { uri: vscode.Uri; funcs: vscode.DocumentSymbol[] }>();
+
+  for (let fi = 0; fi < fileEntries.length; fi += FILE_PARALLEL) {
     checkCancellation(token);
-    const { uri, functions } = fileEntries[fi];
-    pct.range(40, 100, fi + 1, fileEntries.length);
+    pct.range(40, 100, fi, fileEntries.length);
 
-    let adaptiveDelay = BATCH_DELAY_INIT;
-    for (let i = 0; i < functions.length; i += BATCH_SIZE) {
-      checkCancellation(token);
-      const processingIds = new Set<string>();
-      let   errorsInBatch = 0;
+    await Promise.all(fileEntries.slice(fi, fi + FILE_PARALLEL).map(async ({ uri, functions }) => {
+      let adaptiveDelay  = BATCH_DELAY_INIT;
+      const wsFileStreak = { val: 0 }; // D: 連続成功カウンタ (nextAdaptiveDelay 用)
+      const canceledFuncs: vscode.DocumentSymbol[] = []; // ★ Fix-Canceled: Canceled 関数を収集
 
-      await Promise.all(functions.slice(i, i + BATCH_SIZE).map(async (func) => {
-        try {
-          const items = await execWithRetry<vscode.CallHierarchyItem[]>(
-            'vscode.prepareCallHierarchy', token, uri, func.selectionRange.start);
-          if (!items?.length) return;
+      for (let i = 0; i < functions.length; i += BATCH_SIZE) {
+        checkCancellation(token);
+        const processingIds = new Set<string>();
+        let   errorsInBatch = 0;
 
-          const outgoing = await execWithRetry<vscode.CallHierarchyOutgoingCall[]>(
-            'vscode.provideOutgoingCalls', token, items[0]);
-          if (!outgoing?.length) return;
+        await Promise.all(functions.slice(i, i + BATCH_SIZE).map(async (func) => {
+          try {
+            const items = await execWithRetry<vscode.CallHierarchyItem[]>(
+              'vscode.prepareCallHierarchy', token, uri, func.selectionRange.start);
+            if (!items?.length) return;
 
-          const callerId = makeNodeId(uri, func.name, func.selectionRange.start.line);
-          for (const call of outgoing) {
-            const { to } = call;
-            let calleeId = findExistingCalleeId(nodes, to);
-            if (!calleeId) {
-              if (!shouldIncludeCallee(to.uri, wsRoots)) continue;
-              calleeId = makeNodeId(to.uri, to.name, to.selectionRange.start.line);
-              if (!nodes.has(calleeId) && !processingIds.has(calleeId)) {
-                processingIds.add(calleeId);
-                if (!nodes.has(calleeId)) {
-                  nodes.set(calleeId, {
+            const outgoing = await execWithRetry<vscode.CallHierarchyOutgoingCall[]>(
+              'vscode.provideOutgoingCalls', token, items[0]);
+            if (!outgoing?.length) return;
+
+            const callerId = makeNodeId(uri, func.name, func.selectionRange.start.line);
+            for (const call of outgoing) {
+              const { to } = call;
+              let calleeId = findExistingCalleeId(nodes, nodeIndex, to);
+              if (!calleeId) {
+                if (!shouldIncludeCallee(to.uri, wsRoots)) continue;
+                calleeId = makeNodeId(to.uri, to.name, to.selectionRange.start.line);
+                if (!nodes.has(calleeId) && !processingIds.has(calleeId)) {
+                  // Bug① 修正: 外側の nodes.has チェック済みのため内側の重複チェックを削除。
+                  // JSシングルスレッドにより await のない同期ブロック内で他コルーチンは割り込まない。
+                  processingIds.add(calleeId);
+                  const calleeNode: GraphNode = {
                     id:            calleeId,
                     label:         baseNameOf(to.name),
                     labelFull:     to.name,
@@ -1020,26 +1351,100 @@ async function buildWorkspaceCallGraphLsp(
                     line:          to.selectionRange.start.line + 1,
                     scopeEnd:      to.range.end.line + 1,
                     isCurrentFile: false,
-                  });
+                  };
+                  nodes.set(calleeId, calleeNode);
+                  addToNodeIndex(nodeIndex, calleeId, calleeNode);
                 }
               }
+              edgeSet.add(`${callerId}|||${calleeId}`);
             }
-            edgeSet.add(`${callerId}|||${calleeId}`);
+          } catch (err) {
+            if (err instanceof vscode.CancellationError) throw err;
+            errorsInBatch++;
+            // ★ Fix-Canceled: clangd の Canceled はリトライ候補に追加し、errs には積まない
+            if (isCanceledByClangd(err)) {
+              canceledFuncs.push(func);
+            } else {
+              errs.push(`${path.basename(uri.fsPath)}::${func.name}: ${String(err)}`);
+            }
           }
-        } catch (err) {
-          if (err instanceof vscode.CancellationError) throw err;
-          errorsInBatch++;
-          errs.push(`${path.basename(uri.fsPath)}::${func.name}: ${String(err)}`);
-        }
-      }));
+        }));
 
-      // ① adaptive delay
-      if (errorsInBatch > 0) {
-        adaptiveDelay = Math.min(Math.round(adaptiveDelay * 1.5) + 10, BATCH_DELAY_MAX);
-      } else {
-        adaptiveDelay = Math.max(Math.round(adaptiveDelay * 0.85) - 2, BATCH_DELAY_MIN);
+        // ① adaptive delay (D: nextAdaptiveDelay で連続成功時に急速収束)
+        adaptiveDelay = nextAdaptiveDelay(adaptiveDelay, errorsInBatch > 0, wsFileStreak);
+        if (adaptiveDelay > 0 && i + BATCH_SIZE < functions.length) await delay(adaptiveDelay);
       }
-      if (adaptiveDelay > 0 && i + BATCH_SIZE < functions.length) await delay(adaptiveDelay);
+
+      // ★ Fix-Canceled: Canceled 関数が残っていればリトライ候補マップに登録
+      if (canceledFuncs.length > 0) {
+        canceledFuncsByFile.set(uri.fsPath, { uri, funcs: canceledFuncs });
+      }
+    }));
+  }
+
+  // ★ Fix-Canceled: フェーズ2 ファイルレベルリトライ
+  // clangd indexing が完了するまで CANCELED_RETRY_DELAY ms 待機してから再処理する。
+  // リトライ後も失敗した場合のみ errs に追加する（真のエラーのみワーニング表示）。
+  if (canceledFuncsByFile.size > 0) {
+    await delay(CANCELED_RETRY_DELAY);
+    checkCancellation(token);
+
+    for (const { uri, funcs } of canceledFuncsByFile.values()) {
+      checkCancellation(token);
+      const fileBase     = path.basename(uri.fsPath);
+      let adaptiveDelay  = BATCH_DELAY_INIT;
+      const wsFileStreak = { val: 0 };
+
+      for (let i = 0; i < funcs.length; i += BATCH_SIZE) {
+        checkCancellation(token);
+        const processingIds = new Set<string>();
+        let   errorsInBatch = 0;
+
+        await Promise.all(funcs.slice(i, i + BATCH_SIZE).map(async (func) => {
+          try {
+            const items = await execWithRetry<vscode.CallHierarchyItem[]>(
+              'vscode.prepareCallHierarchy', token, uri, func.selectionRange.start);
+            if (!items?.length) return;
+
+            const outgoing = await execWithRetry<vscode.CallHierarchyOutgoingCall[]>(
+              'vscode.provideOutgoingCalls', token, items[0]);
+            if (!outgoing?.length) return;
+
+            const callerId = makeNodeId(uri, func.name, func.selectionRange.start.line);
+            for (const call of outgoing) {
+              const { to } = call;
+              let calleeId = findExistingCalleeId(nodes, nodeIndex, to);
+              if (!calleeId) {
+                if (!shouldIncludeCallee(to.uri, wsRoots)) continue;
+                calleeId = makeNodeId(to.uri, to.name, to.selectionRange.start.line);
+                if (!nodes.has(calleeId) && !processingIds.has(calleeId)) {
+                  processingIds.add(calleeId);
+                  const calleeNode: GraphNode = {
+                    id:            calleeId,
+                    label:         baseNameOf(to.name),
+                    labelFull:     to.name,
+                    file:          to.uri.fsPath,
+                    line:          to.selectionRange.start.line + 1,
+                    scopeEnd:      to.range.end.line + 1,
+                    isCurrentFile: false,
+                  };
+                  nodes.set(calleeId, calleeNode);
+                  addToNodeIndex(nodeIndex, calleeId, calleeNode);
+                }
+              }
+              edgeSet.add(`${callerId}|||${calleeId}`);
+            }
+          } catch (err) {
+            if (err instanceof vscode.CancellationError) throw err;
+            errorsInBatch++;
+            // リトライ後も失敗した場合のみ errs に追加する
+            errs.push(`${fileBase}::${func.name}: ${String(err)}`);
+          }
+        }));
+
+        adaptiveDelay = nextAdaptiveDelay(adaptiveDelay, errorsInBatch > 0, wsFileStreak);
+        if (adaptiveDelay > 0 && i + BATCH_SIZE < funcs.length) await delay(adaptiveDelay);
+      }
     }
   }
 
@@ -1082,20 +1487,30 @@ async function collectGtagsCached(wsRoot: string): Promise<{
   tags:           Map<string, GtagEntry[]>;
   lineCache:      Map<string, string[]>;
   ambiguousNames: string[];
+  scopeMap:       Map<string, ScopeMapEntry>; // B: キャッシュ済みスコープマップ
 }> {
   const now    = Date.now();
   const cached = tagsCache.get(wsRoot);
   if (cached && now - cached.timestamp < TAGS_CACHE_TTL_MS) {
-    return { tags: cached.tags, lineCache: new Map(), ambiguousNames: cached.ambiguousNames };
+    return {
+      tags:           cached.tags,
+      lineCache:      new Map(),
+      ambiguousNames: cached.ambiguousNames,
+      scopeMap:       cached.scopeMap,    // B: キャッシュヒット時もそのまま返す
+    };
   }
-  const allUris = await findFilesCached();
-  const result  = await collectGtags(allUris.map(u => u.fsPath), wsRoot);
+  const allUris  = await findFilesCached();
+  const result   = await collectGtags(allUris.map(u => u.fsPath), wsRoot);
+  // B: buildGtagsScopeMap はタグから決定的に生成できるため、タグと一緒にキャッシュする。
+  //   以降の build 関数は scopeMap を受け取るだけでよく、再計算コストがゼロになる。
+  const scopeMap = buildGtagsScopeMap(result.tags);
   tagsCache.set(wsRoot, {
     tags:           result.tags,
     ambiguousNames: result.ambiguousNames,
+    scopeMap,
     timestamp:      now,
   });
-  return result;
+  return { ...result, scopeMap };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1179,7 +1594,7 @@ async function ensureGtagsDb(wsRoot: string): Promise<string | undefined> {
       //   古いタグのまま続行すると print_result など新規関数がエッジに現れない。
       //   フルリビルドすることでタグを最新化し欠落エッジを防ぐ。
       try {
-        await execFileAsync('gtags', ['--accept-dotfiles'], { cwd: wsRoot, timeout: 120_000 });
+        await runGtagsWithDotfilesCompat(wsRoot);
         gtagsUpdateCache.set(wsRoot, now);
       } catch (rebuildErr) {
         // リビルドも失敗したら警告を返して古いタグで続行 (BugFix F の挙動を維持)
@@ -1187,10 +1602,34 @@ async function ensureGtagsDb(wsRoot: string): Promise<string | undefined> {
       }
     }
   } else {
-    await execFileAsync('gtags', ['--accept-dotfiles'], { cwd: wsRoot, timeout: 120_000 });
+    try {
+      await runGtagsWithDotfilesCompat(wsRoot);
+    } catch (initErr) {
+      return spawnErrorMessage('gtags', initErr);
+    }
     gtagsUpdateCache.set(wsRoot, now);
   }
   return undefined;
+}
+
+/**
+ * BUG-5 修正: GNU GLOBAL のバージョン互換を考慮した gtags 実行ヘルパー。
+ * --accept-dotfiles は 6.5 以降のオプション。Ubuntu 20.04 の標準パッケージ (6.3 系) など
+ * 旧バージョンでは "unrecognized option" で終了コード 1 になるため、
+ * 失敗した場合はオプションなしで再試行する。
+ */
+async function runGtagsWithDotfilesCompat(wsRoot: string): Promise<void> {
+  try {
+    await execFileAsync('gtags', ['--accept-dotfiles'], { cwd: wsRoot, timeout: 120_000 });
+  } catch (err) {
+    const msg = String(err);
+    // --accept-dotfiles 未サポートの場合のみフォールバック
+    if (/unrecognized option|invalid option|unknown option/i.test(msg)) {
+      await execFileAsync('gtags', [], { cwd: wsRoot, timeout: 120_000 });
+    } else {
+      throw err;
+    }
+  }
 }
 
 /**
@@ -1202,21 +1641,27 @@ async function ensureGtagsDb(wsRoot: string): Promise<string | undefined> {
  */
 function sanitizeToWsRoot(rawPath: string, wsRoot: string): string | null {
   const fp          = path.isAbsolute(rawPath) ? rawPath : path.resolve(wsRoot, rawPath);
-  const wsRootSlash = wsRoot.endsWith(path.sep) ? wsRoot : wsRoot + path.sep;
-  // 一次チェック: パス文字列によるプレフィックス検証
-  if (!(fp.startsWith(wsRootSlash) || fp === wsRoot)) return null;
+  // Bug③ 修正: 一次チェックも normalizeFsPath で大文字小文字を統一する。
+  // Windows (大文字小文字無視 FS) でパスが混在しても正しく判定できるようにする。
+  const fpNorm      = normalizeFsPath(fp);
+  const wsRootNorm  = normalizeFsPath(wsRoot);
+  const wsRootSlash = wsRootNorm.endsWith(path.sep) ? wsRootNorm : wsRootNorm + path.sep;
+  // 一次チェック: 正規化済みパス文字列によるプレフィックス検証
+  if (!(fpNorm.startsWith(wsRootSlash) || fpNorm === wsRootNorm)) return null;
   // 二次チェック (Security②): シンボリックリンクを解決して実パスで再検証。
   // ワークスペース内のシンボリックリンク → ワークスペース外ファイル のトラバーサルを防ぐ。
   try {
     // H: realpathSync 結果をキャッシュ。wsRoot は不変、fp も繰り返し出現するため効果大。
     const realFp = realpathCache.get(fp) ?? (() => {
-      const r = fs.realpathSync(fp); realpathCache.set(fp, r); return r;
+      const r = fs.realpathSync(fp); setRealpathCache(fp, r); return r;
     })();
     const realRoot = realpathCache.get(wsRoot) ?? (() => {
-      const r = fs.realpathSync(wsRoot); realpathCache.set(wsRoot, r); return r;
+      const r = fs.realpathSync(wsRoot); setRealpathCache(wsRoot, r); return r;
     })();
-    const realSlash = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep;
-    if (!(realFp.startsWith(realSlash) || realFp === realRoot)) return null;
+    const realFpNorm   = normalizeFsPath(realFp);
+    const realRootNorm = normalizeFsPath(realRoot);
+    const realSlash    = realRootNorm.endsWith(path.sep) ? realRootNorm : realRootNorm + path.sep;
+    if (!(realFpNorm.startsWith(realSlash) || realFpNorm === realRootNorm)) return null;
   } catch {
     // ファイルが存在しない / 解決不能な場合は安全のため除外
     return null;
@@ -1225,7 +1670,23 @@ function sanitizeToWsRoot(rawPath: string, wsRoot: string): string | null {
 }
 
 /**
+ * BUG-4 修正: マルチルートワークスペース対応の sanitize ヘルパー。
+ * LSP バックエンドでは全ワークスペースフォルダが callee 対象になるが、
+ * gtags バックエンドは単一 wsRoot のみ対象だった非対称を修正する。
+ * wsRoots の中の任意のルートに含まれるパスを受け入れる。
+ * wsRoots が空の場合は単一 wsRoot にフォールバックする。
+ */
+function sanitizeToAnyWsRoot(rawPath: string, wsRoots: string[]): string | null {
+  for (const root of wsRoots) {
+    const result = sanitizeToWsRoot(rawPath, root);
+    if (result !== null) return result;
+  }
+  return null;
+}
+
+/**
  * `global -f <file>` を実行してそのファイルで定義されているタグを取得。
+ * per-file フォールバックパスおよび buildScopeForFileCached で使用する。
  */
 async function runGlobalF(
   absFile: string, wsRoot: string
@@ -1251,17 +1712,45 @@ async function runGlobalF(
   }
 }
 
-/** ファイルを行配列で読み込み、キャッシュする */
+/** ファイルを行配列で読み込み、キャッシュする（同期版・キャッシュヒット専用） */
 function readFileLinesCached(filePath: string, cache: Map<string, string[]>): string[] {
   if (cache.has(filePath)) return cache.get(filePath)!;
+  // ⑤ Performance 修正: 同期I/Oは廃止し空配列を返す。
+  // 呼び出し元は事前に prefetchFileLines / getFileLinesAsync でキャッシュを温めること。
+  // フォールバックとして同期読み込みを残すと大規模プロジェクトでホストをブロックするため削除。
+  // BUG-2 派生修正: キャッシュミス時に空配列をキャッシュしない。
+  // キャッシュすると同一ビルド内でそのファイルの呼び出し関係が欠落し続ける。
+  return [];
+}
+
+/**
+ * ⑤ Performance 追加: 非同期ファイル行読み込み。
+ * キャッシュヒット時は即座に返し、ミス時のみ fs.promises.readFile で非同期読み込みする。
+ * BFS ループ・buildScopeForFileCached など async コンテキストで使用する。
+ */
+async function getFileLinesAsync(filePath: string, cache: Map<string, string[]>): Promise<string[]> {
+  if (cache.has(filePath)) return cache.get(filePath)!;
   try {
-    const lines = fs.readFileSync(filePath, 'utf-8').split('\n');
+    const content = await fs.promises.readFile(filePath, 'utf-8');
+    const lines   = content.split('\n');
     cache.set(filePath, lines);
     return lines;
   } catch {
-    cache.set(filePath, []);
+    // BUG-2 修正: 一時的な I/O エラー（ファイルロック等）を永続キャッシュしない。
+    // キャッシュすると lazyTagCache 経由でモジュールレベルに残り、TTL 内ずっとそのファイルが
+    // グラフから消える。エラー時はキャッシュせず空配列だけ返す。
     return [];
   }
+}
+
+/**
+ * ⑤ Performance 追加: 必要なファイルを事前に並列プリフェッチしてキャッシュを温める。
+ * collectGtags のフォールバックパスなど「直後に同期読みが走る」箇所で呼ぶ。
+ */
+async function prefetchFileLines(files: readonly string[], cache: Map<string, string[]>): Promise<void> {
+  const needed = [...new Set(files)].filter(f => !cache.has(f));
+  if (needed.length === 0) return;
+  await Promise.all(needed.map(f => getFileLinesAsync(f, cache)));
 }
 
 /**
@@ -1270,16 +1759,16 @@ function readFileLinesCached(filePath: string, cache: Map<string, string[]>): st
  * ソース行は global 出力に含まれるためファイルを読まない。
  * 出力形式: name<ws>line<ws>file<ws>source_line
  *
- * 【High-3 修正】maxBuffer を 200MB → 50MB に削減。
- *   大規模プロジェクトで 200MB を確保すると VS Code ホストがメモリ枯渇でクラッシュする。
- *   50MB を超えた場合は ENOBUFS として上位の collectGtags に伝播し、
- *   per-file global -f フォールバックへ自動的に切り替わるため安全。
+ * 【maxBuffer について】
+ *   SEC-02 修正により 256MB を設定している（旧 High-3 コメントの「50MB」は廃止済み）。
+ *   50MB では大規模プロジェクトで RangeError が発生しタグ収集が全滅していた。
+ *   256MB を超えるプロジェクトには spawn + readline によるストリーム処理への移行を推奨。
  */
 async function runGlobalXAll(
   wsRoot: string
 ): Promise<Array<{ name: string; line: number; file: string; sourceLine: string }>> {
   const { stdout } = await execFileAsync('global', ['-x', '-e', '.'], {
-    cwd: wsRoot, maxBuffer: 50 * 1024 * 1024, timeout: 120_000,
+    cwd: wsRoot, maxBuffer: 256 * 1024 * 1024, timeout: 120_000, // SEC-02: 256MB (詳細は JSDoc 参照)
   });
   return stdout.split('\n').flatMap(raw => {
     const trimmed = raw.trimEnd();
@@ -1330,13 +1819,30 @@ async function collectGtags(
   }
 
   const rawMap = new Map<string, RawEntry[]>();
-  for (const e of rawEntries) {
+  // PERF-01 修正: 数万行のエントリを逐行処理するとイベントループがブロックされる。
+  // 10000 件ごとに setImmediate で制御を返し VS Code の応答性を維持する。
+  for (let i = 0; i < rawEntries.length; i++) {
+    if (i > 0 && i % 10_000 === 0) await new Promise<void>(r => setImmediate(r));
+    const e = rawEntries[i];
     if (!rawMap.has(e.name)) rawMap.set(e.name, []);
     rawMap.get(e.name)!.push(e);
   }
 
   const tags           = new Map<string, GtagEntry[]>();
   const ambiguousNames: string[] = [];
+
+  // ⑤ Performance 修正: sourceLine が空のエントリのファイルを事前に並列プリフェッチ。
+  // フォールバックパス (per-file global -f) では sourceLine が常に空のため、
+  // ここで非同期プリフェッチしておくことで後続の readFileLinesCached がキャッシュヒットする。
+  {
+    const filesNeedingRead: string[] = [];
+    for (const [, candidates] of rawMap) {
+      for (const cand of candidates) {
+        if (!cand.sourceLine) filesNeedingRead.push(cand.file);
+      }
+    }
+    await prefetchFileLines(filesNeedingRead, lineCache);
+  }
 
   for (const [name, candidates] of rawMap) {
     const distinctFiles = new Set(candidates.map(c => c.file));
@@ -1628,7 +2134,11 @@ async function buildEdgesGlobalRx(
   pct?:        Pct,
   startPct     = 20,
   endPct       = 75,
+  errs:        string[] = [],  // ① 修正: エラー記録用配列を追加
+  wsRoots?:    string[],       // BUG-4 修正: マルチルート対応 (未指定時は wsRoot のみ)
 ): Promise<Set<string>> {
+  // BUG-4: wsRoots が渡されていない場合は単一 wsRoot で動作 (後方互換)
+  const effectiveRoots = (wsRoots && wsRoots.length > 0) ? wsRoots : [wsRoot];
   const edgeSet = new Set<string>();
 
   // isFunc エントリを持つ関数名のみ対象にする
@@ -1642,6 +2152,11 @@ async function buildEdgesGlobalRx(
   const patterns    = buildPatternBatches(funcNames);
   const totalGroups = Math.ceil(patterns.length / GLOBAL_RX_PARALLEL);
 
+  // Warning修正: 同一エラーを集約するための一時セット。
+  // global -rx -e がすべてのバッチで同じ理由（-e 未サポート等）で失敗する場合に
+  // 同一メッセージが N 件 push されるのを防ぐ。
+  const errorMessages = new Set<string>();
+
   for (let gi = 0; gi < patterns.length; gi += GLOBAL_RX_PARALLEL) {
     checkCancellation(token);
     pct?.range(startPct, endPct, Math.floor(gi / GLOBAL_RX_PARALLEL), totalGroups);
@@ -1652,7 +2167,34 @@ async function buildEdgesGlobalRx(
         ({ stdout } = await execFileAsync('global', ['-rx', '-e', pattern], {
           cwd: wsRoot, maxBuffer: 50 * 1024 * 1024, timeout: 60_000,
         }));
-      } catch { return; }
+      } catch (e) {
+        // Warning修正: エラーを集約 (重複除去)。
+        //   GNU GLOBAL < 5.0 で -e フラグ非サポートの場合は全バッチが同じエラーになるため、
+        //   同一メッセージを1件に絞ってユーザーへの警告量を最小化する。
+        //   キャンセルによる中断は警告として報告しない。
+        const ex  = e as NodeJS.ErrnoException & { killed?: boolean };
+        const msg = ex instanceof Error ? ex.message : String(ex);
+        // SEC-3 修正: SIGTERM 文字列マッチ → .killed フラグで確実にタイムアウトを検出
+        if (ex.killed || msg.includes('cancel')) { return; }
+        // BUG-6 修正: maxBuffer 超過は「グラフが不完全」とユーザーに明示する
+        if (msg.includes('maxBuffer') || msg.includes('STDIO_MAXBUFFER') || msg.includes('ERR_CHILD_PROCESS_STDIO_MAXBUFFER')) {
+          errorMessages.add(
+            '[gtags] global -rx: Output too large (>50MB). ' +
+            'Some call edges may be missing. ' +
+            'Consider splitting the analysis with Folder Graph.'
+          );
+          return;
+        }
+        const firstLine = msg.split('\n')[0];
+        // -e フラグ未サポートの場合に分かりやすいメッセージに変換する
+        const isUnsupportedE = /invalid option|unknown option|illegal option/i.test(firstLine);
+        const normalized = isUnsupportedE
+          ? 'global -rx: -e flag not supported (GNU GLOBAL < 5.0). ' +
+            'Using regex fallback for callee detection. Upgrade to GLOBAL 5.0+ for better accuracy.'
+          : `global -rx: ${firstLine}`;
+        errorMessages.add(normalized);
+        return;
+      }
 
       for (const rawLine of stdout.split('\n')) {
         const parts = rawLine.trim().split(/\s+/);
@@ -1660,9 +2202,13 @@ async function buildEdgesGlobalRx(
         const calleeName = parts[0];
         const refLine    = parseInt(parts[1], 10);
         if (!calleeName || isNaN(refLine)) continue;
-        const refFile = sanitizeToWsRoot(parts[2], wsRoot); // Security H
+        const refFile = sanitizeToAnyWsRoot(parts[2], effectiveRoots); // Security H + BUG-4
         if (!refFile || !callerFiles.has(refFile)) continue;
-        const fileScopeEntry = scopeMap.get(refFile);
+      // 🔴 Bug 4 修正: scopeMap のキーと refFile のパスは取得経路が異なるため
+      //   macOS/Windows でパス大文字小文字・区切り文字が不一致になることがある。
+      //   findScopeMapEntry() はこの差異を吸収するために実装されており、
+      //   他箇所では正しく使われていたがこの3箇所だけ漏れていた。
+      const fileScopeEntry = findScopeMapEntry(scopeMap, refFile);
         if (!fileScopeEntry) continue;
         const callerScope = findScopeAtLine(fileScopeEntry.list, refLine);
         if (!callerScope) continue;
@@ -1682,6 +2228,9 @@ async function buildEdgesGlobalRx(
       }
     }));
   }
+  // Warning修正: 集約したエラーメッセージを errs に追加する。
+  // ループ内で都度 push すると同一エラーが N 件になるためループ外でまとめて push する。
+  for (const msg of errorMessages) errs.push(msg);
   return edgeSet;
 }
 
@@ -1719,10 +2268,12 @@ async function buildFileCallGraphGtags(
   progress?: vscode.Progress<{ message?: string; increment?: number }>,
   token?:    vscode.CancellationToken
 ): Promise<GraphData> {
-  const t0     = Date.now();
-  const errs:  string[] = [];
-  const wsRoot = getWorkspaceRootForFile(document.uri);
+  const t0      = Date.now();
+  const errs:   string[] = [];
+  const wsRoot  = getWorkspaceRootForFile(document.uri); // gtags DB 操作用 (単一ルート)
   if (!wsRoot) throw new Error('No workspace folder is open.');
+  // BUG-4 修正: callee フィルタには全ワークスペースフォルダを使用 (LSP バックエンドと統一)
+  const wsRoots = getWorkspaceRoots(document.uri);
   const pct = new Pct(progress);
 
   pct.to(0);
@@ -1731,8 +2282,8 @@ async function buildFileCallGraphGtags(
 
   // ★ Precision ③: ヘッダーも含めてタグを収集 (inline 関数・テンプレートを callee ノードとして登録)
   pct.to(5);
-  pct.report?.('📂 Loading tags...');
-  const { tags, lineCache, ambiguousNames } = await collectGtagsCached(wsRoot);
+  pct.report('📂 Loading tags...');
+  const { tags, lineCache, ambiguousNames, scopeMap } = await collectGtagsCached(wsRoot);
   if (!tags.size) throw new Error(
     'No tags found.\nPlease verify that gtags is installed and GTAGS exists.');
 
@@ -1750,7 +2301,7 @@ async function buildFileCallGraphGtags(
   lineCache.set(currentFileNorm, currentLines);
   lineCache.set(currentFile, currentLines); // 両方登録して確実にヒットさせる
 
-  const scopeMap   = buildGtagsScopeMap(tags);
+  // B: scopeMap は collectGtagsCached がキャッシュ済みのものを返す（再計算なし）
   // Fix 2: findScopeMapEntry でパス差異に対応
   const fileScopes = findScopeMapEntry(scopeMap, currentFile)?.list ?? [];
   const nodes      = new Map<string, GraphNode>();
@@ -1776,7 +2327,7 @@ async function buildFileCallGraphGtags(
       e => normalizeFsPath(e.file) === currentFileNorm && e.isFunc);
     if (e) callerFiles.add(e.file);
   }
-  const edgeSet     = await buildEdgesGlobalRx(callerFiles, tags, scopeMap, wsRoot, token, pct, 20, 75);
+  const edgeSet = await buildEdgesGlobalRx(callerFiles, tags, scopeMap, wsRoot, token, pct, 20, 75, errs, wsRoots);
 
   // callee ノードを登録 (currentFile 外・ヘッダー定義も含む)
   for (const edgeKey of edgeSet) {
@@ -1795,20 +2346,21 @@ async function buildFileCallGraphGtags(
   // buildEdgesGlobalRx で発見された callee ノードを起点に extractCallsFromLines で再帰展開。
   // 深さ制限なし（downVisited でサイクル防止）。
   // buildFunctionCallGraphGtags の下方向 BFS と同じロジックを使用。
+  //
+  // 🐛 gtags ファイルグラフ修正:
+  //   旧実装はコアノード（ファイル内関数）を downVisited に先行登録し、
+  //   「buildEdgesGlobalRx で処理済み」としてキューから除外していた。
+  //   しかし global -rx -e が失敗（GNU GLOBAL < 5.0 等）して edgeSet が空の場合、
+  //   コアノードは一切処理されず extractCallsFromLines フォールバックも走らないため、
+  //   エッジゼロ → 全ノード level=0 → 縦1列になっていた。
+  //   先行登録を削除し、コアノードも通常の BFS キューで処理するよう修正する。
+  //   edgeSet が非空の場合でも Set の冪等性（重複エッジは無視）により正確性は維持される。
   pct.to(75);
   {
     const knownTags   = new Set(tags.keys());
     const downVisited = new Set<string>();
 
-    // コアノード（ファイル内関数）を visited 済みとしてマーク（buildEdgesGlobalRx で処理済み）
-    for (const scope of fileScopes) {
-      const entry = tags.get(scope.name)?.find(
-        e => normalizeFsPath(e.file) === currentFileNorm && e.isFunc);
-      if (!entry) continue;
-      downVisited.add(makeGtagsNodeId(entry.file, scope.name, entry.line));
-    }
-
-    // 第1フェーズ（buildEdgesGlobalRx）で発見された callee ノードをキューに積む
+    // buildEdgesGlobalRx で発見されたノード＋コアノードをまとめてキューに積む
     type DownItem = { name: string; entry: GtagEntry; scope: ScopeEntry };
     const downQueue: DownItem[] = [];
     for (const nodeId of nodes.keys()) {
@@ -1829,7 +2381,8 @@ async function buildFileCallGraphGtags(
       const { name, entry, scope } = downQueue[dqi++];
       const callerId = makeGtagsNodeId(entry.file, name, entry.line);
 
-      const lines   = readFileLinesCached(entry.file, lineCache);
+      // ⑤ Performance 修正: readFileLinesCached (同期) → getFileLinesAsync (非同期)
+      const lines   = await getFileLinesAsync(entry.file, lineCache);
       const callees = extractCallsFromLines(lines, scope.start, scope.end, name, knownTags);
 
       for (const callee of callees) {
@@ -1886,14 +2439,18 @@ async function buildFileCallGraphGtags(
       checkCancellation(token);
 
       const levelFuncNames = upCurrentLevel.map(item => item.funcName);
-      const refMap = await runGlobalRxBatch(levelFuncNames, wsRoot);
+      const refMap = await runGlobalRxBatch(levelFuncNames, wsRoot, errs, wsRoots);
       const upNextLevel: UpItem[] = [];
 
       for (const { funcName, calleeId } of upCurrentLevel) {
         for (const { refFile, refLine } of refMap.get(funcName) ?? []) {
           checkCancellation(token);
 
-          const fileScopeEntry = scopeMap.get(refFile);
+        // 🔴 Bug 4 修正: scopeMap のキーと refFile のパスは取得経路が異なるため
+      //   macOS/Windows でパス大文字小文字・区切り文字が不一致になることがある。
+      //   findScopeMapEntry() はこの差異を吸収するために実装されており、
+      //   他箇所では正しく使われていたがこの3箇所だけ漏れていた。
+      const fileScopeEntry = findScopeMapEntry(scopeMap, refFile);
           if (!fileScopeEntry) continue;
           const callerScope = findScopeAtLine(fileScopeEntry.list, refLine);
           if (!callerScope || callerScope.name === funcName) continue; // 自己再帰を除外
@@ -1963,14 +2520,20 @@ function buildPatternBatches(names: string[]): string[] {
   if (names.length === 0) return [];
   const batches: string[] = [];
   let batch: string[] = [];
-  let len = 0; // '|' 区切りの合計長
+  // BUG-12 修正: `^(` と `)$` の計4文字分をラッパー長として初期値に加える。
+  // 旧実装は 0 から始めており、生成パターンが MAX_PATTERN_LENGTH を超える可能性があった。
+  const WRAPPER_LEN = 4; // '^(' + ')$'
+  let len = WRAPPER_LEN;
 
   for (const name of names) {
     const escaped = escapeRegexForGlobal(name);
-    const add     = (batch.length > 0 ? 1 : 0) + escaped.length; // 1 = '|' セパレータ
+    // SEC-07 修正: 単一エントリが MAX_PATTERN_LENGTH を超える場合はスキップ（無限ループ防止）。
+    // C++ のテンプレート特殊化など極端に長い関数名で buildPatternBatches が停止しなくなる問題を防ぐ。
+    if (WRAPPER_LEN + escaped.length > MAX_PATTERN_LENGTH) continue;
+    const add = (batch.length > 0 ? 1 : 0) + escaped.length; // 1 = '|' セパレータ
     if (len + add > MAX_PATTERN_LENGTH && batch.length > 0) {
       batches.push('^(' + batch.join('|') + ')$');
-      batch = []; len = 0;
+      batch = []; len = WRAPPER_LEN;
     }
     batch.push(escaped);
     len += add;
@@ -1987,11 +2550,13 @@ function buildPatternBatches(names: string[]): string[] {
 async function runGlobalXNames(
   names:  string[],
   wsRoot: string,
+  errs:   string[] = [], // BUG-22 修正: エラーを呼び出し元に伝搬
 ): Promise<Map<string, GtagEntry[]>> {
   const result = new Map<string, GtagEntry[]>();
   if (names.length === 0) return result;
 
   const patterns = buildPatternBatches(names); // B-2+S-3
+  const errorMessages = new Set<string>(); // 重複除去
 
   await Promise.all(patterns.map(async pattern => {
     let stdout = '';
@@ -1999,7 +2564,15 @@ async function runGlobalXNames(
       ({ stdout } = await execFileAsync('global', ['-x', '-e', pattern], {
         cwd: wsRoot, maxBuffer: 10 * 1024 * 1024, timeout: 30_000,
       }));
-    } catch { return; }
+    } catch (e) {
+      // BUG-22 修正: サイレント握り潰しをやめて errs に記録
+      // NEW-1 修正: SIGTERM 文字列マッチ → ex.killed フラグで確実にタイムアウトを検出
+      const ex  = e as NodeJS.ErrnoException & { killed?: boolean };
+      const msg = ex instanceof Error ? ex.message : String(ex);
+      if (ex.killed || msg.includes('cancel')) { return; }
+      errorMessages.add(`global -x: ${msg.split('\n')[0]}`);
+      return;
+    }
 
     for (const raw of stdout.split('\n')) {
       const trimmed = raw.trimEnd();
@@ -2017,6 +2590,9 @@ async function runGlobalXNames(
     }
   }));
 
+  // V3-2 修正: runGlobalRxBatch と同様に、収集したエラーを呼び出し元の errs に転送する。
+  // これがないと BUG-22 修正コメントの「errs に伝搬する」が実装されていない状態になる。
+  for (const msg of errorMessages) errs.push(msg);
   return result;
 }
 
@@ -2028,12 +2604,13 @@ async function resolveOrFetchTag(
   name:     string,
   wsRoot:   string,
   tagCache: Map<string, GtagEntry[]>,
+  errs:     string[] = [], // NEW-3: global -x エラーを呼び出し元に伝搬
 ): Promise<GtagEntry[] | undefined> {
   if (tagCache.has(name)) {
     const cached = tagCache.get(name)!;
     return cached.length > 0 ? cached : undefined;
   }
-  const resolved = await runGlobalXNames([name], wsRoot);
+  const resolved = await runGlobalXNames([name], wsRoot, errs);
   const entries  = resolved.get(name) ?? [];
   tagCache.set(name, entries); // 空配列もキャッシュして再フェッチを防止
   return entries.length > 0 ? entries : undefined;
@@ -2061,7 +2638,8 @@ async function buildScopeForFileCached(
   const tagEntries = await runGlobalF(file, wsRoot);
   if (!tagEntries.length) return undefined;
 
-  const lines = readFileLinesCached(file, lineCache);
+  // ⑤ Performance 修正: fs.readFileSync → getFileLinesAsync で非同期読み込み
+  const lines = await getFileLinesAsync(file, lineCache);
   // B-3: 正規化パスも lineCache に登録してキャッシュヒット率を向上させる
   if (norm !== file && !lineCache.has(norm)) lineCache.set(norm, lines);
   const funcEntries: { name: string; line: number }[] = [];
@@ -2093,10 +2671,12 @@ async function buildFunctionCallGraphGtags(
   progress?: vscode.Progress<{ message?: string; increment?: number }>,
   token?:    vscode.CancellationToken
 ): Promise<GraphData> {
-  const t0     = Date.now();
-  const errs:  string[] = [];
-  const wsRoot = getWorkspaceRootForFile(document.uri);
+  const t0      = Date.now();
+  const errs:   string[] = [];
+  const wsRoot  = getWorkspaceRootForFile(document.uri); // gtags DB 操作用 (単一ルート)
   if (!wsRoot) throw new Error('No workspace folder is open.');
+  // NEW-2: 上方向 BFS でもマルチルートのファイルを caller として検出できるよう wsRoots を取得
+  const wsRoots = getWorkspaceRoots(document.uri);
   const pct = new Pct(progress);
 
   pct.to(0);
@@ -2133,7 +2713,7 @@ async function buildFunctionCallGraphGtags(
   // ── 起点関数を特定 ──────────────────────────────────────────────────────────
   pct.to(5);
   checkCancellation(token);
-  pct.report?.('🔍 Finding start function...');
+  pct.report('🔍 Finding start function...');
 
   // global -f で現在ファイルのスコープのみ構築 (全ダンプ不要)
   const startFileScopeEntry = await buildScopeForFileCached(
@@ -2147,7 +2727,7 @@ async function buildFunctionCallGraphGtags(
     'No function found at cursor position.\nPlace the cursor on a function name and try again.');
 
   // global -x で起点関数のエントリだけを取得 (全ダンプ不要)
-  const startCandidates = await resolveOrFetchTag(startScope.name, wsRoot, tagCache);
+  const startCandidates = await resolveOrFetchTag(startScope.name, wsRoot, tagCache, errs);
   const startEntry =
     startCandidates?.find(e => normalizeFsPath(e.file) === currentFileNorm && e.isFunc)
     ?? startCandidates?.find(e => e.isFunc)
@@ -2160,7 +2740,7 @@ async function buildFunctionCallGraphGtags(
   // ── 下方向 BFS (callee) ──────────────────────────────────────────────────────
   // 【BugFix G 維持】visited (処理完了) と queued (投入済み) を分離して退行バグを防止。
   pct.to(15);
-  pct.report?.('⬇ Building callee graph...');
+  pct.report('⬇ Building callee graph...');
   checkCancellation(token);
 
   const startNodeId = makeGtagsNodeId(startEntry.file, startScope.name, startEntry.line);
@@ -2177,7 +2757,8 @@ async function buildFunctionCallGraphGtags(
     if (visited.has(nodeId)) continue;
     visited.add(nodeId);
 
-    const lines = readFileLinesCached(entry.file, lineCache);
+    // ⑤ Performance 修正: readFileLinesCached (同期) → getFileLinesAsync (非同期)
+    const lines = await getFileLinesAsync(entry.file, lineCache);
     nodes.set(nodeId, gtagsEntryToNode(name, entry, scope, currentFile));
     if (hop >= maxHops) continue;
 
@@ -2188,7 +2769,7 @@ async function buildFunctionCallGraphGtags(
     // ② キャッシュ未ヒット分だけ global -x でバッチ取得 (buildPatternBatches で動的分割・並列実行)
     const uncached = [...rawCandidates].filter(c => !tagCache.has(c));
     if (uncached.length > 0) {
-      const freshMap = await runGlobalXNames(uncached, wsRoot);
+      const freshMap = await runGlobalXNames(uncached, wsRoot, errs);
       for (const [n, entries] of freshMap) tagCache.set(n, entries);
       // GTAGS に存在しなかった候補は空エントリをキャッシュして再クエリを防止
       for (const n of uncached) { if (!tagCache.has(n)) tagCache.set(n, []); }
@@ -2234,7 +2815,7 @@ async function buildFunctionCallGraphGtags(
   // 旧実装: 関数 1 つにつき runGlobalRxSingle を 1 回 → N 回のプロセス起動
   // 新実装: BFS の各レベルを runGlobalRxBatch で一括クエリ → レベル数回のプロセス起動
   pct.to(65);
-  pct.report?.('⬆ Building caller graph...');
+  pct.report('⬆ Building caller graph...');
   checkCancellation(token);
 
   type UpItem = { funcName: string; calleeId: string };
@@ -2246,20 +2827,32 @@ async function buildFunctionCallGraphGtags(
 
     // 現レベルの全関数名を一括 global -rx でクエリ
     const levelFuncNames = upCurrentLevel.map(item => item.funcName);
-    const refMap = await runGlobalRxBatch(levelFuncNames, wsRoot);
+    const refMap = await runGlobalRxBatch(levelFuncNames, wsRoot, errs, wsRoots);
     const upNextLevel: UpItem[] = [];
+
+    // BUG-24 修正: refFile のスコープ取得を並列プリフェッチしてから処理する。
+    // 旧実装は 1 件ずつ直列 await していたため、参照先ファイル数 × I/O 待機の合計が大きかった。
+    // 下方向 BFS の uniqueCalleeFiles プリフェッチと同じパターンを適用する。
+    const uniqueRefFiles = [...new Set(
+      [...upCurrentLevel].flatMap(({ funcName }) =>
+        (refMap.get(funcName) ?? []).map(r => r.refFile)
+      )
+    )];
+    await Promise.all(uniqueRefFiles.map(f =>
+      buildScopeForFileCached(f, wsRoot, fileScopeCache, lineCache)));
 
     for (const { funcName, calleeId } of upCurrentLevel) {
       for (const { refFile, refLine } of refMap.get(funcName) ?? []) {
         checkCancellation(token);
 
-        const callerFileScopeEntry = await buildScopeForFileCached(
-          refFile, wsRoot, fileScopeCache, lineCache);
+        // スコープはプリフェッチ済みのためキャッシュから即取得
+        const callerFileScopeEntry =
+          fileScopeCache.get(normalizeFsPath(refFile)) ?? fileScopeCache.get(refFile);
         if (!callerFileScopeEntry) continue;
         const callerScope = findScopeAtLine(callerFileScopeEntry.list, refLine);
         if (!callerScope || callerScope.name === funcName) continue;
 
-        const callerEntries = await resolveOrFetchTag(callerScope.name, wsRoot, tagCache);
+        const callerEntries = await resolveOrFetchTag(callerScope.name, wsRoot, tagCache, errs);
         const callerEntry   =
           callerEntries?.find(e => e.file === refFile && e.isFunc)
           ?? resolveCallee(callerEntries, refFile);
@@ -2339,22 +2932,20 @@ async function buildWorkspaceCallGraphGtags(
 
     { const w = await ensureGtagsDb(wsRoot); if (w) errs.push(w); }
 
-    // ヘッダーも callee ノードとして登録するため CC_ALL_GLOB で収集
-    const allUris = await findFilesCached();
-    // このルートのファイルのみ対象に絞る（他ルートのファイルを誤って混入させない）
-    const rootNorm    = normalizeFsPath(wsRoot);
-    const rootAllUris = allUris.filter(u =>
-      normalizeFsPath(u.fsPath).startsWith(rootNorm + path.sep) ||
-      normalizeFsPath(u.fsPath).startsWith(rootNorm + '/')
-    );
+    // 🔧 ④ 修正: rootAllUris は collectGtagsCached に渡されておらず完全な死コードだったため削除。
+    //   collectGtagsCached は内部で findFilesCached() を使用し wsRoot の GTAGS のみを参照するため
+    //   ルートごとのフィルタリングは sanitizeToWsRoot で担保される。
 
-    let rootTags: Map<string, GtagEntry[]>;
+    let rootTags:           Map<string, GtagEntry[]>;
     let rootAmbiguousNames: string[];
+    let rootScopeMap:       Map<string, ScopeMapEntry>;
     try {
       // パフォーマンス改善①: collectGtagsCached でルートのタグをキャッシュ
-      const result = await collectGtagsCached(wsRoot);
+      // B: scopeMap もキャッシュ済みのものをそのまま受け取る（再計算・二重呼び出しなし）
+      const result   = await collectGtagsCached(wsRoot);
       rootTags           = result.tags;
       rootAmbiguousNames = result.ambiguousNames;
+      rootScopeMap       = result.scopeMap;
     } catch (e) {
       errs.push(`[gtags] Failed to collect tags for ${wsRoot}: ${e}`);
       continue;
@@ -2376,8 +2967,6 @@ async function buildWorkspaceCallGraphGtags(
       mergedTags.get(name)!.push(...entries);
     }
 
-    // スコープマップを構築してマージ
-    const rootScopeMap = buildGtagsScopeMap(rootTags);
     for (const [fp, entry] of rootScopeMap) {
       mergedScopeMap.set(fp, entry);
     }
@@ -2402,6 +2991,10 @@ async function buildWorkspaceCallGraphGtags(
 
   // ルートごとに global -rx でエッジを構築 (callerFiles フィルタで混在を防ぐ)
   const edgeSet = new Set<string>();
+  // V4-4 修正: mergedTags/mergedScopeMap には全ルートのエントリが含まれるため、
+  // buildEdgesGlobalRx の callee フィルタにも全ルートを渡す。
+  // 単一 wsRoot のみ渡すと他ルートのファイルが callee として弾かれクロスルートエッジが欠落する。
+  const allWsRoots = rootList.map(([root]) => root);
   pct.to(20);
   checkCancellation(token);
   for (let ri = 0; ri < rootList.length; ri++) {
@@ -2415,7 +3008,9 @@ async function buildWorkspaceCallGraphGtags(
     const rootEdges = await buildEdgesGlobalRx(
       rootCallerFiles, mergedTags, mergedScopeMap, wsRoot, token, pct,
       20 + Math.floor(ri * 70 / rootList.length),
-      20 + Math.floor((ri + 1) * 70 / rootList.length)
+      20 + Math.floor((ri + 1) * 70 / rootList.length),
+      errs,       // ① 修正: エラーを呼び出し元の errs に記録
+      allWsRoots  // V4-4: 全ルートを渡してクロスルートエッジを検出
     );
     for (const e of rootEdges) edgeSet.add(e);
   }
@@ -2436,20 +3031,30 @@ async function buildWorkspaceCallGraphGtags(
   // Mid-2 修正: buildEdgesGlobalRx で発見されたヘッダー inline callee ノードから
   //   さらに呼ばれる関数のエッジが欠落していた問題を修正。
   //   buildFileCallGraphGtags と同じ下方向 BFS を追加してエッジを補完する。
+  //
+  // 🐛 ① 修正 (Workspace縦1列バグ):
+  //   旧実装は downVisited を全ノードで初期化し、callerFiles 由来ノードを BFS キューから
+  //   除外していた。「buildEdgesGlobalRx で処理済み」の前提だが、global -rx -e が失敗
+  //   (GNU GLOBAL < 5.0 等) して edgeSet が空の場合、ソースノードは一切処理されず
+  //   エッジゼロ → 全ノード level=0 → 縦1列になっていた。
+  //   buildFileCallGraphGtags (同じ修正済み) に揃え:
+  //     - downVisited を空で初期化
+  //     - callerFiles フィルタを削除して全ノードを BFS キューに積む
+  //   edgeSet が非空の場合でも Set の冪等性で重複エッジは無視される。
   pct.to(90);
   {
     // ② 修正: new Map() を毎ループ渡すとキャッシュが一切効かないため
     //   BFS スコープ全体で共有するキャッシュを1つ定義する。
     const bfsLineCache = new Map<string, string[]>();
-    const knownTags   = new Set(mergedTags.keys());
-    const downVisited = new Set<string>(nodes.keys()); // 登録済みノードは全て処理済みとしてマーク
-    // ソースファイルの関数は buildEdgesGlobalRx が処理済みなので除外
-    // ヘッダー由来など callerFiles に含まれないノードのみキューに積む
+    const knownTags    = new Set(mergedTags.keys());
+    const downVisited  = new Set<string>(); // 🐛 ① 修正: 全ノード pre-mark を削除
     type DownItem = { name: string; entry: GtagEntry; scope: ScopeEntry };
     const downQueue: DownItem[] = [];
     for (const nodeId of nodes.keys()) {
+      if (downVisited.has(nodeId)) continue;
+      downVisited.add(nodeId);
       const { file: nFile, name: nName } = parseGtagsNodeId(nodeId);
-      if (callerFiles.has(nFile)) continue; // ソースファイル由来はスキップ
+      // 🐛 ① 修正: callerFiles フィルタを削除。全ノードを BFS で処理する。
       const entry = mergedTags.get(nName)?.find(e => e.file === nFile && e.isFunc);
       if (!entry) continue;
       const scope = resolveCalleeScope(mergedScopeMap, nFile, nName, entry.line);
@@ -2462,7 +3067,9 @@ async function buildWorkspaceCallGraphGtags(
       checkCancellation(token);
       const { name, entry, scope } = downQueue[dqi++];
       const callerId = makeGtagsNodeId(entry.file, name, entry.line);
-      const lines    = readFileLinesCached(entry.file, bfsLineCache);
+      // ⑤ Performance 修正 (漏れ補完): readFileLinesCached (同期) → getFileLinesAsync (非同期)
+      // buildFileCallGraphGtags BFS と同様に非同期読み込みに統一する。
+      const lines    = await getFileLinesAsync(entry.file, bfsLineCache);
       const callees  = extractCallsFromLines(lines, scope.start, scope.end, name, knownTags);
 
       for (const callee of callees) {
@@ -2497,10 +3104,6 @@ async function buildWorkspaceCallGraphGtags(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * `global -rx <funcName>` を 1 関数分実行して参照箇所 (refFile, refLine) の配列を返す。
- * パス貫通グラフの上方向 (caller) 探索で使用する。
- */
-/**
  * I-1: 複数の関数名に対する参照を global -rx -e '^(func1|func2|...)$' で一括取得する。
  * buildPatternBatches で ARG_MAX 対策済み (S-3)、アンカーで部分一致防止 (B-2)。
  *
@@ -2509,12 +3112,18 @@ async function buildWorkspaceCallGraphGtags(
 async function runGlobalRxBatch(
   funcNames: string[],
   wsRoot:    string,
+  errs:      string[] = [], // BUG-10 修正: エラーを呼び出し元に伝搬
+  wsRoots?:  string[],      // NEW-2: マルチルート対応 (未指定時は wsRoot のみ)
 ): Promise<Map<string, Array<{ refFile: string; refLine: number }>>> {
   const result = new Map<string, Array<{ refFile: string; refLine: number }>>();
   for (const n of funcNames) result.set(n, []);
   if (funcNames.length === 0) return result;
 
+  // NEW-2: wsRoots が渡されていない場合は単一 wsRoot で動作 (後方互換)
+  const effectiveRoots = (wsRoots && wsRoots.length > 0) ? wsRoots : [wsRoot];
+
   const patterns = buildPatternBatches(funcNames); // B-2+S-3
+  const errorMessages = new Set<string>(); // 重複除去
 
   await Promise.all(patterns.map(async pattern => {
     let stdout = '';
@@ -2522,7 +3131,15 @@ async function runGlobalRxBatch(
       ({ stdout } = await execFileAsync('global', ['-rx', '-e', pattern], {
         cwd: wsRoot, maxBuffer: 50 * 1024 * 1024, timeout: 60_000,
       }));
-    } catch { return; }
+    } catch (e) {
+      // BUG-10 修正: サイレント握り潰しをやめて errs に記録
+      // NEW-1 修正: SIGTERM 文字列マッチ → ex.killed フラグで確実にタイムアウトを検出
+      const ex  = e as NodeJS.ErrnoException & { killed?: boolean };
+      const msg = ex instanceof Error ? ex.message : String(ex);
+      if (ex.killed || msg.includes('cancel')) { return; }
+      errorMessages.add(`global -rx: ${msg.split('\n')[0]}`);
+      return;
+    }
 
     for (const raw of stdout.split('\n')) {
       const parts = raw.trim().split(/\s+/);
@@ -2530,12 +3147,12 @@ async function runGlobalRxBatch(
       const name    = parts[0];
       const refLine = parseInt(parts[1], 10);
       if (!name || isNaN(refLine)) continue;
-      const refFile = sanitizeToWsRoot(parts[2], wsRoot); // Security H
+      const refFile = sanitizeToAnyWsRoot(parts[2], effectiveRoots); // Security H + NEW-2
       if (!refFile) continue;
       result.get(name)?.push({ refFile, refLine });
     }
   }));
-
+  for (const msg of errorMessages) errs.push(msg); // BUG-10: 集約エラーを伝搬
   return result;
 }
 
@@ -2562,8 +3179,10 @@ async function buildPathThroughCallGraphGtags(
 ): Promise<GraphData> {
   const t0     = Date.now();
   const errs:  string[] = [];
-  const wsRoot = getWorkspaceRootForFile(document.uri);
+  const wsRoot  = getWorkspaceRootForFile(document.uri); // gtags DB 操作用 (単一ルート)
   if (!wsRoot) throw new Error('No workspace folder is open.');
+  // V4-3 修正: 他の gtags 関数と同様に wsRoots を取得して上方向 BFS でもマルチルート対応する
+  const wsRoots = getWorkspaceRoots(document.uri);
   const pct = new Pct(progress);
 
   pct.to(0);
@@ -2572,8 +3191,8 @@ async function buildPathThroughCallGraphGtags(
 
   pct.to(5);
   checkCancellation(token);
-  pct.report?.('📂 Loading tags...');
-  const { tags, lineCache, ambiguousNames } =
+  pct.report('📂 Loading tags...');
+  const { tags, lineCache, ambiguousNames, scopeMap } =
     await collectGtagsCached(wsRoot);
   if (!tags.size) throw new Error('No tags found.');
 
@@ -2589,12 +3208,14 @@ async function buildPathThroughCallGraphGtags(
   lineCache.set(normalizeFsPath(currentFile), currentLines);
 
   const knownTags = new Set(tags.keys());
-  const scopeMap  = buildGtagsScopeMap(tags);
+  // B: scopeMap は collectGtagsCached がキャッシュ済みのものを返す（再計算なし）
 
   // 起点関数を特定 (Fix 2: findScopeMapEntry でパス差異に対応)
   const cursorLine = position.line + 1;
   const fileScopes = findScopeMapEntry(scopeMap, currentFile)?.list ?? [];
-  const startScope = fileScopes.find(s => s.start <= cursorLine && cursorLine <= s.end);
+  // BUG-23 修正: Array.find (O(n)) → findScopeAtLine (二分探索 O(log n)) に変更。
+  // buildFileCallGraphGtags および全BFS処理と統一する。
+  const startScope = findScopeAtLine(fileScopes, cursorLine);
   if (!startScope) throw new Error(
     'No function found at cursor position.\nPlace the cursor on a function name and try again.');
 
@@ -2626,13 +3247,15 @@ async function buildPathThroughCallGraphGtags(
       if (visited.has(nodeId)) continue;
       visited.add(nodeId);
 
-      const lines = readFileLinesCached(entry.file, lineCache);
+      const lines = await getFileLinesAsync(entry.file, lineCache); // BUG-09 修正: 同期→非同期
       nodes.set(nodeId, gtagsEntryToNode(name, entry, scope, currentFile));
       if (hop >= maxHops) continue;
 
       for (const callee of extractCallsFromLines(lines, scope.start, scope.end, name, knownTags)) {
         const calleeEntry = resolveCallee(tags.get(callee), entry.file);
-        if (!calleeEntry) continue;
+        // 🐛 ③ 修正: isFunc チェックが抜けていた。struct/enum 宣言行が callee ノードとして
+        //   混入する問題を修正。buildFunctionCallGraphGtags と同じ条件に統一する。
+        if (!calleeEntry?.isFunc) continue;
         // Bug④: resolveCalleeScope (findScopeAtLine 優先)
         const calleeScope = resolveCalleeScope(scopeMap, calleeEntry.file, callee, calleeEntry.line);
         if (!calleeScope) continue;
@@ -2664,7 +3287,7 @@ async function buildPathThroughCallGraphGtags(
       checkCancellation(token);
 
       const levelFuncNames = upCurrentLevel.map(item => item.funcName);
-      const refMap = await runGlobalRxBatch(levelFuncNames, wsRoot);
+      const refMap = await runGlobalRxBatch(levelFuncNames, wsRoot, errs, wsRoots);
       const upNextLevel: UpItem[] = [];
 
       for (const { funcName, calleeId } of upCurrentLevel) {
@@ -2672,7 +3295,11 @@ async function buildPathThroughCallGraphGtags(
           checkCancellation(token);
 
           // 参照行が含まれる caller スコープを二分探索で特定
-          const fileScopeEntry = scopeMap.get(refFile);
+        // 🔴 Bug 4 修正: scopeMap のキーと refFile のパスは取得経路が異なるため
+      //   macOS/Windows でパス大文字小文字・区切り文字が不一致になることがある。
+      //   findScopeMapEntry() はこの差異を吸収するために実装されており、
+      //   他箇所では正しく使われていたがこの3箇所だけ漏れていた。
+      const fileScopeEntry = findScopeMapEntry(scopeMap, refFile);
           if (!fileScopeEntry) continue;
           const callerScope = findScopeAtLine(fileScopeEntry.list, refLine);
           if (!callerScope || callerScope.name === funcName) continue; // 自己再帰を除外
@@ -2720,16 +3347,35 @@ function makeCacheKey(type: string, ...parts: string[]): string {
   return `${type}::${parts.join('::')}`;
 }
 
+/**
+ * Bug② 修正: FNV-1a (32-bit) ハッシュ。
+ * buildWorkspaceCallGraph のキャッシュキーに全ファイルパスのダイジェストを含めることで、
+ * 「先頭5ファイル+ファイル数が同じ別プロジェクト」での誤ヒットを防止する。
+ * 純粋なJS実装なのでNode.js crypto 依存なし。
+ */
+function fnv1a32(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    // 32bit乗算を2^16分割で近似 (JS の整数精度対策)
+    h = (Math.imul(h, 0x01000193) >>> 0);
+  }
+  return h.toString(16).padStart(8, '0');
+}
+
 export async function buildFileCallGraph(
   document: vscode.TextDocument,
   progress?: vscode.Progress<{ message?: string; increment?: number }>,
   backend:   Backend = 'auto',
   token?:    vscode.CancellationToken
 ): Promise<GraphData> {
-  const key     = makeCacheKey('file', document.uri.fsPath);
+  // Bug2 修正: バックエンドが異なると結果も異なるため resolved backend をキーに含める。
+  //   LSP で実行後 gtags に切り替えても古い結果が返らないよう修正。
+  const resolved = await resolveBackend(backend);
+  const key     = makeCacheKey('file', document.uri.fsPath, resolved);
   const cached  = graphDataCache.get(key);
   if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) return cached.data; // ⑦ キャッシュヒット (TTL 内)
-  const result  = await ((await resolveBackend(backend)) === 'gtags'
+  const result  = await (resolved === 'gtags'
     ? buildFileCallGraphGtags(document, progress, token)
     : buildFileCallGraphLsp(document, progress, token));
   setGraphCache(key, { data: result, timestamp: Date.now() });
@@ -2744,16 +3390,15 @@ export async function buildFunctionCallGraph(
 ): Promise<GraphData> {
   // Low-1 修正: 同一行に複数関数シンボルが並ぶ場合 (マクロ展開など) に
   //   position.character を含めることでキャッシュの誤ヒットを防ぐ。
+  // Bug1 修正: バックエンドが異なると結果も異なるため resolved backend をキーに含める。
+  // 🟠 Bug 5 修正: maxHops が欠落していたため、callmap.maxHops を変更しても TTL(5分) が
+  //   切れるまで古いホップ数の結果が返り続けていた。キーに maxHops を追加して即時反映させる。
+  const resolved = await resolveBackend(backend);
   const key    = makeCacheKey('func', document.uri.fsPath,
-    `${position.line}:${position.character}`);
+    `${position.line}:${position.character}:${maxHops}:${resolved}`);
   const cached = graphDataCache.get(key);
   if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) return cached.data;
-  // Bug⑤ + Feat① 修正:
-  //   旧実装では gtags が buildPathThroughCallGraphGtags (上下双方向) を呼んでいたため、
-  //   LSP バックエンド (下方向 BFS のみ) と動作が異なり、同じコマンドで結果の性質が変わっていた。
-  //   buildFunctionCallGraphGtags (下方向 BFS のみ) に統一し、LSP と一致させる。
-  //   上下双方向が欲しい場合は "Show Path-Through Graph (gtags)" コマンドを使用すること。
-  const result = await ((await resolveBackend(backend)) === 'gtags'
+  const result = await (resolved === 'gtags'
     ? buildFunctionCallGraphGtags(document, position, maxHops, progress, token)
     : buildFunctionCallGraphLsp(document, position, maxHops, progress, token));
   setGraphCache(key, { data: result, timestamp: Date.now() });
@@ -2766,16 +3411,19 @@ export async function buildWorkspaceCallGraph(
   backend:   Backend = 'auto',
   token?:    vscode.CancellationToken
 ): Promise<GraphData> {
-  // G: 32bit 多項式ハッシュ → ファイル数 + 先頭5パスの「親ディレクトリ名/ファイル名」文字列キー。
-  // basename のみだと同名ファイルセットの別プロジェクトで衝突するため親ディレクトリも含める。
-  const sorted   = uris.map(u => u.fsPath).sort();
-  const keyParts = sorted.slice(0, 5)
-    .map(p => `${path.basename(path.dirname(p))}/${path.basename(p)}`)
-    .join('\x01');
-  const key      = makeCacheKey('workspace', String(sorted.length), keyParts);
+  // Bug② 修正: 先頭5ファイル+総数のみのキーでは異なるプロジェクトが衝突する恐れがある。
+  // 全ソートパスを結合した文字列の FNV-1a ハッシュをキーに含めることで
+  // どのファイルセットの組み合わせも一意に識別できるようにする。
+  // FNV-1a (32-bit) は衝突確率 1/2^32。ファイル数と組み合わせることで実用上は無視できる水準。
+  // Bug2 修正: バックエンドが異なると結果も異なるため resolved backend をキーに含める。
+  const resolved  = await resolveBackend(backend);
+  const sorted    = uris.map(u => u.fsPath).sort();
+  const pathsHash = fnv1a32(sorted.join('\x00'));
+  // ファイル数をハッシュと組み合わせることで同ハッシュ・異ファイル数の衝突を排除
+  const key       = makeCacheKey('workspace', String(sorted.length), pathsHash, resolved);
   const cached   = graphDataCache.get(key);
   if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) return cached.data;
-  const result = await ((await resolveBackend(backend)) === 'gtags'
+  const result = await (resolved === 'gtags'
     ? buildWorkspaceCallGraphGtags(uris, progress, token)
     : buildWorkspaceCallGraphLsp(uris, progress, token));
   setGraphCache(key, { data: result, timestamp: Date.now() });
@@ -2783,26 +3431,62 @@ export async function buildWorkspaceCallGraph(
 }
 
 /**
- * パス貫通コールグラフ: 選択した関数を中心に ancestors (上方向) + descendants (下方向) を展開。
- * 現在は gtags バックエンドのみ対応 (上方向探索に global -rx を使用するため)。
+ * B: ダイアログ待ち時間を活用するウォームアップ関数。
+ *
+ * pickBackend() 確定後、pickOutputMode() を待つ間（~0.5〜1秒）に
+ * 最初の重い初期化処理を先行実行してキャッシュを温める。
+ * build 関数呼び出し時にはキャッシュヒットするため実質コスト 0 になる。
+ *
+ * - gtags: ensureGtagsDb + collectGtagsCached (global -x と DB 更新)
+ * - lsp  : executeDocumentSymbolProvider (VSCode 内部のシンボルキャッシュを温める)
+ *
+ * エラーは全て握り潰す（warmup 失敗は build 時のエラーで改めて報告される）。
+ * キャンセルトークンは渡さない（build とは独立した短命タスクのため）。
  */
+export async function warmupCache(
+  document: vscode.TextDocument,
+  backend:  Backend,
+): Promise<void> {
+  try {
+    const resolved = await resolveBackend(backend);
+    if (resolved === 'gtags') {
+      const wsRoot = getWorkspaceRootForFile(document.uri);
+      if (!wsRoot) return;
+      // BUG-17 修正: ensureGtagsDb が返す警告メッセージをコンソールに記録する。
+      // 旧実装は全エラーを握り潰していたため、global -u 失敗時も原因が分からなかった。
+      const dbWarning = await ensureGtagsDb(wsRoot);
+      if (dbWarning) {
+        console.warn('[CallMap] warmupCache:', dbWarning);
+      }
+      await collectGtagsCached(wsRoot);
+    } else {
+      // LSP: VSCode 内部でシンボルキャッシュを温める（結果は捨てる）
+      await vscode.commands.executeCommand(
+        'vscode.executeDocumentSymbolProvider', document.uri);
+    }
+  } catch (e) {
+    console.warn('[CallMap] warmupCache failed:', e instanceof Error ? e.message : String(e));
+  }
+}
 export async function buildPathThroughCallGraph(
   document: vscode.TextDocument, position: vscode.Position, maxHops = 4,
   progress?: vscode.Progress<{ message?: string; increment?: number }>,
   backend:   Backend = 'auto',
   token?:    vscode.CancellationToken
 ): Promise<GraphData> {
+  // ② 修正: position.character を含めないと同一行の別関数が同じキャッシュにヒットする。
+  //   buildFunctionCallGraph と同じ形式 `${line}:${character}:${resolved}` に統一する。
+  // Bug1 修正: バックエンドが異なると結果も異なるため resolved backend をキーに含める。
+  // 🟠 Bug 5 修正: maxHops が欠落していたため、callmap.maxHops を変更しても TTL(5分) が
+  //   切れるまで古いホップ数の結果が返り続けていた。キーに maxHops を追加して即時反映させる。
   const resolved = await resolveBackend(backend);
-  if (resolved !== 'gtags') {
-    throw new Error(
-      'Path-through graph is only supported with the gtags backend.\n' +
-      'Please select "gtags (Fast)" as the backend.'
-    );
-  }
-  const key    = makeCacheKey('path', document.uri.fsPath, String(position.line));
+  const key    = makeCacheKey('path', document.uri.fsPath,
+    `${position.line}:${position.character}:${maxHops}:${resolved}`);
   const cached = graphDataCache.get(key);
   if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) return cached.data;
-  const result = await buildPathThroughCallGraphGtags(document, position, maxHops, progress, token);
+  const result = resolved === 'gtags'
+    ? await buildPathThroughCallGraphGtags(document, position, maxHops, progress, token)
+    : await buildPathThroughCallGraphLsp(document, position, maxHops, progress, token);
   setGraphCache(key, { data: result, timestamp: Date.now() });
   return result;
 }

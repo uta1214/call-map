@@ -39,6 +39,7 @@
   var canvasFontSize       = DEFAULT_FONT_SIZE;
   var currentNode          = null;
   var connectedEdgesOfNode = new Set();
+  var _hadSelection        = false; // PERF-07: ノードが一度でも選択されたかを追跡
   var currentSourceNodeId  = null;
   var pendingSourceNodeId  = null; // ⑥ requestSource 送信済みで応答待ちの nodeId
 
@@ -78,9 +79,20 @@
     document.getElementById('loading-overlay').style.display = 'none';
   }
 
+  // SEC-04 修正: escapeHtml を5文字エスケープに統一。
+  // webviewPanel.ts の escapeHtmlForTitle と一致させる。
+  // " と ' を追加することで将来この関数を属性値に使っても XSS にならない。
   function escapeHtml(s) {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return String(s)
+      .replace(/&/g,  '&amp;')
+      .replace(/</g,  '&lt;')
+      .replace(/>/g,  '&gt;')
+      .replace(/"/g,  '&quot;')
+      .replace(/'/g,  '&#39;');
   }
+
+  // BUG-05 用: HTML 属性値 (title 等) のエスケープ（escapeHtml と同一）
+  var escapeAttr = escapeHtml;
 
   function showErrorInView(msg) {
     document.getElementById('network').innerHTML =
@@ -151,14 +163,22 @@
     }
 
     var qi = 0;
+    // V4-6 修正: 相互再帰（A→B→A）などのサイクルグラフで bfsLevel の更新が
+    // 収束するまで同じノードが bfsQueue に大量追加され O(N²) になる問題を修正する。
+    // inQueue セットで「既にキューに積まれているノード」を管理し、重複追加を防ぐ。
+    var inQueue = new Set(bfsQueue);
     while (qi < bfsQueue.length) {
       var cur = bfsQueue[qi++];
+      inQueue.delete(cur);
       var nextLevel = bfsLevel[cur] + 1;
       (adjOut[cur] || []).forEach(function (to) {
         // 未訪問 OR より浅いパスが見つかった場合にのみ更新
         if (bfsLevel[to] === undefined || bfsLevel[to] > nextLevel) {
           bfsLevel[to] = nextLevel;
-          bfsQueue.push(to); // 更新があったので再伝播
+          if (!inQueue.has(to)) {
+            inQueue.add(to);
+            bfsQueue.push(to); // 更新があったので再伝播
+          }
         }
       });
     }
@@ -220,6 +240,10 @@
     // ★ 修正②: ノード数に応じてレイアウトを切り替える。
     //   hierarchical は大量ノードで破綻するため閾値を超えたら無効化する。
     if (network) {
+      // BUG-8 修正: 前回の stabilize が完了していない状態で再レンダリングが呼ばれた場合、
+      // 古い stabilizationIterationsDone ハンドラが先に発火してオーバーレイが消え、
+      // 新しいハンドラが残るという競合が発生する。stopSimulation() で先に停止させる。
+      network.stopSimulation();
       var useHierarchical = visNodes.length <= HIERARCHICAL_THRESHOLD;
       network.setOptions({ layout: { hierarchical: { enabled: useHierarchical } } });
       edges.clear(); edges.add(visEdges);
@@ -231,6 +255,11 @@
           hideLoading();
         });
         network.stabilize(200);
+      } else {
+        // 🟡 Bug 6 修正: hierarchical モードで再描画したとき network.fit() が呼ばれておらず、
+        //   前回のズーム・スクロール位置が残ったまま新グラフが画面外に出ることがあった。
+        //   physics モードが stabilizationIterationsDone 内で fit() を呼ぶのと対称にする。
+        network.fit();
       }
     } else {
       nodes = new vis.DataSet(visNodes);
@@ -249,14 +278,36 @@
     renderLegend(msg.fileLegend);
 
     var errNote = (msg.errors && msg.errors.length > 0)
-      ? ' (warnings: ' + msg.errors.length + ')' : '';
+      ? ' ⚠️ warnings: ' + msg.errors.length : '';
     var layoutNote = visNodes.length > HIERARCHICAL_THRESHOLD
       ? ' [physics]' : ' [hierarchical]';
-    document.getElementById('build-info').textContent =
+    var buildInfoEl = document.getElementById('build-info');
+    buildInfoEl.textContent =
       'Nodes: ' + msg.nodes.length + ' / Edges: ' + msg.edges.length +
       ' / ' + msg.buildTimeMs + 'ms' + layoutNote + errNote;
 
+    // ④ 警告がある場合: hover で詳細を表示、クリックでアラート
+    if (msg.errors && msg.errors.length > 0) {
+      buildInfoEl.style.cursor  = 'pointer';
+      buildInfoEl.style.color   = '#e17055';
+      buildInfoEl.title = msg.errors.map(escapeAttr).join('\n');
+      buildInfoEl.onclick = function () {
+        alert('Build warnings (' + msg.errors.length + '):\n\n' + msg.errors.join('\n'));
+      };
+    } else {
+      buildInfoEl.style.cursor  = '';
+      buildInfoEl.style.color   = '';
+      buildInfoEl.title = '';
+      buildInfoEl.onclick = null;
+    }
+
     resetAll();
+
+    // 設定値 callmap.initialControlPanel に従って初期パネル状態を適用する。
+    // グラフ表示のたびに設定値を参照するため、再描画時も反映される。
+    if (typeof msg.controlPanelCollapsed === 'boolean') {
+      setControlsCollapsed(msg.controlPanelCollapsed);
+    }
 
     // ★ hierarchical モードは同期描画なのでここで即座にローディングを消す。
     //   physics モードは initNetwork 内の stabilizationIterationsDone で消す。
@@ -314,7 +365,9 @@
 
     network.on('click', onNetworkClick);
     network.on('doubleClick', function (params) {
-      if (params.nodes.length === 0) resetAll();
+      if (params.nodes.length === 0) {
+        resetAll(!!searchBox.value.trim());
+      }
     });
     network.on('hoverNode', function (p) {
       if (currentNode !== null) return;
@@ -382,19 +435,23 @@
       return;
     }
 
-    if (!params.nodes.length) { resetAll(); return; }
+    if (!params.nodes.length) {
+      // 検索中はノード選択だけリセットして検索を維持する。
+      // 空のとき（非検索中）は通常どおり全リセット。
+      resetAll(!!searchBox.value.trim());
+      return;
+    }
     var id = params.nodes[0];
-    if (id === currentNode) { resetAll(); return; }
+    // 同じノードを再クリック: 選択解除（検索中は検索を維持）
+    if (id === currentNode) { resetAll(!!searchBox.value.trim()); return; }
 
     currentNode          = id;
     connectedEdgesOfNode = new Set(network.getConnectedEdges(id));
+    _hadSelection        = true; // PERF-07: 選択発生を記録
 
-    var outgoing = new Set();
-    var incoming = new Set();
-    edges.forEach(function (e) {
-      if (e.from === id) outgoing.add(e.to);
-      if (e.to   === id) incoming.add(e.from);
-    });
+    // ② 修正: edges.forEach 全スキャン → getConnectedNodes で直接取得 (O(n) → O(k))
+    var outgoing = new Set(network.getConnectedNodes(id, 'from')); // callees
+    var incoming = new Set(network.getConnectedNodes(id, 'to'));   // callers
 
     nodes.update(nodes.getIds().map(function (nid) {
       if (nid === id)         return { id: nid, color: { background: '#97c2fc', border: '#5a9fd4' }, font: makeFont('#1a3d5c') };
@@ -443,12 +500,9 @@
     if (currentNode === null) return;
 
     var visible  = (maxHops === null) ? new Set(nodes.getIds()) : getNodesWithinHops(currentNode, maxHops);
-    var outgoing = new Set();
-    var incoming = new Set();
-    edges.forEach(function (e) {
-      if (e.from === currentNode) outgoing.add(e.to);
-      if (e.to   === currentNode) incoming.add(e.from);
-    });
+    // ② 修正: edges.forEach 全スキャン → getConnectedNodes で直接取得
+    var outgoing = new Set(network.getConnectedNodes(currentNode, 'from')); // callees
+    var incoming = new Set(network.getConnectedNodes(currentNode, 'to'));   // callers
 
     nodes.update(nodes.getIds().map(function (id) {
       var d = defaultNodeColors[id] || {};
@@ -473,13 +527,14 @@
     }));
 
     document.querySelectorAll('.hop-btn').forEach(function (btn) {
-      btn.classList.toggle('active', btn.dataset.hop === String(maxHops));
+      var _hop = maxHops === null ? 'all' : String(maxHops);
+      btn.classList.toggle('active', btn.dataset.hop === _hop);
     });
   }
 
   document.querySelectorAll('.hop-btn').forEach(function (btn) {
     btn.addEventListener('click', function () {
-      var v = btn.dataset.hop === 'null' ? null : parseInt(btn.dataset.hop, 10);
+      var v = btn.dataset.hop === 'all' ? null : parseInt(btn.dataset.hop, 10);
       applyHopFilter(v);
     });
   });
@@ -498,7 +553,15 @@
     document.getElementById('source-file-info').textContent =
       baseName ? (baseName + ' : line ' + info.line) : '';
     if (info.source !== null && info.source !== undefined) {
-      document.getElementById('source-code').textContent = info.source;
+      // ⑤ 行番号を付与して表示 (info.line = スコープ開始行)
+      var startLine = info.line || 1;
+      var sourceLines = info.source.split('\n');
+      var maxNum = startLine + sourceLines.length - 1;
+      var pad    = String(maxNum).length;
+      var numbered = sourceLines.map(function (l, i) {
+        return String(startLine + i).padStart(pad) + '  ' + l;
+      }).join('\n');
+      document.getElementById('source-code').textContent = numbered;
       placeholder.style.display = 'none';
       content.style.display     = 'flex';
     } else {
@@ -604,9 +667,19 @@
     }));
   }
 
+  // PERF-06 修正: applyFontSize のデバウンス版。
+  // input イベントはキー押下ごとに連続発火するため、16ms のデバウンスで
+  // 高頻度の全ノード再描画を抑制する。click イベント（+/- ボタン・リセット）は
+  // 1回の操作につき1回しか発火しないためデバウンスなしで applyFontSize を直接呼ぶ。
+  var _fontSizeTimer;
+  function applyFontSizeDebounced() {
+    clearTimeout(_fontSizeTimer);
+    _fontSizeTimer = setTimeout(applyFontSize, 16);
+  }
+
   document.getElementById('font-size-input').addEventListener('input', function () {
     var val = parseInt(this.value, 10);
-    if (!isNaN(val) && val >= 6 && val <= 64) { canvasFontSize = val; applyFontSize(); }
+    if (!isNaN(val) && val >= 6 && val <= 64) { canvasFontSize = val; applyFontSizeDebounced(); }
   });
   document.getElementById('font-size-reset').addEventListener('click', function () {
     canvasFontSize = DEFAULT_FONT_SIZE;
@@ -616,14 +689,20 @@
   // ＋ / － ボタン: ネイティブスピナーを置き換える
   document.getElementById('font-size-up').addEventListener('click', function () {
     var input = document.getElementById('font-size-input');
-    var val   = Math.min(parseInt(input.value, 10) + 1, 64);
+    // NEW-5: input.value が空の場合 parseInt は NaN を返すため DEFAULT_FONT_SIZE にフォールバック
+    var cur   = parseInt(input.value, 10);
+    if (isNaN(cur)) cur = DEFAULT_FONT_SIZE;
+    var val   = Math.min(cur + 1, 64);
     input.value    = val;
     canvasFontSize = val;
     applyFontSize();
   });
   document.getElementById('font-size-down').addEventListener('click', function () {
     var input = document.getElementById('font-size-input');
-    var val   = Math.max(parseInt(input.value, 10) - 1, 6);
+    // NEW-5: input.value が空の場合 parseInt は NaN を返すため DEFAULT_FONT_SIZE にフォールバック
+    var cur   = parseInt(input.value, 10);
+    if (isNaN(cur)) cur = DEFAULT_FONT_SIZE;
+    var val   = Math.max(cur - 1, 6);
     input.value    = val;
     canvasFontSize = val;
     applyFontSize();
@@ -632,25 +711,34 @@
   // ─────────────────────────────────────────────────────────────────────────
   // コントロールパネル 折りたたみ
   // ─────────────────────────────────────────────────────────────────────────
+  // コントロールパネル折りたたみ
+  // collapsed 変数を module スコープに昇格し、renderGraph から初期状態を適用できるようにする。
+  var _ctrlCollapsed = false;
+  var _ctrlOpenWidth = '';
+
+  function setControlsCollapsed(val) {
+    var toggleBtn = document.getElementById('controls-toggle');
+    var controls  = document.getElementById('controls');
+    var body      = document.getElementById('controls-body');
+    _ctrlCollapsed = val;
+    if (_ctrlCollapsed) {
+      // 閉じる直前に実幅を取得して固定（0 の場合は CSS デフォルト幅をそのまま使う）
+      var w = controls.getBoundingClientRect().width;
+      _ctrlOpenWidth       = w > 0 ? w + 'px' : '';
+      controls.style.width = _ctrlOpenWidth;
+    } else {
+      // 開いたら固定幅を解除 (CSS の width: 230px に戻る)
+      controls.style.width = '';
+    }
+    body.style.display    = _ctrlCollapsed ? 'none' : '';
+    toggleBtn.textContent = _ctrlCollapsed ? '▶' : '▼';
+    toggleBtn.title       = _ctrlCollapsed ? 'Expand panel' : 'Collapse panel';
+  }
+
   (function () {
-    var toggleBtn  = document.getElementById('controls-toggle');
-    var controls   = document.getElementById('controls');
-    var body       = document.getElementById('controls-body');
-    var collapsed  = false;
-    var openWidth  = '';  // 開いているときの実幅を保持
+    var toggleBtn = document.getElementById('controls-toggle');
     toggleBtn.addEventListener('click', function () {
-      collapsed = !collapsed;
-      if (collapsed) {
-        // 閉じる直前に実幅を取得して固定
-        openWidth          = controls.getBoundingClientRect().width + 'px';
-        controls.style.width = openWidth;
-      } else {
-        // 開いたら固定幅を解除 (CSS の width: 230px に戻る)
-        controls.style.width = '';
-      }
-      body.style.display    = collapsed ? 'none' : '';
-      toggleBtn.textContent = collapsed ? '▶' : '▼';
-      toggleBtn.title       = collapsed ? 'Expand panel' : 'Collapse panel';
+      setControlsCollapsed(!_ctrlCollapsed);
     });
   }());
 
@@ -659,21 +747,62 @@
   // ─────────────────────────────────────────────────────────────────────────
 
   var searchBox = document.getElementById('search-box');
-  // Low-3: 検索 Enter で次ヒットへ順番に移動するためのカウンタ
-  var searchHitIndex = 0;
+
+  // ─── 検索モードトグル（func / file、両方 ON がデフォルト） ──────────────
+  var searchModeFunc = true;
+  var searchModeFile = true;
+  (function () {
+    var btnFunc = document.getElementById('search-mode-func');
+    var btnFile = document.getElementById('search-mode-file');
+    function applyToggle(btn, isActive) {
+      btn.classList.toggle('active', isActive);
+    }
+    btnFunc.addEventListener('click', function () {
+      // 両方 OFF にはできない: 片方だけ ON の状態でそれを押した場合は無視
+      if (searchModeFunc && !searchModeFile) return;
+      searchModeFunc = !searchModeFunc;
+      applyToggle(btnFunc, searchModeFunc);
+      // モード変更時に検索クエリを再適用
+      searchBox.dispatchEvent(new Event('input'));
+    });
+    btnFile.addEventListener('click', function () {
+      if (searchModeFile && !searchModeFunc) return;
+      searchModeFile = !searchModeFile;
+      applyToggle(btnFile, searchModeFile);
+      searchBox.dispatchEvent(new Event('input'));
+    });
+  }());
+
+  // ─── 検索インデックス ────────────────────────────────────────────────────
+  // -1 = 未フォーカス（初期値）。Enter で +1、Shift+Enter で -1 して循環。
+  // ポストインクリメント方式を廃止し、index が「現在フォーカス中のノード」を
+  // 常に指すようにすることで Enter → Shift+Enter の 1 回ずれバグを修正。
+  var searchHitIndex = -1;
+  // ② 修正: matchSet を外スコープで保持し、keydown ハンドラでの全スキャン再実行を廃止。
+  var matchSet = new Set();
+
   searchBox.addEventListener('input', function () {
-    searchHitIndex = 0; // 入力変更時はカウンタをリセット
+    searchHitIndex = -1; // 入力変更時はリセット
+    matchSet = new Set();
     if (!nodes) return;
     var q = this.value.trim().toLowerCase();
     if (!q) { resetAll(); return; }
-    var matchSet = new Set();
-    // label (短縮名) と labelFull (フルシグネチャ) 両方で検索
     Object.keys(nodeInfoMap).forEach(function (id) {
-      var info = nodeInfoMap[id];
-      if ((info.label     || '').toLowerCase().indexOf(q) !== -1 ||
-          (info.labelFull || '').toLowerCase().indexOf(q) !== -1) {
-        matchSet.add(id);
+      var info    = nodeInfoMap[id];
+      var matched = false;
+      // func モード: label (短縮名) と labelFull (フルシグネチャ) で検索
+      if (searchModeFunc) {
+        if ((info.label     || '').toLowerCase().indexOf(q) !== -1 ||
+            (info.labelFull || '').toLowerCase().indexOf(q) !== -1) {
+          matched = true;
+        }
       }
+      // file モード: ファイルのベース名で検索（OR 条件）
+      if (!matched && searchModeFile) {
+        var basename = (info.file || '').replace(/\\/g, '/').split('/').pop() || '';
+        if (basename.toLowerCase().indexOf(q) !== -1) matched = true;
+      }
+      if (matched) matchSet.add(id);
     });
     nodes.update(nodes.getIds().map(function (id) {
       if (matchSet.has(id)) {
@@ -683,33 +812,26 @@
       return { id: id, color: { background: '#f0f0f0', border: '#e0e0e0' }, font: makeFont('#dddddd') };
     }));
   });
+
   searchBox.addEventListener('keydown', function (e) {
     if (e.key === 'Enter' && nodes) {
-      var q    = this.value.trim().toLowerCase();
-      var hits = nodes.get({
-        filter: function (n) {
-          var info = nodeInfoMap[n.id] || {};
-          return (info.label     || '').toLowerCase().indexOf(q) !== -1 ||
-                 (info.labelFull || '').toLowerCase().indexOf(q) !== -1;
-        }
-      });
+      var hits = Array.from(matchSet);
       if (hits.length) {
-        // Low-3: Shift+Enter で前へ、Enter で次へ循環移動
+        // フォーカス移動バグ修正: ポストインクリメント廃止 → index が現在位置を常に指す。
+        //   旧実装: 使用後インクリメントのためShift+Enter直後に同ノードを再フォーカスしていた。
+        //   新実装: Enter で +1、Shift+Enter で -1 してから表示するだけ。
         if (e.shiftKey) {
           searchHitIndex = (searchHitIndex - 1 + hits.length) % hits.length;
         } else {
-          searchHitIndex = searchHitIndex % hits.length;
+          searchHitIndex = (searchHitIndex + 1) % hits.length;
         }
-        network.focus(hits[searchHitIndex].id, { scale: 1.5, animation: { duration: 400 } });
-        // 次回 Enter に備えてインクリメント（Shift 時はデクリメント済みなので +1）
-        if (!e.shiftKey) searchHitIndex++;
+        network.focus(hits[searchHitIndex], { scale: 1.5, animation: { duration: 400 } });
       }
     }
     if (e.key === 'Escape') {
       // ① 修正: document の keydown ハンドラも Escape を捕捉するため
       //   stopPropagation で伝播を止めて resetAll の二重呼び出しを防ぐ。
       e.stopPropagation();
-      searchHitIndex = 0;
       resetAll();
     }
   });
@@ -718,32 +840,65 @@
   // リセット
   // ─────────────────────────────────────────────────────────────────────────
 
-  function resetAll() {
+  // preserveSearch=true のとき: ノード選択状態だけリセットし、
+  //   検索ボックス・matchSet・ソースパネルには手を触れない。
+  //   外から値を save/restore する方式は network.unselectAll() が
+  //   synchronous に内部イベントを再発火したとき途中で崩れるため、
+  //   resetAll 内部で完結させることで再入性の問題を回避する。
+  function resetAll(preserveSearch) {
+    // PERF-07 修正（再修正）: ノードクリック時は接続エッジ「も」非接続エッジ「も」
+    // 両方のスタイルが変更される（接続→ハイライト、非接続→薄灰色 opacity:0.3）。
+    // そのため選択があった場合は必ず全エッジをリセットする必要がある。
+    // 最適化として「一度もノードを選択していない状態の resetAll（Esc 連打など）」のみスキップする。
+    var prevHadSelection = _hadSelection;
     currentNode          = null;
     connectedEdgesOfNode = new Set();
+    _hadSelection        = false;
     // High-1 修正: resetAll 後に同じノードを再クリックしても
     // pendingSourceNodeId が残っていると requestSource が再送されず
     // ソースパネルが空のまま固まる問題を修正。
     pendingSourceNodeId  = null;
+    if (!preserveSearch) {
+      // 🟡 Bug 9 修正: matchSet / searchHitIndex も明示的にクリア
+      matchSet       = new Set();
+      searchHitIndex = -1;
+    } else {
+      // 検索保持時もフォーカス位置はリセット（ノード選択が変わったため）
+      searchHitIndex = -1;
+    }
     if (network) network.unselectAll();
     if (nodes) {
-      nodes.update(nodes.getIds().map(function (id) {
-        var d = defaultNodeColors[id] || {};
-        return { id: id, color: d.color, font: makeFont(d.fontColor || '#2d3436') };
-      }));
+      if (preserveSearch && matchSet.size > 0) {
+        // 検索ハイライト色を維持したままノード選択だけ外す
+        nodes.update(nodes.getIds().map(function (id) {
+          if (matchSet.has(id)) {
+            var d = defaultNodeColors[id] || {};
+            return { id: id, color: d.color, font: makeFont('#2d3436') };
+          }
+          return { id: id, color: { background: '#f0f0f0', border: '#e0e0e0' }, font: makeFont('#dddddd') };
+        }));
+      } else {
+        nodes.update(nodes.getIds().map(function (id) {
+          var d = defaultNodeColors[id] || {};
+          return { id: id, color: d.color, font: makeFont(d.fontColor || '#2d3436') };
+        }));
+      }
     }
-    if (edges) {
+    // PERF-07: 前回選択がなければエッジは変更されていないのでスキップ
+    if (edges && prevHadSelection) {
       edges.update(edges.getIds().map(function (id) {
         return { id: id, color: { color: '#aaaaaa', opacity: 0.8 }, width: 1 };
       }));
     }
-    document.getElementById('hop-panel').style.display    = 'none';
-    document.getElementById('search-box').value           = '';
+    document.getElementById('hop-panel').style.display = 'none';
     document.querySelectorAll('.hop-btn').forEach(function (b) { b.classList.remove('active'); });
-    if (document.getElementById('src-toggle').checked) {
-      showSource(null);
-    } else {
-      document.getElementById('source-panel').style.display = 'none';
+    if (!preserveSearch) {
+      document.getElementById('search-box').value = '';
+      if (document.getElementById('src-toggle').checked) {
+        showSource(null);
+      } else {
+        document.getElementById('source-panel').style.display = 'none';
+      }
     }
   }
 
@@ -760,7 +915,7 @@
       var name = item.file.replace(/\\/g, '/').split('/').pop();
       var row  = document.createElement('div');
       row.style.cssText = 'display:flex;align-items:center;gap:6px;margin-bottom:3px;font-size:11px;cursor:default;';
-      row.title = item.file;
+      row.title = escapeAttr(item.file); // BUG-05 修正: title 属性をエスケープ
       var dot  = document.createElement('span');
       dot.style.cssText = 'width:10px;height:10px;border-radius:50%;flex-shrink:0;' +
         'background:' + item.color + ';border:1.5px solid ' + item.border + ';';

@@ -52,16 +52,19 @@ https://github.com/uta1214/call-map
 ### Commands
 | Command | Description |
 |---------|-------------|
-| `Call Map: Show File Call Graph` | Analyze all functions in the current file |
-| `Call Map: Show Function Graph (BFS)` | Expand from the function at the cursor position |
 | `Call Map: Analyze Workspace` | Cross-file analysis across the workspace |
 | `Call Map: Analyze Folder` | Analyze all C/C++ files in a selected folder |
+| `Call Map: Show File Call Graph` | Analyze all functions in the current file |
+| `Call Map: Show Function Graph (BFS)` | Expand from the function at the cursor position |
+| `Call Map: Show Path-Through Graph (gtags)` | Bidirectional graph centered on the cursor function (gtags only) |
 
 ### Keybindings
 | Feature | Key |
 |---------|-----|
+| Analyze Workspace | `Ctrl+Alt+W` |
 | Show File Call Graph | `Ctrl+Alt+M` |
 | Show Function Graph  | `Ctrl+Alt+F` |
+| Show Path-Through Graph | `Ctrl+Alt+P` |
 
 ### Graph Operations
 | Action | Description |
@@ -87,7 +90,7 @@ https://github.com/uta1214/call-map
 - `callmap.defaultBackend`: Default backend for call graph analysis
   - `lsp`: Use LSP (clangd / C/C++ extension) — high accuracy
   - `gtags`: Use GNU GLOBAL (gtags) — fast, no LSP required
-  - Default: `lsp`
+  - Default: `ask`
 - `callmap.maxHops`: Maximum number of BFS hops for Function Graph
   - Default: `4`
 
@@ -226,16 +229,19 @@ https://github.com/uta1214/call-map
 ### コマンド一覧
 | コマンド | 説明 |
 |---------|------|
-| `Call Map: Show File Call Graph` | ファイル内の全関数を解析 |
-| `Call Map: Show Function Graph (BFS)` | カーソル位置の関数から BFS で展開 |
 | `Call Map: Analyze Workspace` | ワークスペース全体を横断解析 |
 | `Call Map: Analyze Folder` | 選択フォルダ内の全 C/C++ ファイルを解析 |
+| `Call Map: Show File Call Graph` | ファイル内の全関数を解析 |
+| `Call Map: Show Function Graph (BFS)` | カーソル位置の関数から BFS で展開 |
+| `Call Map: Show Path-Through Graph (gtags)` | カーソル位置の関数を中心に双方向グラフを表示（gtags のみ） |
 
 ### キーバインド
 | 機能 | キー |
 |------|------|
+| Analyze Workspace | `Ctrl+Alt+W` |
 | Show File Call Graph | `Ctrl+Alt+M` |
 | Show Function Graph  | `Ctrl+Alt+F` |
+| Show Path-Through Graph | `Ctrl+Alt+P` |
 
 ### グラフの操作方法
 | 操作 | 内容 |
@@ -261,7 +267,7 @@ https://github.com/uta1214/call-map
 - `callmap.defaultBackend`: コールグラフ解析のデフォルトバックエンド
   - `lsp`：LSP（clangd / C/C++ 拡張）を使用 — 高精度
   - `gtags`：GNU GLOBAL（gtags）を使用 — 高速、LSP 不要
-  - デフォルト: `lsp`
+  - デフォルト: `ask`
 - `callmap.maxHops`: Function Graph の BFS 最大ホップ数
   - デフォルト: `4`
 
