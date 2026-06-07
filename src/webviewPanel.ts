@@ -4,7 +4,7 @@
  * 【変更点 (main ← gtags マージ)】
  *  - buildGraphMsg: labelFull をソースパネル用に維持し label をノード表示に使用
  *  - HTML 凡例の色変更: selected #00b894 → #97c2fc、caller #0984e3 → #00b894
- *  - HTML から引数表示トグル (sig-toggle) を削除
+ *  - HTML の引数表示トグル (sig-toggle) を維持（webview.js 側で showFullSig / getLabel() / applyLabelMode() として実装済み）
  *  - CSS の .ctrl-label クラスを削除してインラインスタイルに統一
  *
  * 【追加修正】
@@ -24,7 +24,7 @@ import * as path   from 'path';
 import * as fs     from 'fs';
 import * as crypto from 'crypto';
 import * as os     from 'os';
-import { GraphData, MAX_SOURCE_LINES } from './callGraphBuilder';
+import { GraphData, MAX_SOURCE_LINES } from './types';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // パスセキュリティユーティリティ
@@ -38,11 +38,30 @@ import { GraphData, MAX_SOURCE_LINES } from './callGraphBuilder';
  * path.resolve で絶対パスに変換した上で比較することで
  * ディレクトリトラバーサルを確実に防ぐ。
  *
+ * 🔒 ⑤ セキュリティ修正: シンボリックリンクパストラバーサル対策
+ *   path.resolve はシンボリックリンクを解決しないため、
+ *   ワークスペース内のシンボリックリンク → ワークスペース外ファイル という経路が
+ *   isPathInWorkspace のチェックを通過し、fs.readFile で実体ファイルを読まれる恐れがあった。
+ *   fs.realpathSync でシンボリックリンクを解決してから比較する。
+ *   ファイルが存在しない場合は try/catch で path.resolve 結果にフォールバックする。
+ *
  * Windows では大文字小文字を統一するため toLowerCase() を適用する。
  */
-function resolveAndNormalize(p: string): string {
+function resolveAndNormalize(p: string): string | null {
   const resolved = path.resolve(p); // 相対パスを絶対パスに変換
-  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  // 🔒 SEC-2 修正: realpathSync 失敗時のフォールバックポリシーを
+  //   gtagsBackend.ts の sanitizeToWsRoot と統一し、null を返してアクセス拒否する。
+  //   ファイルが削除直後などの短時間でも意図しないパスへのアクセスを防ぐ。
+  let real: string;
+  try {
+    real = fs.realpathSync(resolved);
+  } catch {
+    return null;
+  }
+  // macOS の HFS+/APFS は Case-Insensitive のため
+  //   win32 と同様に toLowerCase() を適用してパス比較のズレを防ぐ。
+  return (process.platform === 'win32' || process.platform === 'darwin')
+    ? real.toLowerCase() : real;
 }
 
 /**
@@ -60,10 +79,13 @@ function isPathInWorkspace(
   allowedFiles: ReadonlySet<string>
 ): boolean {
   const fileResolved = resolveAndNormalize(filePath);
+  // SEC-2 修正: realpathSync 失敗時（ファイル不存在等）は null が返るためアクセス拒否。
+  if (fileResolved === null) return false;
   // ワークスペースが開いている場合: フォルダ配下かどうかで判断
   if (wsRoots.length > 0) {
     return wsRoots.some(r => {
       const rResolved = resolveAndNormalize(r);
+      if (rResolved === null) return false;
       return fileResolved === rResolved
         || fileResolved.startsWith(rResolved + path.sep)
         || fileResolved.startsWith(rResolved + '/');
@@ -91,13 +113,38 @@ const FILE_COLORS_BASE = [
 
 function generateFileColors(files: string[]): Record<string, { background: string; border: string }> {
   const map: Record<string, { background: string; border: string }> = {};
+  const extra = files.length - FILE_COLORS_BASE.length; // プリセット外のファイル数
   files.forEach((f, i) => {
-    map[f] = i < FILE_COLORS_BASE.length
-      ? FILE_COLORS_BASE[i]
-      : { background: `hsl(${Math.round((i * 360 / files.length) % 360)},65%,80%)`,
-          border:     `hsl(${Math.round((i * 360 / files.length) % 360)},65%,55%)` };
+    if (i < FILE_COLORS_BASE.length) {
+      map[f] = FILE_COLORS_BASE[i];
+    } else {
+      // 🐛 ① 修正: i * 360 / files.length だと色相が前半に偏る。
+      //   プリセット以降を 0 から数え直し、extra 個を色相環で均等配置する。
+      const hue = Math.round(((i - FILE_COLORS_BASE.length) * 360 / Math.max(1, extra)) % 360);
+      map[f] = {
+        background: `hsl(${hue},65%,80%)`,
+        border:     `hsl(${hue},65%,55%)`,
+      };
+    }
   });
   return map;
+}
+
+/**
+ * ④ Security 追加: vis-network の title プロパティ用 HTML エスケープ。
+ * vis-network v9 は string 型の title を innerHTML で挿入するため、
+ * プロジェクト側が制御するファイル名などに HTML メタ文字が含まれると XSS になる。
+ * &, <, >, ", ' の5文字を安全な HTML エンティティに変換する。
+ * 改行は <br> に変換し、ツールチップの表示を維持する。
+ */
+function escapeHtmlForTitle(s: string): string {
+  return s
+    .replace(/&/g,  '&amp;')
+    .replace(/</g,  '&lt;')
+    .replace(/>/g,  '&gt;')
+    .replace(/"/g,  '&quot;')
+    .replace(/'/g,  '&#39;')
+    .replace(/\n/g, '<br>');
 }
 
 function buildGraphMsg(data: GraphData): object {
@@ -115,30 +162,53 @@ function buildGraphMsg(data: GraphData): object {
       scopeEnd:      n.scopeEnd,   // ⑥ lazy source 用 (source は送らない)
       isCurrentFile: n.isCurrentFile,
       color:  colorMap[n.file] ?? FILE_COLORS_BASE[FILE_COLORS_BASE.length - 1],
-      title:  `${n.label}\n${path.basename(n.file)} : line ${n.line}`,
+      // ④ Security 修正: vis-network v9 は title プロパティを HTML としてレンダリングする。
+      // ファイル名に <img onerror=...> 等の文字列が含まれると WebView 内でスクリプトが実行される恐れがある。
+      // escapeHtmlForTitle でメタ文字をエスケープして XSS を防ぐ。
+      title:  escapeHtmlForTitle(`${n.label}\n${path.basename(n.file)} : line ${n.line}`),
     })),
     edges: data.edges, fileLegend,
     buildTimeMs: data.buildTimeMs, errors: data.errors,
+    // callmap.initialControlPanel 設定値をメッセージに含める。
+    // webview.js の renderGraph で setControlsCollapsed() に渡して初期状態を適用する。
+    controlPanelCollapsed: vscode.workspace.getConfiguration('callmap')
+      .get<string>('initialControlPanel', 'expanded') === 'collapsed',
   };
 }
 
+// vis-network.min.js / webview.js のインメモリキャッシュ。
+// HTML エクスポートのたびに約 1MB の vis-network.min.js を readFile するのを避ける。
+// NEW-4 修正: Promise シングルトンパターンで並行呼び出し時の二重読み込みも防ぐ。
+// 拡張機能のバージョンアップ時はプロセス再起動されるためキャッシュは常に有効。
+let _filesCachePromise: Promise<[string, string]> | undefined;
+
 async function generateStandaloneHtml(extensionUri: vscode.Uri, data: GraphData): Promise<string> {
   const distDir   = vscode.Uri.joinPath(extensionUri, 'dist').fsPath;
-  // Mid-4 修正: readFileSync → readFile (非同期) に変更。
-  //   約 1MB の vis-network.min.js を同期読み込みすると VS Code 拡張機能ホストの
-  //   イベントループをブロックするため、Promise.all で並列非同期読み込みに変更する。
-  const [visJs, webviewJs] = await Promise.all([
-    fs.promises.readFile(path.join(distDir, 'vis-network.min.js'), 'utf-8'),
-    fs.promises.readFile(path.join(distDir, 'webview.js'), 'utf-8'),
-  ]);
+  // NEW-4: if チェックと await の間に別呼び出しが入っても Promise を再利用するため二重読み込みしない
+  // Bug-7 修正: readFile が失敗した場合 reject 済みの Promise が永続保持され、
+  // 以降の exportHtml 呼び出しが全て失敗し続ける。catch でキャッシュをクリアして再試行可能にする。
+  if (!_filesCachePromise) {
+    _filesCachePromise = Promise.all([
+      fs.promises.readFile(path.join(distDir, 'vis-network.min.js'), 'utf-8'),
+      fs.promises.readFile(path.join(distDir, 'webview.js'),         'utf-8'),
+    ]).catch(err => {
+      _filesCachePromise = undefined; // エラー時はキャッシュをクリアして次回再試行を可能にする
+      throw err;
+    });
+  }
+  const [visJs, webviewJs] = await _filesCachePromise;
   const graphMsg  = buildGraphMsg(data);
 
   // ★ セキュリティ: JSON.stringify は </script> をエスケープしないため
   //   ソースコード中に </script> が含まれると HTML が破壊される (XSS)。
   //   Unicodeエスケープで < と > を無害化する。
+  // U+2028 (LINE SEPARATOR) / U+2029 (PARAGRAPH SEPARATOR) も
+  //   一部パーサーで改行扱いされてスクリプトが破壊されるためエスケープする。
   const safeJson = JSON.stringify(graphMsg)
-    .replace(/</g, '\\u003c')
-    .replace(/>/g, '\\u003e');
+    .replace(/</g,      '\\u003c')
+    .replace(/>/g,      '\\u003e')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
 
   // ★ ④: visJs / webviewJs をインラインで埋め込む際に </script> が含まれると
   //   ブラウザの HTML パーサーがスクリプトブロックを早期終端してしまう。
@@ -192,24 +262,40 @@ export class CallGraphPanel {
             break;
           case 'requestSource': {
             // ⑥ ソース遅延読み込み: ノードクリック時にファイルを読んで返す
-            const { nodeId, file, line, scopeEnd } = msg as {
-              nodeId: string; file: string; line: number; scopeEnd?: number;
-            };
+            // msg の宣言型に nodeId が含まれないため unknown 経由でキャストする
+            const req = msg as unknown as { nodeId: string; file: string; line: number; scopeEnd?: number };
+            const { nodeId, file, line, scopeEnd } = req;
             // Bug① 修正: !line は line===0 でも true になるため line !== undefined に変更
             if (!file || line === undefined) break;
+            // Sec-4 修正: WebView 由来の nodeId は型・長さを検証する
+            if (!nodeId || typeof nodeId !== 'string' || nodeId.length > 1000) break;
             // Security①: resolveAndNormalize + isPathInWorkspace (allowedFiles フォールバック付き)
             const wsRoots = vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? [];
             if (!isPathInWorkspace(file, wsRoots, this._allowedFiles)) break;
-            // 検証済みの正規化パスを使ってファイルを読む
-            const resolvedFile = path.resolve(file);
+            // TOCTOU 対策。
+            // isPathInWorkspace は realpathSync でシンボリックリンクを解決して検証するが、
+            // その後 path.resolve (symlink未解決) でファイルを読むと TOCTOU になる。
+            // realpath を再度取得して「チェックしたパス = 読み取るパス」を一致させる。
+            let resolvedFile: string;
+            try {
+              resolvedFile = await fs.promises.realpath(path.resolve(file));
+            } catch {
+              break; // ファイルが存在しない or 解決不能
+            }
+            // 解決済みパスで再チェック（シンボリックリンクが変更された場合の二重確認）
+            if (!isPathInWorkspace(resolvedFile, wsRoots, this._allowedFiles)) break;
             try {
               const content = await fs.promises.readFile(resolvedFile, 'utf-8');
               const lines   = content.split('\n');
               const startIdx = Math.max(0, line - 1);
               // Bug③ 修正: 120 (ハードコード) → MAX_SOURCE_LINES に統一
               //   callGraphBuilder.ts の scopeEnd 計算 (start + MAX_SOURCE_LINES - 1) と一致させる
-              const endIdx   = scopeEnd !== undefined
-                ? Math.min(scopeEnd, startIdx + MAX_SOURCE_LINES, lines.length)
+              // Sec-2 修正: WebView 由来の scopeEnd が NaN/Infinity の場合 Math.min が NaN を返し
+              //   lines.slice が空になるため、有限な正の整数のみ受け入れる。
+              const safeScopeEnd = (typeof scopeEnd === 'number' && isFinite(scopeEnd) && scopeEnd > 0)
+                ? scopeEnd : undefined;
+              const endIdx   = safeScopeEnd !== undefined
+                ? Math.min(safeScopeEnd, startIdx + MAX_SOURCE_LINES, lines.length)
                 : Math.min(startIdx + MAX_SOURCE_LINES, lines.length);
               const source = lines.slice(startIdx, endIdx).join('\n');
               this._panel.webview.postMessage({ type: 'sourceData', nodeId, source });
@@ -251,7 +337,10 @@ export class CallGraphPanel {
     this._lastGraphData = data;
     this._panel.title   = `Call Map — ${data.fileName}`;
     // Security①: グラフに含まれるファイルを許可リストとして更新
-    this._allowedFiles = new Set(data.nodes.map(n => resolveAndNormalize(n.file)));
+    // SEC-2 修正: resolveAndNormalize が null を返す（ファイル不存在）場合は除外する。
+    this._allowedFiles = new Set(
+      data.nodes.map(n => resolveAndNormalize(n.file)).filter((p): p is string => p !== null)
+    );
     this._postOrQueue(buildGraphMsg(data));
   }
 
@@ -262,7 +351,15 @@ export class CallGraphPanel {
 
   public static async exportHtmlFile(extensionUri: vscode.Uri, data: GraphData): Promise<void> {
     const wsRoot    = vscode.workspace.workspaceFolders?.[0]?.uri;
-    const safeName  = data.fileName.replace(/[^\w.-]/g, '_');
+    // ファイル名サニタイズを改善。
+    // 旧実装: /[^\w.-]/g → _ で括弧・矢印・スペースを全てアンダースコアにして冗長な名前になっていた。
+    // 新実装: FS 危険文字のみ除去し、空白は _ に、連続 _ は畳む。最大 80 文字。
+    const safeName = data.fileName
+      .replace(/[/\\:*?"<>|]/g, '')
+      .replace(/\s+/g, '_')
+      .replace(/_+/g,  '_')
+      .replace(/^[._]+|[._]+$/g, '')
+      .slice(0, 80) || 'graph';
     // ★ ⑦: process.env.HOME → os.homedir() に変更 (Windows 対応)
     const defaultUri = wsRoot
       ? vscode.Uri.joinPath(wsRoot, `callgraph_${safeName}.html`)
@@ -307,8 +404,20 @@ export class CallGraphPanel {
         `Call Map: Cannot open file outside workspace:\n${filePath}`);
       return;
     }
-    // 検証済みの正規化パスで URI を生成する
-    const resolvedPath = path.resolve(filePath);
+    // 検証済みの実パスで URI を生成する（SEC-09: TOCTOU 対策、SEC-01 と同様の方針）
+    let resolvedPath: string;
+    try {
+      resolvedPath = await fs.promises.realpath(path.resolve(filePath));
+    } catch {
+      vscode.window.showErrorMessage(`Could not open file: ${filePath}`);
+      return;
+    }
+    // 解決後のパスで再チェック
+    if (!isPathInWorkspace(resolvedPath, wsRoots, this._allowedFiles)) {
+      vscode.window.showErrorMessage(
+        `Call Map: Cannot open file outside workspace:\n${resolvedPath}`);
+      return;
+    }
     try {
       const uri = vscode.Uri.file(resolvedPath);
       const pos = new vscode.Position(Math.max(0, line - 1), 0);
@@ -349,9 +458,9 @@ type HtmlTemplateMode =
 function htmlTemplate(mode: HtmlTemplateMode, scripts: string): string {
   const cspMeta = mode.kind === 'webview'
     ? `<meta http-equiv="Content-Security-Policy"
-         content="default-src 'none'; script-src 'nonce-${mode.nonce}' ${mode.cspSource}; style-src 'unsafe-inline';">`
+         content="default-src 'none'; script-src 'nonce-${mode.nonce}' ${mode.cspSource}; style-src 'unsafe-inline'; img-src data: blob:;">`
     : `<meta http-equiv="Content-Security-Policy"
-         content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline';">`;
+         content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; object-src 'none'; base-uri 'none';">`;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -389,6 +498,10 @@ div.vis-network div.vis-navigation div.vis-button.vis-zoomOut     { left: 122px 
 }
 .hop-btn { flex: 1; padding: 4px 0; border: 1px solid #b2bec3; border-radius: 4px; cursor: pointer; background: #dfe6e9; font-family: monospace; font-size: 12px; }
 .hop-btn.active { background: #636e72 !important; color: #fff !important; }
+.search-mode-btn { flex: 1; padding: 3px 0; border: 1px solid #b2bec3; cursor: pointer; background: #dfe6e9; font-family: monospace; font-size: 11px; color: #636e72; }
+.search-mode-btn:first-child { border-radius: 4px 0 0 4px; }
+.search-mode-btn:last-child  { border-radius: 0 4px 4px 0; border-left: none; }
+.search-mode-btn.active { background: #636e72 !important; color: #fff !important; }
 #source-panel {
   display: none; position: fixed; top: 0; right: 0; bottom: 0;
   width: 40%; max-width: 600px; z-index: 998;
@@ -434,8 +547,15 @@ div.vis-network div.vis-navigation div.vis-button.vis-zoomOut     { left: 122px 
     <b style="color:#00b894;">●</b> caller &nbsp;
     <span style="color:#aaa;font-size:10px;">Ctrl+Click to jump</span>
   </div>
-  <input id="search-box" type="text" placeholder="🔍 Search function">
+  <div style="display:flex;margin-bottom:4px;">
+    <button class="search-mode-btn active" id="search-mode-func" title="Search by function name">func</button>
+    <button class="search-mode-btn active" id="search-mode-file" title="Search by file name">file</button>
+  </div>
+  <input id="search-box" type="text" placeholder="🔍 Search">
 
+  <label style="cursor:pointer;display:flex;align-items:center;gap:6px;font-size:11px;color:#2d3436;margin-bottom:4px;">
+    <input id="sig-toggle" type="checkbox" style="cursor:pointer;"> Show parameters
+  </label>
   <label style="cursor:pointer;display:flex;align-items:center;gap:6px;font-size:11px;color:#2d3436;margin-bottom:4px;">
     <input id="src-toggle" type="checkbox" style="cursor:pointer;"> Show source panel
   </label>
@@ -456,7 +576,7 @@ div.vis-network div.vis-navigation div.vis-button.vis-zoomOut     { left: 122px 
       <button class="hop-btn" data-hop="1">1</button>
       <button class="hop-btn" data-hop="2">2</button>
       <button class="hop-btn" data-hop="3">3</button>
-      <button class="hop-btn" data-hop="null">All</button>
+      <button class="hop-btn" data-hop="all">All</button>
     </div>
   </div>
   <div style="margin-top:10px;border-top:1px solid #ddd;padding-top:8px;">

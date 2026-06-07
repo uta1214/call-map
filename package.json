@@ -3,23 +3,40 @@
   "displayName": "Call Map",
   "publisher": "uta-orange-1214",
   "description": "Interactive C/C++ call graph viewer using LSP Call Hierarchy or GNU GLOBAL (gtags). / LSP または GNU GLOBAL (gtags) を使った C/C++ インタラクティブコールグラフビューア。",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "repository": {
     "type": "git",
     "url": "https://github.com/uta1214/call-map"
   },
   "icon": "icon.png",
+  "keywords": [
+    "call graph",
+    "call hierarchy",
+    "visualization",
+    "C",
+    "C++",
+    "clangd",
+    "gtags",
+    "GNU GLOBAL",
+    "LSP"
+  ],
+  "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["Visualization", "Programming Languages"],
+  "categories": [
+    "Visualization",
+    "Programming Languages"
+  ],
   "activationEvents": [
-    "onStartupFinished"
+    "onLanguage:c",
+    "onLanguage:cpp",
+    "onLanguage:cuda-cpp"
   ],
   "main": "./dist/extension.js",
   "scripts": {
-    "compile":           "node esbuild.js",
-    "watch":             "node esbuild.js --watch",
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
     "vscode:prepublish": "node esbuild.js --production"
   },
   "dependencies": {
@@ -27,22 +44,12 @@
   },
   "devDependencies": {
     "@types/vscode": "^1.85.0",
-    "@types/node":   "^20.0.0",
-    "esbuild":       "^0.20.0",
-    "typescript":    "^5.3.0"
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.0"
   },
   "contributes": {
     "commands": [
-      {
-        "command": "callgraph.showFileGraph",
-        "title": "Call Map: Show File Call Graph",
-        "icon": "$(type-hierarchy)"
-      },
-      {
-        "command": "callgraph.showFunctionGraph",
-        "title": "Call Map: Show Function Graph (BFS)",
-        "icon": "$(type-hierarchy-sub)"
-      },
       {
         "command": "callgraph.showWorkspaceGraph",
         "title": "Call Map: Analyze Workspace",
@@ -54,35 +61,67 @@
         "icon": "$(folder-opened)"
       },
       {
+        "command": "callgraph.showFileGraph",
+        "title": "Call Map: Show File Call Graph",
+        "icon": "$(type-hierarchy)"
+      },
+      {
+        "command": "callgraph.showFunctionGraph",
+        "title": "Call Map: Show Function Graph (BFS)",
+        "icon": "$(type-hierarchy-sub)"
+      },
+      {
         "command": "callgraph.showPathGraph",
-        "title": "Call Map: Show Path-Through Graph (gtags)",
+        "title": "Call Map: Show Path-Through Graph",
         "icon": "$(git-merge)"
       }
     ],
     "keybindings": [
-      { "command": "callgraph.showFileGraph",     "key": "ctrl+alt+M", "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp" },
-      { "command": "callgraph.showFunctionGraph", "key": "ctrl+alt+F", "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp" },
-      { "command": "callgraph.showPathGraph",     "key": "ctrl+alt+P", "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp" }
+      {
+        "command": "callgraph.showWorkspaceGraph",
+        "key": "ctrl+alt+W",
+        "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp"
+      },
+      {
+        "command": "callgraph.showFolderGraph",
+        "key": "ctrl+alt+L",
+        "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp"
+      },
+      {
+        "command": "callgraph.showFileGraph",
+        "key": "ctrl+alt+M",
+        "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp"
+      },
+      {
+        "command": "callgraph.showFunctionGraph",
+        "key": "ctrl+alt+F",
+        "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp"
+      },
+      {
+        "command": "callgraph.showPathGraph",
+        "key": "ctrl+alt+P",
+        "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp"
+      }
     ],
     "menus": {
       "editor/context": [
         {
-          "command": "callgraph.showFileGraph",
+          "command": "callgraph.showWorkspaceGraph",
           "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp",
           "group": "9_callgraph@1"
         },
         {
-          "command": "callgraph.showFunctionGraph",
+          "command": "callgraph.showFolderGraph",
           "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp",
           "group": "9_callgraph@2"
         },
         {
-          "command": "callgraph.showWorkspaceGraph",
+          "command": "callgraph.showFileGraph",
           "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp",
           "group": "9_callgraph@3"
         },
         {
-          "command": "callgraph.showFolderGraph",
+          "command": "callgraph.showFunctionGraph",
           "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp",
           "group": "9_callgraph@4"
         },
@@ -101,17 +140,17 @@
       ],
       "editor/title": [
         {
-          "command": "callgraph.showFileGraph",
+          "command": "callgraph.showWorkspaceGraph",
           "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp",
           "group": "navigation@1"
         },
         {
-          "command": "callgraph.showWorkspaceGraph",
+          "command": "callgraph.showFolderGraph",
           "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp",
           "group": "navigation@2"
         },
         {
-          "command": "callgraph.showFolderGraph",
+          "command": "callgraph.showFileGraph",
           "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp",
           "group": "navigation@3"
         }
@@ -121,15 +160,35 @@
       "type": "object",
       "title": "Call Map Settings",
       "properties": {
+        "callmap.defaultOutputMode": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "webview",
+            "html"
+          ],
+          "default": "ask",
+          "enumDescriptions": [
+            "Always ask which output mode to use / 毎回確認する",
+            "Always open in WebView without asking / 常に WebView で開く（確認なし）",
+            "Always save as HTML without asking / 常に HTML 保存する（確認なし）"
+          ],
+          "description": "Default output mode. Set to 'webview' or 'html' to skip the QuickPick prompt. / デフォルト出力モード。'webview' または 'html' に設定すると選択ダイアログをスキップします。"
+        },
         "callmap.defaultBackend": {
           "type": "string",
-          "enum": ["lsp", "gtags"],
-          "default": "lsp",
-          "enumDescriptions": [
-            "Use LSP (clangd / C/C++ extension) for high-accuracy analysis / LSP (clangd / C/C++ 拡張) を使用した高精度解析",
-            "Use GNU GLOBAL (gtags) for fast analysis / GNU GLOBAL (gtags) を使用した高速解析"
+          "enum": [
+            "ask",
+            "lsp",
+            "gtags"
           ],
-          "description": "Default backend for call graph analysis. / コールグラフ解析のデフォルトバックエンド。"
+          "default": "ask",
+          "enumDescriptions": [
+            "Always ask which backend to use / 毎回確認する",
+            "Always use LSP without asking / 常に LSP を使用（確認なし）",
+            "Always use gtags without asking / 常に gtags を使用（確認なし）"
+          ],
+          "description": "Default backend for call graph analysis. Set to 'lsp' or 'gtags' to skip the selection prompt. / コールグラフ解析のデフォルトバックエンド。'lsp' または 'gtags' に設定すると選択ダイアログをスキップします。"
         },
         "callmap.maxHops": {
           "type": "number",
@@ -140,6 +199,19 @@
           "type": "number",
           "default": 30,
           "description": "Warn when the number of files to analyze exceeds this threshold. / 解析対象ファイル数がこの閾値を超えたときに警告を表示する。"
+        },
+        "callmap.initialControlPanel": {
+          "type": "string",
+          "enum": [
+            "expanded",
+            "collapsed"
+          ],
+          "default": "expanded",
+          "enumDescriptions": [
+            "Show the control panel when the graph opens / グラフ表示時にコントロールパネルを表示する",
+            "Hide the control panel when the graph opens / グラフ表示時にコントロールパネルを非表示にする"
+          ],
+          "description": "Initial visibility of the control panel. / コントロールパネルの初期表示状態。"
         }
       }
     }

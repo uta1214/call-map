@@ -1,0 +1,315 @@
+/**
+ * cacheManager.ts  ─  キャッシュ一元管理 (Phase 1)
+ *
+ * callGraphBuilder.ts / extension.ts に散在していた 10 個のキャッシュ変数を
+ * 1 クラスに集約する。invalidateFile / invalidateAll の 2 本だけで
+ * 全キャッシュの無効化を行う。
+ *
+ * キャッシュキーのセパレータは \x00 (NUL) に統一する。
+ * NUL はファイルパス・C/C++ 関数名のいずれにも含まれないため安全。
+ *
+ * workspace キャッシュキー:
+ *   workspace\x00<wsRoots_joined_\x01>\x00<count>\x00<hash>\x00<backend>
+ *   全ワークスペースルートを \x01 区切りでソート結合することで
+ *   マルチルート環境でも任意ルートのファイル変更を正しく検出できる。
+ */
+
+import * as path from 'path';
+import * as fs   from 'fs';
+import * as vscode from 'vscode';
+import { GraphNode, GraphEdge, GraphData, GtagEntry, ScopeEntry, ScopeMapEntry } from './types';
+
+// normalizeFsPath はここでローカルに定義する。
+// utils.ts が cache (cacheManager) を import しているため、
+// utils から import すると循環依存になる。
+function normalizeFsPath(p: string): string {
+  const n = path.normalize(p);
+  return process.platform === 'win32' ? n.toLowerCase() : n;
+}
+
+export type { GraphNode, GraphEdge, GraphData, GtagEntry, ScopeEntry, ScopeMapEntry };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 型定義 (callGraphBuilder.ts から参照されるものを再エクスポート)
+// ─────────────────────────────────────────────────────────────────────────────
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// キャッシュエントリ型
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface GraphCacheEntry   { data: GraphData;                     timestamp: number; }
+interface TagsCacheEntry    {
+  tags:           Map<string, GtagEntry[]>;
+  ambiguousNames: string[];
+  scopeMap:       Map<string, ScopeMapEntry>;
+  timestamp:      number;
+}
+interface FilesCacheEntry   { uris: vscode.Uri[];                  timestamp: number; }
+interface LazyTagEntry      { entries: Map<string, GtagEntry[]>;   timestamp: number; }
+interface LazyScopeEntry    { scopes:  Map<string, ScopeMapEntry>; timestamp: number; }
+interface FolderFilesEntry  { uris: vscode.Uri[];                  ts:        number; }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 定数
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MAX_CACHE_ENTRIES         = 20;
+const CACHE_TTL_MS              = 5 * 60_000;   // 5 分
+const TAGS_CACHE_TTL_MS         = 5 * 60_000;   // 5 分 (GTAGS_UPDATE_TTL と同期)
+const FILES_CACHE_TTL_MS        = 60_000;        // 60 秒
+const LAZY_CACHE_TTL_MS         = 5 * 60_000;   // 5 分
+const FOLDER_FILES_CACHE_TTL_MS = 60_000;        // 60 秒（extension.ts の FOLDER_FILES_CACHE_TTL と同値）
+const REALPATH_CACHE_MAX        = 500;
+const GTAGS_FALSE_TTL           = 30_000;        // 30 秒
+
+// ─────────────────────────────────────────────────────────────────────────────
+// パスユーティリティ (CacheManager 内部専用)
+// ─────────────────────────────────────────────────────────────────────────────
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CacheManager
+// ─────────────────────────────────────────────────────────────────────────────
+
+export class CacheManager {
+
+  // ── グラフ結果キャッシュ (FIFO 上限 20 件 + TTL 5 分) ──────────────────
+  private readonly _graph = new Map<string, GraphCacheEntry>();
+
+  getGraph(key: string): GraphData | undefined {
+    const e = this._graph.get(key);
+    if (!e) return undefined;
+    if (Date.now() - e.timestamp >= CACHE_TTL_MS) { this._graph.delete(key); return undefined; }
+    return e.data;
+  }
+
+  setGraph(key: string, data: GraphData): void {
+    // 既存キーは末尾に移動（FIFO 順を保つ）
+    if (this._graph.has(key)) this._graph.delete(key);
+    if (this._graph.size >= MAX_CACHE_ENTRIES) {
+      const first = this._graph.keys().next().value;
+      if (first !== undefined) this._graph.delete(first);
+    }
+    this._graph.set(key, { data, timestamp: Date.now() });
+  }
+
+  // ── gtags タグキャッシュ (wsRoot キー, TTL 5 分) ───────────────────────
+  private readonly _tags = new Map<string, TagsCacheEntry>();
+
+  getTags(wsRoot: string): TagsCacheEntry | undefined {
+    const e = this._tags.get(wsRoot);
+    if (!e) return undefined;
+    if (Date.now() - e.timestamp >= TAGS_CACHE_TTL_MS) { this._tags.delete(wsRoot); return undefined; }
+    return e;
+  }
+
+  setTags(wsRoot: string, entry: TagsCacheEntry): void {
+    this._tags.set(wsRoot, entry);
+  }
+
+  // ── findFiles キャッシュ (固定キー, TTL 60 秒) ─────────────────────────
+  private readonly _files = new Map<string, FilesCacheEntry>();
+
+  getFiles(key: string): vscode.Uri[] | undefined {
+    const e = this._files.get(key);
+    if (!e) return undefined;
+    if (Date.now() - e.timestamp >= FILES_CACHE_TTL_MS) { this._files.delete(key); return undefined; }
+    return e.uris;
+  }
+
+  setFiles(key: string, uris: vscode.Uri[]): void {
+    this._files.set(key, { uris, timestamp: Date.now() });
+  }
+
+  // ── lazyTag キャッシュ (wsRoot キー, TTL 5 分) ────────────────────────
+  private readonly _lazyTags = new Map<string, LazyTagEntry>();
+
+  getLazyTagEntry(wsRoot: string): LazyTagEntry | undefined {
+    const e = this._lazyTags.get(wsRoot);
+    if (!e) return undefined;
+    if (Date.now() - e.timestamp >= LAZY_CACHE_TTL_MS) { this._lazyTags.delete(wsRoot); return undefined; }
+    return e;
+  }
+
+  setLazyTagEntry(wsRoot: string, entry: LazyTagEntry): void {
+    this._lazyTags.set(wsRoot, entry);
+  }
+
+  // ── lazyScope キャッシュ (wsRoot キー, TTL 5 分) ─────────────────────
+  private readonly _lazyScopes = new Map<string, LazyScopeEntry>();
+
+  getLazyScopeEntry(wsRoot: string): LazyScopeEntry | undefined {
+    const e = this._lazyScopes.get(wsRoot);
+    if (!e) return undefined;
+    if (Date.now() - e.timestamp >= LAZY_CACHE_TTL_MS) { this._lazyScopes.delete(wsRoot); return undefined; }
+    return e;
+  }
+
+  setLazyScopeEntry(wsRoot: string, entry: LazyScopeEntry): void {
+    this._lazyScopes.set(wsRoot, entry);
+  }
+
+  // ── gtags DB 更新時刻 ────────────────────────────────────────────────
+  private readonly _gtagsUpdateTs = new Map<string, number>();
+
+  getGtagsUpdateTs(wsRoot: string): number {
+    return this._gtagsUpdateTs.get(wsRoot) ?? 0;
+  }
+
+  setGtagsUpdateTs(wsRoot: string, ts: number): void {
+    this._gtagsUpdateTs.set(wsRoot, ts);
+  }
+
+  // ── realpathCache (上限 500 件) ─────────────────────────────────────
+  private readonly _realpath = new Map<string, string>();
+
+  getRealpath(rawPath: string): string | undefined {
+    return this._realpath.get(rawPath);
+  }
+
+  setRealpath(rawPath: string, resolved: string): void {
+    if (this._realpath.size >= REALPATH_CACHE_MAX) this._realpath.clear();
+    this._realpath.set(rawPath, resolved);
+  }
+
+  // ── gtags 存在チェック ──────────────────────────────────────────────
+  // boolean と falseTs をペアで管理し、更新し忘れによる stale を防ぐ。
+  private _gtagsAvailable: boolean | undefined = undefined;
+  private _gtagsFalseTs:   number  | undefined = undefined;
+
+  getGtagsAvailable(): { value: boolean; falseTs?: number } | undefined {
+    if (this._gtagsAvailable === undefined) return undefined;
+    return { value: this._gtagsAvailable, falseTs: this._gtagsFalseTs };
+  }
+
+  setGtagsAvailable(value: boolean): void {
+    this._gtagsAvailable = value;
+    this._gtagsFalseTs   = value ? undefined : Date.now();
+  }
+
+  get gtagsFalseTtl(): number { return GTAGS_FALSE_TTL; }
+
+  // ── folderFilesCache (extension.ts から移動) ─────────────────────────
+  private readonly _folderFiles = new Map<string, FolderFilesEntry>();
+
+  // QUALITY-2 修正: TTL チェックを CacheManager 内部に閉じ込め、
+  // 他のキャッシュ API と一貫した設計にする。
+  // 旧 getFolderFilesEntry（生エントリ返し + 呼び出し元で TTL チェック）は廃止。
+  getFolderFiles(key: string): vscode.Uri[] | undefined {
+    const e = this._folderFiles.get(key);
+    if (!e) return undefined;
+    if (Date.now() - e.ts >= FOLDER_FILES_CACHE_TTL_MS) { this._folderFiles.delete(key); return undefined; }
+    return e.uris;
+  }
+
+  setFolderFiles(key: string, uris: vscode.Uri[]): void {
+    this._folderFiles.set(key, { uris, ts: Date.now() });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // 無効化 API
+  // ─────────────────────────────────────────────────────────────────────
+
+  /**
+   * ファイル内容・構造変更時の部分無効化。
+   *
+   * graphCache:
+   *   - file / func / path キー: セグメント[1] が変更ファイルと完全一致するエントリを削除
+   *   - workspace キー: セグメント[1] が '\x01' 区切りの全 wsRoot リスト。
+   *     いずれかの wsRoot 配下なら削除（マルチルート対応）
+   *
+   * tagsCache / lazyTagCache / lazyScopeCache:
+   *   変更ファイルが属する wsRoot のエントリのみ削除
+   *   どの wsRoot にも属さない場合は全クリア（安全側）
+   *
+   * filesCache / folderFilesCache:
+   *   構造変更時（onDidCreate / onDidDelete）のみ呼び出し元が全クリアする。
+   *   内容変更時（onDidChange）は触らない。
+   *
+   * realpathCache:
+   *   シンボリックリンクの向き先変更に対応するため常に全クリア。
+   */
+  invalidateFile(fsPath: string): void {
+    const norm = normalizeFsPath(fsPath);
+
+    // ── graphCache ──────────────────────────────────────────────────────
+    for (const key of this._graph.keys()) {
+      const segments = key.split('\x00');
+      const type     = segments[0];
+
+      if (type === 'workspace') {
+        // segments[1] = '\x01' 区切りの全 wsRoot
+        const roots = segments[1]?.split('\x01') ?? [];
+        const hit   = roots.some(r => {
+          const rn = normalizeFsPath(r);
+          return norm === rn || norm.startsWith(rn + '/') || norm.startsWith(rn + path.sep);
+        });
+        if (hit) this._graph.delete(key);
+      } else {
+        // file / func / path: segments[1] = fsPath
+        const keyPath = segments[1] ?? '';
+        if (normalizeFsPath(keyPath) === norm) this._graph.delete(key);
+      }
+    }
+
+    // ── tagsCache / lazyTagCache / lazyScopeCache ───────────────────────
+    const allWsRoots = new Set([
+      ...this._tags.keys(),
+      ...this._lazyTags.keys(),
+      ...this._lazyScopes.keys(),
+    ]);
+
+    const affected = [...allWsRoots].filter(wsRoot => {
+      const rn = normalizeFsPath(wsRoot);
+      return norm === rn || norm.startsWith(rn + '/') || norm.startsWith(rn + path.sep);
+    });
+
+    if (affected.length === 0) {
+      // どの wsRoot にも属さない変更は全削除（安全側）
+      this._tags.clear();
+      this._lazyTags.clear();
+      this._lazyScopes.clear();
+    } else {
+      for (const wsRoot of affected) {
+        this._tags.delete(wsRoot);
+        this._lazyTags.delete(wsRoot);
+        this._lazyScopes.delete(wsRoot);
+      }
+    }
+    // _files（ファイル URI リスト）はファイル内容変更では無効化不要。
+    // 構造変更（onDidCreate / onDidDelete）時は invalidateFileList() が呼ばれる。
+
+    // ── realpathCache: シンボリックリンク変更に対応するため常に全クリア ──
+    this._realpath.clear();
+  }
+
+  /**
+   * 全キャッシュを削除する。
+   * 拡張機能の deactivate 時・テスト間のリセットに使用する。
+   */
+  invalidateAll(): void {
+    this._graph.clear();
+    this._tags.clear();
+    this._files.clear();
+    this._lazyTags.clear();
+    this._lazyScopes.clear();
+    this._gtagsUpdateTs.clear();
+    this._realpath.clear();
+    this._folderFiles.clear();
+    this._gtagsAvailable = undefined;
+    this._gtagsFalseTs   = undefined;
+  }
+
+  /**
+   * ファイル構造変更時（onDidCreate / onDidDelete）の
+   * filesCache / folderFilesCache クリア専用 API。
+   */
+  invalidateFileList(): void {
+    this._files.clear();
+    this._folderFiles.clear();
+  }
+}
+
+/** モジュールレベルのシングルトン */
+export const cache = new CacheManager();

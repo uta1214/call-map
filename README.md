@@ -7,6 +7,8 @@ It supports two analysis backends: **LSP** (using the Call Hierarchy API) for hi
 
 ## Key Features
 
+![Call Map demo](images/demo.gif)
+
 ### Call Graph Analysis
 - **File Graph**: Analyze all functions in the current file and display their call relationships
 - **Function Graph**: Start from the function at the cursor position and expand via BFS up to N hops
@@ -31,7 +33,7 @@ It supports two analysis backends: **LSP** (using the Call Hierarchy API) for hi
 ## Installation
 
 ### Visual Studio Code Marketplace
-https://github.com/uta1214/call-map
+https://marketplace.visualstudio.com/items?itemName=uta-orange-1214.call-map
 
 ### Manual Installation
 1. Clone or download this repository
@@ -52,16 +54,20 @@ https://github.com/uta1214/call-map
 ### Commands
 | Command | Description |
 |---------|-------------|
-| `Call Map: Show File Call Graph` | Analyze all functions in the current file |
-| `Call Map: Show Function Graph (BFS)` | Expand from the function at the cursor position |
 | `Call Map: Analyze Workspace` | Cross-file analysis across the workspace |
 | `Call Map: Analyze Folder` | Analyze all C/C++ files in a selected folder |
+| `Call Map: Show File Call Graph` | Analyze all functions in the current file |
+| `Call Map: Show Function Graph (BFS)` | Expand from the function at the cursor position |
+| `Call Map: Show Path-Through Graph` | Bidirectional graph centered on the cursor function (LSP and gtags) |
 
 ### Keybindings
 | Feature | Key |
 |---------|-----|
+| Analyze Workspace | `Ctrl+Alt+W` |
+| Analyze Folder | `Ctrl+Alt+L` |
 | Show File Call Graph | `Ctrl+Alt+M` |
 | Show Function Graph  | `Ctrl+Alt+F` |
+| Show Path-Through Graph | `Ctrl+Alt+P` |
 
 ### Graph Operations
 | Action | Description |
@@ -87,13 +93,22 @@ https://github.com/uta1214/call-map
 - `callmap.defaultBackend`: Default backend for call graph analysis
   - `lsp`: Use LSP (clangd / C/C++ extension) — high accuracy
   - `gtags`: Use GNU GLOBAL (gtags) — fast, no LSP required
-  - Default: `lsp`
+  - Default: `ask`
 - `callmap.maxHops`: Maximum number of BFS hops for Function Graph
   - Default: `4`
+
+#### Output Settings
+- `callmap.defaultOutputMode`: Default output mode
+  - `webview`: Always open in WebView without asking
+  - `html`: Always save as HTML without asking
+  - Default: `ask`
 
 #### Display Settings
 - `callmap.warnThreshold`: Warn when the number of files to analyze exceeds this value
   - Default: `30`
+- `callmap.initialControlPanel`: Initial visibility of the control panel when the graph opens
+  - `expanded`: Show the control panel (default)
+  - `collapsed`: Hide the control panel to maximize the graph area
 
 ---
 
@@ -110,18 +125,6 @@ https://github.com/uta1214/call-map
 
 > **Tip for clangd users**: Having `compile_commands.json` in your project root greatly improves accuracy.
 > Generate it with `cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON` (CMake) or `bear -- make` (Bear).
-
----
-
-## Processing Time Reference
-
-| Project size | Functions | Estimated time |
-|---|---|---|
-| Small | ~20 | 100–300 ms |
-| Medium | ~80 | 400–800 ms |
-| Large | ~200 | 1–2 s |
-
-File-level display time is independent of total project size, since clangd maintains a persistent background index.
 
 ---
 
@@ -147,7 +150,7 @@ File-level display time is independent of total project size, since clangd maint
 
 ### Function Graph (BFS) behavior differs between backends
 - Both LSP and gtags backends perform **downward BFS only** (callee direction) for the `Show Function Graph (BFS)` command.
-- If you need a bidirectional graph (both callers and callees), use the `Show Path-Through Graph (gtags)` command (gtags backend only).
+- If you need a bidirectional graph (both callers and callees), use the `Show Path-Through Graph` command.
 
 ---
 
@@ -181,6 +184,8 @@ https://github.com/uta1214/call-map
 
 ## 主な機能
 
+![Call Map demo](images/demo.gif)
+
 ### コールグラフ解析
 - **ファイルグラフ**: 現在のファイル内の全関数を解析し、コール関係を可視化
 - **関数グラフ**: カーソル位置の関数を起点に BFS で N ホップ展開
@@ -205,7 +210,7 @@ https://github.com/uta1214/call-map
 ## インストール方法
 
 ### Visual Studio Code Marketplace
-https://github.com/uta1214/call-map
+https://marketplace.visualstudio.com/items?itemName=uta-orange-1214.call-map
 
 ### 手動インストール
 1. このリポジトリをクローンまたはダウンロード
@@ -226,16 +231,20 @@ https://github.com/uta1214/call-map
 ### コマンド一覧
 | コマンド | 説明 |
 |---------|------|
-| `Call Map: Show File Call Graph` | ファイル内の全関数を解析 |
-| `Call Map: Show Function Graph (BFS)` | カーソル位置の関数から BFS で展開 |
 | `Call Map: Analyze Workspace` | ワークスペース全体を横断解析 |
 | `Call Map: Analyze Folder` | 選択フォルダ内の全 C/C++ ファイルを解析 |
+| `Call Map: Show File Call Graph` | ファイル内の全関数を解析 |
+| `Call Map: Show Function Graph (BFS)` | カーソル位置の関数から BFS で展開 |
+| `Call Map: Show Path-Through Graph` | カーソル位置の関数を中心に双方向グラフを表示（LSP・gtags 両対応） |
 
 ### キーバインド
 | 機能 | キー |
 |------|------|
+| Analyze Workspace | `Ctrl+Alt+W` |
+| Analyze Folder | `Ctrl+Alt+L` |
 | Show File Call Graph | `Ctrl+Alt+M` |
 | Show Function Graph  | `Ctrl+Alt+F` |
+| Show Path-Through Graph | `Ctrl+Alt+P` |
 
 ### グラフの操作方法
 | 操作 | 内容 |
@@ -261,13 +270,22 @@ https://github.com/uta1214/call-map
 - `callmap.defaultBackend`: コールグラフ解析のデフォルトバックエンド
   - `lsp`：LSP（clangd / C/C++ 拡張）を使用 — 高精度
   - `gtags`：GNU GLOBAL（gtags）を使用 — 高速、LSP 不要
-  - デフォルト: `lsp`
+  - デフォルト: `ask`
 - `callmap.maxHops`: Function Graph の BFS 最大ホップ数
   - デフォルト: `4`
+
+#### 出力設定
+- `callmap.defaultOutputMode`: デフォルト出力モード
+  - `webview`：毎回確認せず常に WebView で開く
+  - `html`：毎回確認せず常に HTML として保存する
+  - デフォルト: `ask`
 
 #### 表示設定
 - `callmap.warnThreshold`: 解析対象ファイル数がこの値を超えると警告を表示する
   - デフォルト: `30`
+- `callmap.initialControlPanel`: グラフ表示時のコントロールパネルの初期表示状態
+  - `expanded`：コントロールパネルを表示する（デフォルト）
+  - `collapsed`：コントロールパネルを非表示にしてグラフ表示領域を最大化する
 
 ---
 
@@ -284,18 +302,6 @@ https://github.com/uta1214/call-map
 
 > **clangd を使う場合の注意**: プロジェクトルートに `compile_commands.json` があると精度が大幅に向上します。
 > CMake なら `cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`、Bear なら `bear -- make` で生成できます。
-
----
-
-## 処理時間の目安
-
-| ファイル規模 | 関数数 | 目安 |
-|---|---|---|
-| 小 | ~20 関数 | 100–300 ms |
-| 中 | ~80 関数 | 400–800 ms |
-| 大 | ~200 関数 | 1–2 秒 |
-
-数万ファイルのプロジェクトでも **ファイル単位表示** の時間は変わりません。clangd がバックグラウンドでインデックスを保持しているためです。
 
 ---
 
@@ -322,7 +328,7 @@ https://github.com/uta1214/call-map
 
 ### Function Graph (BFS) の動作がバックエンドで異なる
 - LSP・gtags 両バックエンドとも、`Show Function Graph (BFS)` コマンドは **下方向 BFS のみ**（callee 方向）です。
-- 上下双方向グラフ（caller と callee の両方）が必要な場合は、`Show Path-Through Graph (gtags)` コマンドを使用してください（gtags バックエンドのみ対応）。
+- 上下双方向グラフ（caller と callee の両方）が必要な場合は、`Show Path-Through Graph` コマンドを使用してください（LSP・gtags 両バックエンド対応）。
 
 ---
 
