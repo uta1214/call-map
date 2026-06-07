@@ -3,8 +3,9 @@
 // 【変更点 (main ← gtags マージ)】
 //  - caller ノード色: #74b9ff / #0984e3 → #00b894 / #00695c
 //  - caller エッジ色: #0984e3 → #00b894
-//  - 引数表示トグル (sig-toggle) 関連コードを削除
-//    → showFullSig 変数 / getLabel() / applyLabelMode() を削除
+//  - 引数表示トグル (sig-toggle) を復元
+//    → showFullSig 変数 / getLabel() / applyLabelMode() を追加
+//    → renderGraph の visNodes 生成を getLabel() 経由に変更
 //  - nodeInfoMap は label / labelFull のみ保持 (labelShort は GraphNode から削除済み)
 //
 (function () {
@@ -35,6 +36,7 @@
   var edges    = null;
 
   var nodeInfoMap          = {};   // id → { file, line, scopeEnd, label, labelFull, source? }
+  var showFullSig          = false; // 引数表示トグル (sig-toggle)。デフォルトはオフ。
   var defaultNodeColors    = {};
   var canvasFontSize       = DEFAULT_FONT_SIZE;
   var currentNode          = null;
@@ -166,6 +168,10 @@
     // V4-6 修正: 相互再帰（A→B→A）などのサイクルグラフで bfsLevel の更新が
     // 収束するまで同じノードが bfsQueue に大量追加され O(N²) になる問題を修正する。
     // inQueue セットで「既にキューに積まれているノード」を管理し、重複追加を防ぐ。
+    // ⑥ 追加: サイクルが多数ある場合の bfsQueue 膨張を防ぐため上限を設ける。
+    // 強連結成分（双方向呼び出し）が多いグラフでも正確なレベル計算が行えるよう
+    // * 2 から * 10 に拡張した（深いサイクルでも収束が保証される）。
+    var BFS_QUEUE_LIMIT = msg.nodes.length * 10;
     var inQueue = new Set(bfsQueue);
     while (qi < bfsQueue.length) {
       var cur = bfsQueue[qi++];
@@ -175,7 +181,7 @@
         // 未訪問 OR より浅いパスが見つかった場合にのみ更新
         if (bfsLevel[to] === undefined || bfsLevel[to] > nextLevel) {
           bfsLevel[to] = nextLevel;
-          if (!inQueue.has(to)) {
+          if (!inQueue.has(to) && bfsQueue.length < BFS_QUEUE_LIMIT) {
             inQueue.add(to);
             bfsQueue.push(to); // 更新があったので再伝播
           }
@@ -212,7 +218,7 @@
     var visNodes = msg.nodes.map(function (n) {
       return {
         id:          n.id,
-        label:       n.label,
+        label:       getLabel(nodeInfoMap[n.id] || n),
         title:       n.title,
         color:       n.color,
         size:        Math.min(12 + ((inDeg[n.id] || 0) * 3), 40),
@@ -292,7 +298,9 @@
       buildInfoEl.style.color   = '#e17055';
       buildInfoEl.title = msg.errors.map(escapeAttr).join('\n');
       buildInfoEl.onclick = function () {
-        alert('Build warnings (' + msg.errors.length + '):\n\n' + msg.errors.join('\n'));
+        // QUALITY-5 修正: escapeAttr では title 属性用にエスケープしているが
+        // alert() は別文脈。一貫性のため escapeHtml を適用する。
+        alert('Build warnings (' + msg.errors.length + '):\n\n' + msg.errors.map(escapeHtml).join('\n'));
       };
     } else {
       buildInfoEl.style.cursor  = '';
@@ -651,6 +659,34 @@
   });
 
   // ─────────────────────────────────────────────────────────────────────────
+  // 引数表示トグル
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * showFullSig が false なら label（短縮名）、true なら labelFull（フルシグネチャ）を返す。
+   * labelFull が未設定の場合は label にフォールバックする。
+   */
+  function getLabel(info) {
+    if (!showFullSig) return info.label || '';
+    return info.labelFull || info.label || '';
+  }
+
+  /** 全ノードのラベルを現在の showFullSig に合わせて一括更新する。 */
+  function applyLabelMode() {
+    if (!nodes) return;
+    nodes.update(nodes.getIds().map(function (id) {
+      var info = nodeInfoMap[id];
+      if (!info) return { id: id };
+      return { id: id, label: getLabel(info) };
+    }));
+  }
+
+  document.getElementById('sig-toggle').addEventListener('change', function () {
+    showFullSig = this.checked;
+    applyLabelMode();
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
   // フォントサイズ
   // ─────────────────────────────────────────────────────────────────────────
 
@@ -917,10 +953,22 @@
       row.style.cssText = 'display:flex;align-items:center;gap:6px;margin-bottom:3px;font-size:11px;cursor:default;';
       row.title = escapeAttr(item.file); // BUG-05 修正: title 属性をエスケープ
       var dot  = document.createElement('span');
-      dot.style.cssText = 'width:10px;height:10px;border-radius:50%;flex-shrink:0;' +
-        'background:' + item.color + ';border:1.5px solid ' + item.border + ';';
+      // SEC-1 修正: cssText への直接連結は CSS インジェクションの経路になるため、
+      // 個別プロパティ代入に変更する。値が不正な CSS であっても無視されるため安全。
+      dot.style.width        = '10px';
+      dot.style.height       = '10px';
+      dot.style.borderRadius = '50%';
+      dot.style.flexShrink   = '0';
+      dot.style.background   = item.color;
+      dot.style.border       = '1.5px solid ' + item.border;
       var label = document.createElement('span');
-      label.style.cssText = 'color:#2d3436;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px;';
+      // SEC-REMAIN-1 修正: dot と同様に cssText 直接代入を個別プロパティ代入に変更。
+      // 値はリテラルのみなので実害はないが、将来的な動的値混入を気づかれにくくしないため統一する。
+      label.style.color        = '#2d3436';
+      label.style.overflow     = 'hidden';
+      label.style.textOverflow = 'ellipsis';
+      label.style.whiteSpace   = 'nowrap';
+      label.style.maxWidth     = '160px';
       label.textContent = name;
       row.appendChild(dot); row.appendChild(label);
       container.appendChild(row);

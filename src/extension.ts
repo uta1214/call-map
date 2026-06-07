@@ -26,13 +26,12 @@ import {
   buildFunctionCallGraph,
   buildWorkspaceCallGraph,
   buildPathThroughCallGraph,
-  invalidateCache,
   warmupCache,
-  hasCppSourceExtension,
   Backend,
   GraphData,
 } from './callGraphBuilder';
-
+import { cache } from './cacheManager';
+import { hasCppSourceExtension } from './utils';
 /** ⑩ callmap.warnThreshold 設定値を読み取る。設定変更時も都度参照するため関数化する。 */
 function getWarnThreshold(): number {
   return vscode.workspace.getConfiguration('callmap').get<number>('warnThreshold', 30);
@@ -78,15 +77,20 @@ async function findFilesInFolder(
     }
     const subdirs: vscode.Uri[] = [];
     for (const [name, type] of entries) {
-      if (type === vscode.FileType.Directory) {
+      // Bug-6 修正: vscode.FileType はビットフラグ。
+      // シンボリックリンクのディレクトリは FileType.SymbolicLink(64)|Directory(2)=66 となり
+      // 厳密等価 === では Directory(2) にマッチしない。ビットマスクで判定する。
+      // シンボリックリンクは無限ループ防止のため意図的に除外する。
+      const isSymlink = !!(type & vscode.FileType.SymbolicLink);
+      if (!isSymlink && (type & vscode.FileType.Directory)) {
         if (EXCLUDE_DIRS.has(name)) continue;
         subdirs.push(vscode.Uri.joinPath(uri, name)); // ① 収集してから並列展開
-      } else if (type === vscode.FileType.File) {
+      } else if (!isSymlink && (type & vscode.FileType.File)) {
         if (extensions.has(path.extname(name).toLowerCase())) {
           result.push(vscode.Uri.joinPath(uri, name));
         }
       }
-      // SymbolicLink は意図的に無視
+      // SymbolicLink は無限ループ防止のため意図的にスキップ
     }
     await Promise.all(subdirs.map(walk)); // ① シリアル await → 並列 Promise.all
   }
@@ -99,22 +103,21 @@ async function findFilesInFolder(
 // showWorkspaceGraph / showFolderGraph は毎回 readDirectory 再帰走査を行っていたが、
 // 大規模プロジェクトでは数百ms〜数秒かかる。2回目以降はキャッシュから即座に返す。
 // FSW の onChanged でキャッシュをクリアするため、ファイル追加・削除も自動的に反映される。
-const FOLDER_FILES_CACHE_TTL = 60_000; // ms
-interface FolderFilesEntry { uris: vscode.Uri[]; ts: number; }
-const folderFilesCache = new Map<string, FolderFilesEntry>();
+// QUALITY-2 修正: TTL チェックは CacheManager.getFolderFiles() 内部に移管したため
+// FOLDER_FILES_CACHE_TTL 定数と getFolderFilesEntry の呼び出しを削除。
+
 
 async function findFilesInFolderCached(
   folderUri:  vscode.Uri,
   extensions: Set<string>,
 ): Promise<vscode.Uri[]> {
-  // BUG-3 修正: Unix ではファイルパスに '|' を含めることができるため \x00 (NUL) を使用する。
+  // BUG-3 修正: Unix ではファイルパスに '|' を含めることができるため \\x00 (NUL) を使用する。
   // NUL はファイルパスに含まれない唯一の文字であるためキー衝突が起きない。
   const key = `${folderUri.fsPath}\x00${[...extensions].sort().join(',')}`;
-  const now = Date.now();
-  const hit = folderFilesCache.get(key);
-  if (hit && now - hit.ts < FOLDER_FILES_CACHE_TTL) return hit.uris;
+  const hit = cache.getFolderFiles(key);
+  if (hit) return hit;
   const uris = await findFilesInFolder(folderUri, extensions);
-  folderFilesCache.set(key, { uris, ts: now });
+  cache.setFolderFiles(key, uris);
   return uris;
 }
 
@@ -152,11 +155,18 @@ async function pickBackend(): Promise<Backend | undefined> {
   qp.title       = 'Call Map: Backend';
   qp.activeItems = items.filter(i => i.backend === defaultBackend);
   return new Promise(resolve => {
-    // 🟢 Bug 10 修正: Accept 時に onDidAccept → onDidHide の順で両方が発火するため
-    //   dispose() が2回呼ばれていた。VS Code 標準パターンに合わせ、
-    //   onDidAccept では hide() のみ呼び、dispose は onDidHide に一元化する。
-    qp.onDidAccept(() => { resolve(qp.selectedItems[0]?.backend); qp.hide(); });
-    qp.onDidHide(()    => { resolve(undefined);                    qp.dispose(); });
+    // BUG-2 修正: onDidAccept → qp.hide() の順で呼ぶと onDidHide も必ず発火し
+    // resolve(undefined) が再実行される。accepted フラグで二重解決を防ぐ。
+    let accepted = false;
+    qp.onDidAccept(() => {
+      accepted = true;
+      resolve(qp.selectedItems[0]?.backend);
+      qp.hide();
+    });
+    qp.onDidHide(() => {
+      if (!accepted) resolve(undefined);
+      qp.dispose();
+    });
     qp.show();
   });
 }
@@ -283,8 +293,8 @@ export function activate(context: vscode.ExtensionContext): void {
   // A: FileSystemWatcher デバウンス（バグ修正版）
   // ──────────────────────────────────────────────────────────────────────────
   // ① onDidChange（ファイル内容変更）: graphData / tags キャッシュのみ無効化。
-  //    フォルダ内のファイル一覧は変わらないため folderFilesCache は触らない。
-  // ② onDidCreate / onDidDelete（ファイル構造変更）: 全キャッシュ + folderFilesCache を無効化。
+  //    ファイル一覧は変わらないため invalidateFileList は呼ばない。
+  // ② onDidCreate / onDidDelete（ファイル構造変更）: 全キャッシュ + fileList 系を無効化。
   //    デバウンスタイマーを分離することで、両イベントが混在しても確実に動作する。
   // SEC-05 修正: ウォッチャーグロブ '**' は node_modules / build 等を含む。
   //   VS Code の createFileSystemWatcher は exclude パターンをサポートしないため、
@@ -305,9 +315,9 @@ export function activate(context: vscode.ExtensionContext): void {
     _contentTimer = setTimeout(() => {
       const paths = [..._contentPending];
       _contentPending.clear();
-      if (paths.length >= 5) invalidateCache();
-      else paths.forEach(fp => invalidateCache(fp));
-      // folderFilesCache は変更しない（ファイル一覧は不変）
+      if (paths.length >= 5) cache.invalidateAll();
+      else paths.forEach(fp => cache.invalidateFile(fp));
+
     }, 300);
   };
 
@@ -320,9 +330,11 @@ export function activate(context: vscode.ExtensionContext): void {
     _structTimer = setTimeout(() => {
       const paths = [..._structPending];
       _structPending.clear();
-      if (paths.length >= 5) invalidateCache();
-      else paths.forEach(fp => invalidateCache(fp));
-      folderFilesCache.clear(); // C: ファイル構造変更時のみクリア
+      if (paths.length >= 5) cache.invalidateAll();
+      else {
+        paths.forEach(fp => cache.invalidateFile(fp));
+        cache.invalidateFileList(); // 構造変更時のみ fileList 系もクリア
+      }
     }, 300);
   };
   context.subscriptions.push(
@@ -376,13 +388,13 @@ export function activate(context: vscode.ExtensionContext): void {
       const activeEditor = vscode.window.activeTextEditor;
       // BUG-08 修正: 非 C/C++ ファイルを開いていると warmup が無意味になる（LSP は無関係なシンボルを取得）。
       const warmupDone = (activeEditor && hasCppSourceExtension(activeEditor.document.uri))
-        ? warmupCache(activeEditor.document, backend) : Promise.resolve();
+        ? warmupCache(activeEditor.document, backend).catch(() => {}) : Promise.resolve();
       const mode = await pickOutputMode();
       if (!mode) { await warmupDone; return; }
       await warmupDone;
 
       await buildAndOutput(mode, `${foundUris.length} files`, context.extensionUri,
-        (prog, tok) => buildWorkspaceCallGraph(foundUris, prog, backend, tok));
+        (prog, tok) => buildWorkspaceCallGraph(foundUris, backend, prog, tok));
     })
   );
 
@@ -399,7 +411,9 @@ export function activate(context: vscode.ExtensionContext): void {
         // editor/context（エディタ右クリック）: ファイル URI が渡されるため親ディレクトリを使う
         try {
           const stat = await vscode.workspace.fs.stat(uri);
-          folderUri = stat.type === vscode.FileType.Directory
+          // Bug-6 同様、FileType はビットフラグ。シンボリックリンクのディレクトリは
+          // FileType.SymbolicLink(64)|Directory(2)=66 となるため厳密等価では判定できない。
+          folderUri = (stat.type & vscode.FileType.Directory)
             ? uri
             : vscode.Uri.file(path.dirname(uri.fsPath));
         } catch {
@@ -454,14 +468,14 @@ export function activate(context: vscode.ExtensionContext): void {
       const activeEditorF = vscode.window.activeTextEditor;
       // BUG-08 修正: 非 C/C++ ファイルを開いていると warmup が無意味になる。
       const warmupDoneF = (activeEditorF && hasCppSourceExtension(activeEditorF.document.uri))
-        ? warmupCache(activeEditorF.document, backend) : Promise.resolve();
+        ? warmupCache(activeEditorF.document, backend).catch(() => {}) : Promise.resolve();
       const mode = await pickOutputMode();
       if (!mode) { await warmupDoneF; return; }
       await warmupDoneF;
 
       const folderName = path.basename(folderUri.fsPath);
       await buildAndOutput(mode, folderName, context.extensionUri,
-        (prog, tok) => buildWorkspaceCallGraph(foundUris, prog, backend, tok));
+        (prog, tok) => buildWorkspaceCallGraph(foundUris, backend, prog, tok));
     })
   );
 
@@ -476,13 +490,13 @@ export function activate(context: vscode.ExtensionContext): void {
       const backend = await pickBackend();
       if (!backend) return;
       // B: バックエンド確定直後に初期化を先行起動。pickOutputMode 待ちの間に走る。
-      const warmupDone = warmupCache(editor.document, backend);
+      const warmupDone = warmupCache(editor.document, backend).catch(() => {});
       const mode = await pickOutputMode();
       if (!mode) { await warmupDone; return; } // キャンセル時も Promise を settle させる
       await warmupDone; // すでに完了していれば即座に返る
 
       await buildAndOutput(mode, editor.document.fileName, context.extensionUri,
-        (prog, tok) => buildFileCallGraph(editor.document, prog, backend, tok));
+        (prog, tok) => buildFileCallGraph(editor.document, backend, prog, tok));
     })
   );
 
@@ -497,7 +511,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const backend = await pickBackend();
       if (!backend) return;
       // B: バックエンド確定直後に初期化を先行起動
-      const warmupDone = warmupCache(editor.document, backend);
+      const warmupDone = warmupCache(editor.document, backend).catch(() => {});
       const mode = await pickOutputMode();
       if (!mode) { await warmupDone; return; }
       await warmupDone;
@@ -507,7 +521,7 @@ export function activate(context: vscode.ExtensionContext): void {
         //   旧実装は Number.MAX_SAFE_INTEGER をハードコードしており設定が無視されていた。
         (prog, tok) => {
           const maxHops = vscode.workspace.getConfiguration('callmap').get<number>('maxHops', 4);
-          return buildFunctionCallGraph(editor.document, editor.selection.active, maxHops, prog, backend, tok);
+          return buildFunctionCallGraph(editor.document, editor.selection.active, maxHops, backend, prog, tok);
         });
     })
   );
@@ -526,7 +540,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const backend = await pickBackend();
       if (!backend) return;
       // バックエンド選択後に warmup を先行起動（pickOutputMode 待ちの間に DB 更新が走る）
-      const warmupDone = warmupCache(editor.document, backend);
+      const warmupDone = warmupCache(editor.document, backend).catch(() => {});
       const mode = await pickOutputMode();
       if (!mode) { await warmupDone; return; }
       await warmupDone;
@@ -535,7 +549,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const maxHops = vscode.workspace.getConfiguration('callmap').get<number>('maxHops', 4);
       await buildAndOutput(mode, editor.document.fileName, context.extensionUri,
         (prog, tok) => buildPathThroughCallGraph(
-          editor.document, editor.selection.active, maxHops, prog, backend, tok));
+          editor.document, editor.selection.active, maxHops, backend, prog, tok));
     })
   );
 }
@@ -545,4 +559,5 @@ export function activate(context: vscode.ExtensionContext): void {
 //   deactivate() で手動 dispose する必要がある。
 export function deactivate(): void {
   CallGraphPanel.currentPanel?.dispose();
+  cache.invalidateAll();
 }
