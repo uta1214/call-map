@@ -1,9 +1,8 @@
 /**
- * cacheManager.ts  ─  キャッシュ一元管理 (Phase 1)
+ * cacheManager.ts  ─  キャッシュ一元管理
  *
- * callGraphBuilder.ts / extension.ts に散在していた 10 個のキャッシュ変数を
- * 1 クラスに集約する。invalidateFile / invalidateAll の 2 本だけで
- * 全キャッシュの無効化を行う。
+ * グラフ結果・gtags タグ・ファイル URI 等のキャッシュを 1 クラスに集約する。
+ * invalidateFile / invalidateAll の 2 メソッドで全キャッシュの無効化を行う。
  *
  * キャッシュキーのセパレータは \x00 (NUL) に統一する。
  * NUL はファイルパス・C/C++ 関数名のいずれにも含まれないため安全。
@@ -193,9 +192,7 @@ export class CacheManager {
   // ── folderFilesCache (extension.ts から移動) ─────────────────────────
   private readonly _folderFiles = new Map<string, FolderFilesEntry>();
 
-  // QUALITY-2 修正: TTL チェックを CacheManager 内部に閉じ込め、
-  // 他のキャッシュ API と一貫した設計にする。
-  // 旧 getFolderFilesEntry（生エントリ返し + 呼び出し元で TTL チェック）は廃止。
+  // TTL チェックは内部で行い、呼び出し元には uris のみ返す。
   getFolderFiles(key: string): vscode.Uri[] | undefined {
     const e = this._folderFiles.get(key);
     if (!e) return undefined;

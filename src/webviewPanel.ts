@@ -1,22 +1,5 @@
 /**
- * webviewPanel.ts
- *
- * 【変更点 (main ← gtags マージ)】
- *  - buildGraphMsg: labelFull をソースパネル用に維持し label をノード表示に使用
- *  - HTML 凡例の色変更: selected #00b894 → #97c2fc、caller #0984e3 → #00b894
- *  - HTML の引数表示トグル (sig-toggle) を維持（webview.js 側で showFullSig / getLabel() / applyLabelMode() として実装済み）
- *  - CSS の .ctrl-label クラスを削除してインラインスタイルに統一
- *
- * 【追加修正】
- *  - _pendingMessage (単一) → _pendingMessages: object[] (配列) に変更。
- *    ready 受信前に setLoading() → updateGraph() の順で呼ばれた場合に
- *    loading メッセージが消えてしまう問題を修正。(⑤)
- *  - exportHtmlFile: process.env.HOME → os.homedir() に変更。
- *    Windows で HOME 未定義になる問題を修正。(⑦)
- *  - htmlTemplate: スタンドアロン HTML にも CSP メタタグを付与。(⑧)
- *    WebView 版: nonce ベース CSP (既存通り)
- *    スタンドアロン版: script-src 'unsafe-inline' の CSP を追加
- *  - deactivate() で dispose できるよう currentPanel を外部から参照可能にする。(⑨)
+ * webviewPanel.ts  ─  WebView パネル管理
  */
 
 import * as vscode from 'vscode';
@@ -38,28 +21,23 @@ import { GraphData, MAX_SOURCE_LINES } from './types';
  * path.resolve で絶対パスに変換した上で比較することで
  * ディレクトリトラバーサルを確実に防ぐ。
  *
- * 🔒 ⑤ セキュリティ修正: シンボリックリンクパストラバーサル対策
+ * シンボリックリンクパストラバーサル対策:
  *   path.resolve はシンボリックリンクを解決しないため、
  *   ワークスペース内のシンボリックリンク → ワークスペース外ファイル という経路が
- *   isPathInWorkspace のチェックを通過し、fs.readFile で実体ファイルを読まれる恐れがあった。
+ *   isPathInWorkspace のチェックを通過し、fs.readFile で実体ファイルを読まれる恐れがある。
  *   fs.realpathSync でシンボリックリンクを解決してから比較する。
- *   ファイルが存在しない場合は try/catch で path.resolve 結果にフォールバックする。
+ *   ファイルが存在しない場合は null を返してアクセスを拒否する。
  *
- * Windows では大文字小文字を統一するため toLowerCase() を適用する。
+ * macOS / Windows では大文字小文字を統一するため toLowerCase() を適用する。
  */
 function resolveAndNormalize(p: string): string | null {
-  const resolved = path.resolve(p); // 相対パスを絶対パスに変換
-  // 🔒 SEC-2 修正: realpathSync 失敗時のフォールバックポリシーを
-  //   gtagsBackend.ts の sanitizeToWsRoot と統一し、null を返してアクセス拒否する。
-  //   ファイルが削除直後などの短時間でも意図しないパスへのアクセスを防ぐ。
+  const resolved = path.resolve(p);
   let real: string;
   try {
     real = fs.realpathSync(resolved);
   } catch {
     return null;
   }
-  // macOS の HFS+/APFS は Case-Insensitive のため
-  //   win32 と同様に toLowerCase() を適用してパス比較のズレを防ぐ。
   return (process.platform === 'win32' || process.platform === 'darwin')
     ? real.toLowerCase() : real;
 }
@@ -67,11 +45,9 @@ function resolveAndNormalize(p: string): string | null {
 /**
  * filePath がワークスペースルートのいずれかの配下にあるか検証する。
  *
- * Security① 修正:
- *   旧実装は wsRoots が空（単一ファイル編集モード）のとき無条件で true を返していたため、
- *   WebView から任意のパス（/etc/passwd 等）を要求できる脆弱性があった。
- *   allowedFiles（現グラフに含まれるファイルのみ）を第三引数で受け取り、
- *   wsRoots が空の場合はそちらにフォールバックする。
+ * wsRoots が空（単一ファイル編集モード）のときは allowedFiles（現グラフに含まれるファイル）
+ * にフォールバックする。wsRoots が空のときに無条件で true を返すと、
+ * WebView から任意のパス（/etc/passwd 等）を要求できる脆弱性になる。
  */
 function isPathInWorkspace(
   filePath:     string,
@@ -79,7 +55,6 @@ function isPathInWorkspace(
   allowedFiles: ReadonlySet<string>
 ): boolean {
   const fileResolved = resolveAndNormalize(filePath);
-  // SEC-2 修正: realpathSync 失敗時（ファイル不存在等）は null が返るためアクセス拒否。
   if (fileResolved === null) return false;
   // ワークスペースが開いている場合: フォルダ配下かどうかで判断
   if (wsRoots.length > 0) {
@@ -91,8 +66,7 @@ function isPathInWorkspace(
         || fileResolved.startsWith(rResolved + '/');
     });
   }
-  // ワークスペースなし（単一ファイル編集モード）:
-  // グラフに含まれるファイルのみ許可する（Security① 修正）
+  // ワークスペースなし（単一ファイル編集モード）: グラフに含まれるファイルのみ許可
   if (allowedFiles.size > 0) {
     return allowedFiles.has(fileResolved);
   }
@@ -118,8 +92,7 @@ function generateFileColors(files: string[]): Record<string, { background: strin
     if (i < FILE_COLORS_BASE.length) {
       map[f] = FILE_COLORS_BASE[i];
     } else {
-      // 🐛 ① 修正: i * 360 / files.length だと色相が前半に偏る。
-      //   プリセット以降を 0 から数え直し、extra 個を色相環で均等配置する。
+      // プリセット以降を 0 から数え直し、extra 個を色相環で均等配置する
       const hue = Math.round(((i - FILE_COLORS_BASE.length) * 360 / Math.max(1, extra)) % 360);
       map[f] = {
         background: `hsl(${hue},65%,80%)`,
@@ -131,9 +104,9 @@ function generateFileColors(files: string[]): Record<string, { background: strin
 }
 
 /**
- * ④ Security 追加: vis-network の title プロパティ用 HTML エスケープ。
+ * vis-network の title プロパティ用 HTML エスケープ。
  * vis-network v9 は string 型の title を innerHTML で挿入するため、
- * プロジェクト側が制御するファイル名などに HTML メタ文字が含まれると XSS になる。
+ * ファイル名などに HTML メタ文字が含まれると XSS になる。
  * &, <, >, ", ' の5文字を安全な HTML エンティティに変換する。
  * 改行は <br> に変換し、ツールチップの表示を維持する。
  */
@@ -159,12 +132,10 @@ function buildGraphMsg(data: GraphData): object {
       labelFull:     n.labelFull,
       file:          n.file,
       line:          n.line,
-      scopeEnd:      n.scopeEnd,   // ⑥ lazy source 用 (source は送らない)
+      scopeEnd:      n.scopeEnd,   // lazy source 読み込み用（通常は source を送らない）
       isCurrentFile: n.isCurrentFile,
       color:  colorMap[n.file] ?? FILE_COLORS_BASE[FILE_COLORS_BASE.length - 1],
-      // ④ Security 修正: vis-network v9 は title プロパティを HTML としてレンダリングする。
-      // ファイル名に <img onerror=...> 等の文字列が含まれると WebView 内でスクリプトが実行される恐れがある。
-      // escapeHtmlForTitle でメタ文字をエスケープして XSS を防ぐ。
+      // vis-network v9 は title を innerHTML でレンダリングするため XSS 対策が必要
       title:  escapeHtmlForTitle(`${n.label}\n${path.basename(n.file)} : line ${n.line}`),
     })),
     edges: data.edges, fileLegend,
@@ -178,15 +149,14 @@ function buildGraphMsg(data: GraphData): object {
 
 // vis-network.min.js / webview.js のインメモリキャッシュ。
 // HTML エクスポートのたびに約 1MB の vis-network.min.js を readFile するのを避ける。
-// NEW-4 修正: Promise シングルトンパターンで並行呼び出し時の二重読み込みも防ぐ。
+// Promise シングルトンパターンで並行呼び出し時の二重読み込みも防ぐ。
 // 拡張機能のバージョンアップ時はプロセス再起動されるためキャッシュは常に有効。
 let _filesCachePromise: Promise<[string, string]> | undefined;
 
 async function generateStandaloneHtml(extensionUri: vscode.Uri, data: GraphData): Promise<string> {
   const distDir   = vscode.Uri.joinPath(extensionUri, 'dist').fsPath;
-  // NEW-4: if チェックと await の間に別呼び出しが入っても Promise を再利用するため二重読み込みしない
-  // Bug-7 修正: readFile が失敗した場合 reject 済みの Promise が永続保持され、
-  // 以降の exportHtml 呼び出しが全て失敗し続ける。catch でキャッシュをクリアして再試行可能にする。
+  // if チェックと await の間に別呼び出しが入っても Promise を再利用するため二重読み込みしない。
+  // readFile が失敗した場合は catch でキャッシュをクリアして次回再試行を可能にする。
   if (!_filesCachePromise) {
     _filesCachePromise = Promise.all([
       fs.promises.readFile(path.join(distDir, 'vis-network.min.js'), 'utf-8'),
@@ -199,20 +169,17 @@ async function generateStandaloneHtml(extensionUri: vscode.Uri, data: GraphData)
   const [visJs, webviewJs] = await _filesCachePromise;
   const graphMsg  = buildGraphMsg(data);
 
-  // ★ セキュリティ: JSON.stringify は </script> をエスケープしないため
-  //   ソースコード中に </script> が含まれると HTML が破壊される (XSS)。
-  //   Unicodeエスケープで < と > を無害化する。
-  // U+2028 (LINE SEPARATOR) / U+2029 (PARAGRAPH SEPARATOR) も
-  //   一部パーサーで改行扱いされてスクリプトが破壊されるためエスケープする。
+  // JSON.stringify は </script> をエスケープしないためソースコード中に含まれると HTML が破壊される。
+  // Unicodeエスケープで < と > を無害化する。
+  // U+2028 / U+2029 も一部パーサーで改行扱いされるためエスケープする。
   const safeJson = JSON.stringify(graphMsg)
     .replace(/</g,      '\\u003c')
     .replace(/>/g,      '\\u003e')
     .replace(/\u2028/g, '\\u2028')
     .replace(/\u2029/g, '\\u2029');
 
-  // ★ ④: visJs / webviewJs をインラインで埋め込む際に </script> が含まれると
-  //   ブラウザの HTML パーサーがスクリプトブロックを早期終端してしまう。
-  //   </script → <\/script に変換して安全に埋め込む。
+  // visJs / webviewJs をインラインで埋め込む際に </script> が含まれると
+  // ブラウザの HTML パーサーがスクリプトブロックを早期終端してしまうため変換する。
   const escapeScript = (s: string): string => s.replace(/<\/script/gi, '<\\/script');
 
   return htmlTemplate({ kind: 'standalone' }, [
@@ -233,13 +200,11 @@ export class CallGraphPanel {
   private readonly _extensionUri: vscode.Uri;
   private readonly _disposables:  vscode.Disposable[] = [];
   private _isReady          = false;
-  // ★ ⑤: 単一メッセージ保留 → キュー方式に変更。
-  //   setLoading() → updateGraph() の順で ready 前に呼ばれても
-  //   両メッセージが順番通りに届くようにする。
+  // ready 受信前に複数メッセージが積まれても順番通りに届くようキュー方式にする
   private _pendingMessages: object[] = [];
   private _lastGraphData:  GraphData | null = null;
-  // Security①: グラフに含まれるファイルパス（正規化済み）のセット。
-  //   wsRoots が空の単一ファイル編集モードでのアクセス制限に使用する。
+  // wsRoots が空の単一ファイル編集モードでのアクセス制限用に
+  // グラフに含まれるファイルパス（正規化済み）のセットを保持する
   private _allowedFiles: Set<string> = new Set();
 
   private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri) {
@@ -251,7 +216,6 @@ export class CallGraphPanel {
         switch (msg.type) {
           case 'ready':
             this._isReady = true;
-            // ★ ⑤: キューに溜まったメッセージを順番に送信
             for (const pending of this._pendingMessages) {
               this._panel.webview.postMessage(pending);
             }
@@ -261,26 +225,22 @@ export class CallGraphPanel {
             if (msg.file && msg.line !== undefined) await this._openFileAtLine(msg.file, msg.line);
             break;
           case 'requestSource': {
-            // ⑥ ソース遅延読み込み: ノードクリック時にファイルを読んで返す
+            // ソース遅延読み込み: ノードクリック時にファイルを読んで返す
             // msg の宣言型に nodeId が含まれないため unknown 経由でキャストする
             const req = msg as unknown as { nodeId: string; file: string; line: number; scopeEnd?: number };
             const { nodeId, file, line, scopeEnd } = req;
-            // Bug① 修正: !line は line===0 でも true になるため line !== undefined に変更
             if (!file || line === undefined) break;
-            // Sec-4 修正: WebView 由来の nodeId は型・長さを検証する
+            // WebView 由来の nodeId は型・長さを検証する
             if (!nodeId || typeof nodeId !== 'string' || nodeId.length > 1000) break;
-            // Security①: resolveAndNormalize + isPathInWorkspace (allowedFiles フォールバック付き)
             const wsRoots = vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? [];
             if (!isPathInWorkspace(file, wsRoots, this._allowedFiles)) break;
-            // TOCTOU 対策。
-            // isPathInWorkspace は realpathSync でシンボリックリンクを解決して検証するが、
-            // その後 path.resolve (symlink未解決) でファイルを読むと TOCTOU になる。
-            // realpath を再度取得して「チェックしたパス = 読み取るパス」を一致させる。
+            // TOCTOU 対策: isPathInWorkspace のチェック後に realpath を再取得して
+            // 「チェックしたパス = 読み取るパス」を一致させる
             let resolvedFile: string;
             try {
               resolvedFile = await fs.promises.realpath(path.resolve(file));
             } catch {
-              break; // ファイルが存在しない or 解決不能
+              break;
             }
             // 解決済みパスで再チェック（シンボリックリンクが変更された場合の二重確認）
             if (!isPathInWorkspace(resolvedFile, wsRoots, this._allowedFiles)) break;
@@ -288,10 +248,7 @@ export class CallGraphPanel {
               const content = await fs.promises.readFile(resolvedFile, 'utf-8');
               const lines   = content.split('\n');
               const startIdx = Math.max(0, line - 1);
-              // Bug③ 修正: 120 (ハードコード) → MAX_SOURCE_LINES に統一
-              //   callGraphBuilder.ts の scopeEnd 計算 (start + MAX_SOURCE_LINES - 1) と一致させる
-              // Sec-2 修正: WebView 由来の scopeEnd が NaN/Infinity の場合 Math.min が NaN を返し
-              //   lines.slice が空になるため、有限な正の整数のみ受け入れる。
+              // WebView 由来の scopeEnd が NaN/Infinity の場合に備えて有限な正の整数のみ受け入れる
               const safeScopeEnd = (typeof scopeEnd === 'number' && isFinite(scopeEnd) && scopeEnd > 0)
                 ? scopeEnd : undefined;
               const endIdx   = safeScopeEnd !== undefined
@@ -336,8 +293,6 @@ export class CallGraphPanel {
   public updateGraph(data: GraphData): void {
     this._lastGraphData = data;
     this._panel.title   = `Call Map — ${data.fileName}`;
-    // Security①: グラフに含まれるファイルを許可リストとして更新
-    // SEC-2 修正: resolveAndNormalize が null を返す（ファイル不存在）場合は除外する。
     this._allowedFiles = new Set(
       data.nodes.map(n => resolveAndNormalize(n.file)).filter((p): p is string => p !== null)
     );
@@ -351,16 +306,14 @@ export class CallGraphPanel {
 
   public static async exportHtmlFile(extensionUri: vscode.Uri, data: GraphData): Promise<void> {
     const wsRoot    = vscode.workspace.workspaceFolders?.[0]?.uri;
-    // ファイル名サニタイズを改善。
-    // 旧実装: /[^\w.-]/g → _ で括弧・矢印・スペースを全てアンダースコアにして冗長な名前になっていた。
-    // 新実装: FS 危険文字のみ除去し、空白は _ に、連続 _ は畳む。最大 80 文字。
+    // FS 危険文字のみ除去し、空白は _ に、連続 _ は畳む。最大 80 文字。
     const safeName = data.fileName
       .replace(/[/\\:*?"<>|]/g, '')
       .replace(/\s+/g, '_')
       .replace(/_+/g,  '_')
       .replace(/^[._]+|[._]+$/g, '')
       .slice(0, 80) || 'graph';
-    // ★ ⑦: process.env.HOME → os.homedir() に変更 (Windows 対応)
+    // ワークスペースがない場合は os.homedir() を使用（Windows で HOME 未定義になる問題に対応）
     const defaultUri = wsRoot
       ? vscode.Uri.joinPath(wsRoot, `callgraph_${safeName}.html`)
       : vscode.Uri.file(path.join(os.homedir(), `callgraph_${safeName}.html`));
@@ -391,20 +344,17 @@ export class CallGraphPanel {
 
   private _postOrQueue(msg: object): void {
     if (this._isReady) this._panel.webview.postMessage(msg);
-    // ★ ⑤: push で追加 (上書きしない)
     else this._pendingMessages.push(msg);
   }
 
   private async _openFileAtLine(filePath: string, line: number): Promise<void> {
-    // Security①: isPathInWorkspace に _allowedFiles を渡し、
-    //   単一ファイル編集モードでもグラフ外のファイルを開けないようにする。
     const wsRoots = (vscode.workspace.workspaceFolders ?? []).map(f => f.uri.fsPath);
     if (!isPathInWorkspace(filePath, wsRoots, this._allowedFiles)) {
       vscode.window.showErrorMessage(
         `Call Map: Cannot open file outside workspace:\n${filePath}`);
       return;
     }
-    // 検証済みの実パスで URI を生成する（SEC-09: TOCTOU 対策、SEC-01 と同様の方針）
+    // TOCTOU 対策: 検証済みの実パスで URI を生成する
     let resolvedPath: string;
     try {
       resolvedPath = await fs.promises.realpath(path.resolve(filePath));
@@ -412,7 +362,7 @@ export class CallGraphPanel {
       vscode.window.showErrorMessage(`Could not open file: ${filePath}`);
       return;
     }
-    // 解決後のパスで再チェック
+    // 解決後のパスで再チェック（シンボリックリンクが変更された場合の二重確認）
     if (!isPathInWorkspace(resolvedPath, wsRoots, this._allowedFiles)) {
       vscode.window.showErrorMessage(
         `Call Map: Cannot open file outside workspace:\n${resolvedPath}`);
@@ -435,7 +385,6 @@ export class CallGraphPanel {
     const visUri     = webview.asWebviewUri(vscode.Uri.joinPath(distDir, 'vis-network.min.js'));
     const webviewUri = webview.asWebviewUri(vscode.Uri.joinPath(distDir, 'webview.js'));
 
-    // ★ ⑥: 型安全な mode オブジェクトを渡す
     return htmlTemplate(
       { kind: 'webview', nonce, cspSource: webview.cspSource },
       `<script nonce="${nonce}" src="${visUri}"></script>\n<script nonce="${nonce}" src="${webviewUri}"></script>`
@@ -448,8 +397,8 @@ export class CallGraphPanel {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * ★ ⑥: モード判定を文字列比較から判別可能な共用体型に変更。
- *   nonce が空文字列だった場合に誤って standalone 扱いになるバグを型レベルで排除する。
+ * webview / standalone の判別を共用体型で行う。
+ * nonce が空文字列のときに誤って standalone 扱いになるバグを型レベルで排除する。
  */
 type HtmlTemplateMode =
   | { kind: 'webview';    nonce: string; cspSource: string }

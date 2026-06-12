@@ -35,8 +35,6 @@ const EXCLUDE_GLOB      = '{**/node_modules/**,**/.git/**,**/build/**,**/dist/**
 const GTAGS_UPDATE_TTL  = 5 * 60_000;  // ms
 const GLOBAL_RX_PARALLEL = Math.max(4, Math.min(os.cpus().length * 2, 32));
 const WORKSPACE_FILES_KEY = '__workspace__';
-// QUALITY-3 修正: ファイルスコープ CONCURRENT = 4 は prefetchFileLines で未使用だったため削除。
-// collectGtags フォールバック内のローカル変数は perFileConcurrent にリネーム（シャドーイング解消）。
 
 /** promisify した execFile。全 global / gtags 呼び出しで共用する。 */
 const execFileAsync = promisify(execFile);
@@ -77,12 +75,8 @@ export async function findFilesCached(): Promise<vscode.Uri[]> {
 }
 
 /**
- * パフォーマンス改善①: collectGtags の結果を TAGS_CACHE_TTL_MS キャッシュする。
- *
- * 【Before】毎回 global -x -e '.' を実行 → 大規模プロジェクトで数十秒
- * 【After】 2回目以降はキャッシュから即座に返す → ほぼ 0ms
- *
- * lineCache は毎回空で返す (ファイル内容はビルド関数側で都度読む)。
+ * collectGtags の結果を TAGS_CACHE_TTL_MS キャッシュする。
+ * キャッシュヒット時は lineCache を空で返す（オンデマンド読み込み用）。
  * タグマップ自体は読み取り専用で参照するため共有しても安全。
  */
 export async function collectGtagsCached(wsRoot: string): Promise<{
@@ -101,10 +95,9 @@ export async function collectGtagsCached(wsRoot: string): Promise<{
     };
   }
   const allUris  = await findFilesCached();
-  // BUG-2 修正: findFilesCached() は全ワークスペースのファイルを返す。
-  // collectGtags のフォールバックパス（global -x 失敗時の per-file global -f）は
-  // cwd: wsRoot で実行するため、別ルートの絶対パスを渡すと相対化に失敗して空結果になる。
-  // wsRoot 配下のファイルのみに絞り込んでから渡す。
+  // findFilesCached() は全ワークスペースのファイルを返すため、
+  // cwd: wsRoot で実行する collectGtags のフォールバックパスに渡す前に
+  // wsRoot 配下のファイルのみに絞り込む。
   const wsRootNorm = normalizeFsPath(wsRoot);
   const wsUris     = allUris.filter(u => {
     const n = normalizeFsPath(u.fsPath);
@@ -127,9 +120,8 @@ export async function collectGtagsCached(wsRoot: string): Promise<{
 
 /**
  * Python 版 is_function_def と同等のヒューリスティック。
- *
- * 【Precision E 修正】純粋仮想・deleted・defaulted 関数宣言を除外。
- *   = 0, = delete, = default で終わる行は定義ではなく宣言のため false を返す。
+ * 純粋仮想・deleted・defaulted 関数宣言を除外する。
+ * = 0, = delete, = default で終わる行は定義ではなく宣言のため false を返す。
  */
 
 /**
@@ -154,16 +146,11 @@ function spawnErrorMessage(cmd: string, err: unknown): string {
 /**
  * GTAGS が存在しなければ gtags を実行して DB 構築。
  * 存在する場合は global -u でインクリメンタル更新する。
- *
- * 【Bug C】GTAGS が存在すれば常にスキップしていた問題を修正。
- * 【BugFix F】global -u 失敗時は例外を飲み込んで古いタグで続行。
- * 【⑤】GTAGS_UPDATE_TTL 以内の再実行は global -u をスキップ。
- *   コマンドを連続実行するたびに毎回 global -u が走っていた問題を解消。
- *
- * 戻り値: 警告メッセージ (問題なければ undefined)。呼び出し元が errs に追加する。
+ * GTAGS_UPDATE_TTL 以内の再実行は global -u をスキップして連続実行のオーバーヘッドを抑制する。
+ * 戻り値: 警告メッセージ（問題なければ undefined）。呼び出し元が errs に追加する。
  */
 async function ensureGtagsDb(wsRoot: string): Promise<string | undefined> {
-  // Sec-3 修正: wsRoot が空文字列や相対パスの場合、意図しないディレクトリで
+  // wsRoot が空文字列や相対パスの場合、意図しないディレクトリで
   // gtags が実行されるリスクがあるため早期リターンする。
   if (!wsRoot || !path.isAbsolute(wsRoot)) {
     return '[gtags] Internal error: wsRoot is not an absolute path.';
@@ -171,7 +158,7 @@ async function ensureGtagsDb(wsRoot: string): Promise<string | undefined> {
   const now = Date.now();
   if (fs.existsSync(path.join(wsRoot, 'GTAGS'))) {
     const last = cache.getGtagsUpdateTs(wsRoot);
-    if (now - last < GTAGS_UPDATE_TTL) return undefined; // ⑤ TTL 内はスキップ
+    if (now - last < GTAGS_UPDATE_TTL) return undefined; // TTL 内はスキップ
     try {
       await execFileAsync('global', ['-u'], { cwd: wsRoot, timeout: 120_000 });
       cache.setGtagsUpdateTs(wsRoot, now);
@@ -195,10 +182,9 @@ async function ensureGtagsDb(wsRoot: string): Promise<string | undefined> {
 }
 
 /**
- * BUG-5 修正: GNU GLOBAL のバージョン互換を考慮した gtags 実行ヘルパー。
- * --accept-dotfiles は 6.5 以降のオプション。Ubuntu 20.04 の標準パッケージ (6.3 系) など
- * 旧バージョンでは "unrecognized option" で終了コード 1 になるため、
- * 失敗した場合はオプションなしで再試行する。
+ * GNU GLOBAL のバージョン互換を考慮した gtags 実行ヘルパー。
+ * --accept-dotfiles は 6.5 以降のオプション。旧バージョンでは
+ * "unrecognized option" で終了するため、失敗した場合はオプションなしで再試行する。
  */
 async function runGtagsWithDotfilesCompat(wsRoot: string): Promise<void> {
   try {
@@ -216,24 +202,20 @@ async function runGtagsWithDotfilesCompat(wsRoot: string): Promise<void> {
 
 /**
  * GTAGS 出力パスの path traversal を防ぐ。
+ * GTAGS が改ざんされていた場合に ../../etc/passwd などの
+ * ワークスペース外ファイルへのアクセスを防止する。
  * wsRoot 外のパスは null を返す。
- *
- * 【Security H】GTAGS が改ざんされていた場合に ../../etc/passwd などの
- *   ワークスペース外ファイルを read-only アクセスされる問題を防止。
  */
 function sanitizeToWsRoot(rawPath: string, wsRoot: string): string | null {
   const fp          = path.isAbsolute(rawPath) ? rawPath : path.resolve(wsRoot, rawPath);
-  // Bug③ 修正: 一次チェックも normalizeFsPath で大文字小文字を統一する。
-  // Windows (大文字小文字無視 FS) でパスが混在しても正しく判定できるようにする。
+  // 一次チェック: normalizeFsPath で大文字小文字を統一してプレフィックス検証
   const fpNorm      = normalizeFsPath(fp);
   const wsRootNorm  = normalizeFsPath(wsRoot);
   const wsRootSlash = wsRootNorm.endsWith(path.sep) ? wsRootNorm : wsRootNorm + path.sep;
-  // 一次チェック: 正規化済みパス文字列によるプレフィックス検証
   if (!(fpNorm.startsWith(wsRootSlash) || fpNorm === wsRootNorm)) return null;
-  // 二次チェック (Security②): シンボリックリンクを解決して実パスで再検証。
+  // 二次チェック: シンボリックリンクを解決して実パスで再検証。
   // ワークスペース内のシンボリックリンク → ワークスペース外ファイル のトラバーサルを防ぐ。
   try {
-    // H: realpathSync 結果をキャッシュ。wsRoot は不変、fp も繰り返し出現するため効果大。
     const realFp = cache.getRealpath(fp) ?? (() => {
       const r = fs.realpathSync(fp); cache.setRealpath(fp, r); return r;
     })();
@@ -245,18 +227,15 @@ function sanitizeToWsRoot(rawPath: string, wsRoot: string): string | null {
     const realSlash    = realRootNorm.endsWith(path.sep) ? realRootNorm : realRootNorm + path.sep;
     if (!(realFpNorm.startsWith(realSlash) || realFpNorm === realRootNorm)) return null;
   } catch {
-    // ファイルが存在しない / 解決不能な場合は安全のため除外
     return null;
   }
   return fp;
 }
 
 /**
- * BUG-4 修正: マルチルートワークスペース対応の sanitize ヘルパー。
- * LSP バックエンドでは全ワークスペースフォルダが callee 対象になるが、
- * gtags バックエンドは単一 wsRoot のみ対象だった非対称を修正する。
+ * マルチルートワークスペース対応の sanitize ヘルパー。
  * wsRoots の中の任意のルートに含まれるパスを受け入れる。
- * wsRoots が空の場合は単一 wsRoot にフォールバックする。
+ * wsRoots が空の場合は null を返す。
  */
 function sanitizeToAnyWsRoot(rawPath: string, wsRoots: string[]): string | null {
   for (const root of wsRoots) {
@@ -296,17 +275,14 @@ async function runGlobalF(
 /** ファイルを行配列で読み込み、キャッシュする（同期版・キャッシュヒット専用） */
 function readFileLinesCached(filePath: string, cache: Map<string, string[]>): string[] {
   if (cache.has(filePath)) return cache.get(filePath)!;
-  // ⑤ Performance 修正: 同期I/Oは廃止し空配列を返す。
   // 呼び出し元は事前に prefetchFileLines / getFileLinesAsync でキャッシュを温めること。
-  // フォールバックとして同期読み込みを残すと大規模プロジェクトでホストをブロックするため削除。
-  // キャッシュすると同一ビルド内でそのファイルの呼び出し関係が欠落し続ける。
+  // フォールバックの同期読み込みは大規模プロジェクトでホストをブロックするため行わない。
   return [];
 }
 
 /**
- * ⑤ Performance 追加: 非同期ファイル行読み込み。
+ * 非同期ファイル行読み込み。
  * キャッシュヒット時は即座に返し、ミス時のみ fs.promises.readFile で非同期読み込みする。
- * BFS ループ・buildScopeForFileCached など async コンテキストで使用する。
  */
 async function getFileLinesAsync(filePath: string, cache: Map<string, string[]>): Promise<string[]> {
   if (cache.has(filePath)) return cache.get(filePath)!;
@@ -316,15 +292,13 @@ async function getFileLinesAsync(filePath: string, cache: Map<string, string[]>)
     cache.set(filePath, lines);
     return lines;
   } catch {
-    // キャッシュすると lazyTagCache 経由でモジュールレベルに残り、TTL 内ずっとそのファイルが
-    // グラフから消える。エラー時はキャッシュせず空配列だけ返す。
+    // エラー時はキャッシュせず空配列を返す（キャッシュすると TTL 内ずっとそのファイルが消える）
     return [];
   }
 }
 
 /**
- * ⑤ Performance 追加: 必要なファイルを事前に並列プリフェッチしてキャッシュを温める。
- * collectGtags のフォールバックパスなど「直後に同期読みが走る」箇所で呼ぶ。
+ * 必要なファイルを事前に並列プリフェッチしてキャッシュを温める。
  */
 async function prefetchFileLines(files: readonly string[], cache: Map<string, string[]>): Promise<void> {
   const needed = [...new Set(files)].filter(f => !cache.has(f));
@@ -333,15 +307,13 @@ async function prefetchFileLines(files: readonly string[], cache: Map<string, st
 }
 
 /**
- * 【③】`global -x -e '.'` を1回実行してすべての定義タグを一括取得。
- * GNU Global 5.0 以降が必要 (-e で POSIX ERE を有効化)。
+ * `global -x -e '.'` を1回実行してすべての定義タグを一括取得。
+ * GNU Global 5.0 以降が必要（-e で POSIX ERE を有効化）。
  * ソース行は global 出力に含まれるためファイルを読まない。
  * 出力形式: name<ws>line<ws>file<ws>source_line
  *
- * 【maxBuffer について】
- *   SEC-02 修正により 256MB を設定している（旧 High-3 コメントの「50MB」は廃止済み）。
- *   50MB では大規模プロジェクトで RangeError が発生しタグ収集が全滅していた。
- *   256MB を超えるプロジェクトには spawn + readline によるストリーム処理への移行を推奨。
+ * maxBuffer は 256MB を設定。これを超えるプロジェクトには
+ * spawn + readline によるストリーム処理への移行を推奨する。
  */
 async function runGlobalXAll(
   wsRoot: string
@@ -357,8 +329,7 @@ async function runGlobalXAll(
     const [, name, lineStr, fileStr, sourceLine] = m;
     const line = parseInt(lineStr, 10);
     if (isNaN(line)) return [];
-    // Sec-1 修正: GTAGS 改ざん等で name に NodeId/EdgeKey のセパレータが混入した場合、
-    // makeGtagsNodeId / エッジキーのパースが破壊されるためスキップする。
+    // name にセパレータが混入するとパースが破壊されるためスキップする
     if (!name || name.includes('\x00') || name.includes('|||')) return [];
     const file = sanitizeToWsRoot(fileStr, wsRoot);
     if (!file) return [];
@@ -368,20 +339,19 @@ async function runGlobalXAll(
 
 /**
  * タグを収集して Map<name, GtagEntry[]> を返す。
- *
- * 【③】global -x -e '.' による一括取得 (O(1) プロセス起動) を優先。
- *   失敗した場合は per-file global -f にフォールバック (GNU Global < 5.0 対応)。
- * 【⑥】ソース行は global 出力またはオンデマンド読み込みで取得するため
- *   collectGtags 内ではファイルを読まない。lineCache は空で返す。
- * 【Precision ②】全候補を GtagEntry[] として保持。resolveCallee() が callerFile 優先で解決。
+ * global -x -e '.' による一括取得を優先し、失敗した場合は
+ * per-file global -f にフォールバックする（GNU Global < 5.0 対応）。
+ * ソース行は global 出力またはオンデマンド読み込みで取得するため
+ * lineCache は空で返す。全候補を GtagEntry[] として保持し、
+ * resolveCallee() が callerFile 優先で解決する。
  */
 async function collectGtags(
   files: string[],
   wsRoot: string
 ): Promise<{ tags: Map<string, GtagEntry[]>; lineCache: Map<string, string[]>; ambiguousNames: string[] }> {
-  const lineCache = new Map<string, string[]>(); // ⑥ 空で返す (オンデマンド読み込み)
+  const lineCache = new Map<string, string[]>(); // オンデマンド読み込み用（空で返す）
 
-  // ③ 高速パス: global -x -e '.' 一括取得
+  // 高速パス: global -x -e '.' 一括取得
   type RawEntry = { name: string; line: number; file: string; sourceLine: string };
   let rawEntries: RawEntry[];
   try {
@@ -389,7 +359,6 @@ async function collectGtags(
   } catch {
     // フォールバック: per-file global -f
     const perFileResults: Array<{ name: string; line: number; file: string }> = [];
-    // B-2: Math.max(1, ...) を除去。files.length=0 の場合ループは自然に空回りする
     const perFileConcurrent = Math.min(16, files.length);
     for (let i = 0; i < files.length; i += perFileConcurrent) {
       const results = await Promise.all(
@@ -412,9 +381,8 @@ async function collectGtags(
   const tags           = new Map<string, GtagEntry[]>();
   const ambiguousNames: string[] = [];
 
-  // ⑤ Performance 修正: sourceLine が空のエントリのファイルを事前に並列プリフェッチ。
-  // フォールバックパス (per-file global -f) では sourceLine が常に空のため、
-  // ここで非同期プリフェッチしておくことで後続の readFileLinesCached がキャッシュヒットする。
+  // sourceLine が空のエントリ（per-file フォールバック時）のファイルを事前に並列プリフェッチ。
+  // 後続の readFileLinesCached がキャッシュヒットするよう先に読み込んでおく。
   {
     const filesNeedingRead: string[] = [];
     for (const [, candidates] of rawMap) {
@@ -444,19 +412,16 @@ async function collectGtags(
 }
 
 /**
- * タグマップからスコープマップを構築。
- *
- * 【Bug A 修正】isFunc=true のエントリのみでスコープを区切る。
- * 【Bug B 修正】byName: Map<name, ScopeEntry> で O(1) ルックアップ。
- * 【Precision ② 対応】tags が Map<name, GtagEntry[]> になったため全 entry を反復する。
- *   同名関数が複数ファイルにある場合、各 (file, name) ペアが独立したスコープとして登録される。
+ * タグマップからスコープマップを構築する。
+ * isFunc=true のエントリのみでスコープを区切る。
+ * byName で O(1) ルックアップ、同名関数が複数ファイルにある場合も
+ * 各 (file, name) ペアが独立したスコープとして登録される。
  */
 
 function buildGtagsScopeMap(tags: Map<string, GtagEntry[]>): Map<string, ScopeMapEntry> {
   const fileMap = new Map<string, { name: string; line: number }[]>();
   for (const [name, entries] of tags) {
     for (const info of entries) {
-      // ★ Bug A: isFunc=true のエントリのみ対象にする
       if (!info.isFunc) continue;
       if (!fileMap.has(info.file)) fileMap.set(info.file, []);
       fileMap.get(info.file)!.push({ name, line: info.line });
@@ -470,12 +435,11 @@ function buildGtagsScopeMap(tags: Map<string, GtagEntry[]>): Map<string, ScopeMa
       start: e.line,
       end:   i + 1 < entries.length ? entries[i + 1].line - 1 : Number.MAX_SAFE_INTEGER,
     }));
-    // ★ Bug B / Bug④: 同一ファイル内に同名関数が複数ある場合 (例: #ifdef 分岐)、
-    //   後勝ちにならないよう最初のエントリを採用する。
-    //   呼び出し元では可能な限り findScopeAtLine (行番号優先) を使うこと。
+    // 同一ファイル内に同名関数が複数ある場合（#ifdef 分岐等）は先勝ち（行番号が小さい定義を優先）
+    // 呼び出し元では可能な限り findScopeAtLine（行番号優先）を使うこと。
     const byName = new Map<string, ScopeEntry>();
     for (const s of list) {
-      if (!byName.has(s.name)) byName.set(s.name, s); // 先勝ち (= 行番号が小さい定義を優先)
+      if (!byName.has(s.name)) byName.set(s.name, s);
     }
     scopeMap.set(fp, { list, byName });
   }
@@ -484,19 +448,8 @@ function buildGtagsScopeMap(tags: Map<string, GtagEntry[]>): Map<string, ScopeMa
 
 /**
  * ソース行の [start, end] 範囲を走査し、
- * knownTags に含まれる呼び出し先 (自己再帰除外) を返す。
- *
- * 【Precision D 修正】文字列リテラル内の誤検出を除去。
- * 【Feat③】C++11 RAW文字列リテラル `R"delimiter(...)delimiter"` に対応。
- *   行をまたぐ RAW 文字列の状態 (rawDelimiter) を行ループ間で持続させる。
- *
- *   状態遷移の優先順位 (inBlockComment / rawDelimiter を除く):
- *     1. R" → RAW 文字列リテラル (rawDelimiter が設定されるまで)
- *     2. " → 二重引用符文字列 (次の unescaped " まで読み飛ばす)
- *     3. ' → 文字リテラル     (次の unescaped ' まで読み飛ばす)
- *     4. // → 行末コメント
- *     5. /* → ブロックコメント開始 (行をまたいで持続)
- *     6. その他 → processed に追加
+ * knownTags に含まれる呼び出し先（自己再帰除外）を返す。
+ * 文字列リテラル内の誤検出を除去し、C++11 RAW文字列リテラルにも対応する。
  */
 function extractCallsFromLines(
   lines: string[], start: number, end: number,
@@ -505,7 +458,7 @@ function extractCallsFromLines(
   const callees        = new Set<string>();
   const re             = /\b([A-Za-z_]\w*)\s*\(/g;
   let   inBlockComment = false;
-  let   rawDelimiter   = '';   // Feat③: RAW文字列の終端デリミタ。空文字列なら非RAW状態
+  let   rawDelimiter   = ''; // RAW文字列の終端デリミタ。空文字列なら非RAW状態
 
   for (let i = start - 1; i < Math.min(end, lines.length); i++) {
     const line = lines[i];
@@ -513,7 +466,7 @@ function extractCallsFromLines(
     let   j         = 0;
 
     while (j < line.length) {
-      // ── RAW文字列状態 (Feat③) ──────────────────────────────────────────
+      // ── RAW文字列状態 ──────────────────────────────────────────
       if (rawDelimiter) {
         const endIdx = line.indexOf(rawDelimiter, j);
         if (endIdx === -1) {
@@ -535,7 +488,7 @@ function extractCallsFromLines(
       const ch  = line[j];
       const ch2 = j + 1 < line.length ? line[j] + line[j + 1] : '';
 
-      // Feat③: R"delimiter(...)delimiter" の開始検出
+      // R"delimiter(...)delimiter" の開始検出
       // 'R' の次が '"' のとき RAW 文字列リテラル開始
       if (ch === 'R' && j + 1 < line.length && line[j + 1] === '"') {
         j += 2; // R" をスキップ
@@ -543,9 +496,6 @@ function extractCallsFromLines(
         if (parenIdx === -1) {
           // '(' なし → 通常の識別子 R として扱う
           processed.push(ch);
-          // j はすでに次の文字を指しているため調整
-          j--; // ループ末尾の j++ で R" の " を再処理させるのではなく、
-                // R だけ processed に積んで次ループで " を通常文字列として処理する
         } else {
           const delim  = line.slice(j, parenIdx); // R"DELIM( の DELIM 部分
           const terminator = ')' + delim + '"';   // 終端は )DELIM"
@@ -603,9 +553,9 @@ function extractCallsFromLines(
 
 /**
  * callee スコープを解決する。
- * Bug④ 修正: calleeEntry.line が既知の場合は findScopeAtLine (行番号優先) を使い、
- *   同一ファイル内に同名関数が複数ある場合でも正しいスコープを返す。
- *   findScopeAtLine が失敗した場合のみ byName にフォールバックする。
+ * calleeEntry.line が既知の場合は findScopeAtLine（行番号優先）を使い、
+ * 同一ファイル内に同名関数が複数ある場合でも正しいスコープを返す。
+ * findScopeAtLine が失敗した場合のみ byName にフォールバックする。
  */
 function resolveCalleeScope(
   scopeMap: Map<string, ScopeMapEntry>,
@@ -620,10 +570,10 @@ function resolveCalleeScope(
 
 
 /**
- * 【Precision ②】callee エントリを全候補から解決する。
- * 優先順位: ① callerFile と同ファイル + isFunc (static 関数)
- *           ② 任意ファイルの isFunc
- *           ③ フォールバック (先頭候補)
+ * callee エントリを全候補から解決する。
+ * 優先順位: 1. callerFile と同ファイル + isFunc（static 関数）
+ *           2. 任意ファイルの isFunc
+ *           3. フォールバック（先頭候補）
  */
 function resolveCallee(
   candidates: GtagEntry[] | undefined,
@@ -637,22 +587,10 @@ function resolveCallee(
 
 
 /**
- * 【Precision ①】global -rx -e '^(func1|func2|...)$' を buildPatternBatches で動的分割し、
+ * global -rx -e '^(func1|func2|...)$' を buildPatternBatches で動的分割し、
  * GLOBAL_RX_PARALLEL 個ずつ並列実行してエッジセットを構築する。
- *
- * ソーステキストの正規表現スキャンではなく GNU Global のシンボル DB を使うため、
- * コメント・文字列リテラル・マクロ名との誤混同がなくなり false positive が大幅減少する。
- *
- * NOTE: -e フラグ (POSIX 拡張正規表現) は GNU Global 5.0 以降が必要。
- *
- * @param callerFiles  caller として対象にするファイルパスの集合
- * @param tags         全タグマップ (Precision ② 対応: name → GtagEntry[])
- * @param scopeMap     スコープマップ
- * @param wsRoot       GTAGS のあるワークスペースルート
- * @param token        キャンセルトークン
- * @param pct          Pct インスタンス（進捗レポーター）
- * @param startPct     この関数が担当するパーセント開始値
- * @param endPct       この関数が担当するパーセント終了値
+ * GNU Global のシンボル DB を使うためコメント・文字列リテラルとの誤混同がない。
+ * -e フラグ（POSIX 拡張正規表現）は GNU Global 5.0 以降が必要。
  */
 async function buildEdgesGlobalRx(
   callerFiles: Set<string>,
@@ -669,20 +607,15 @@ async function buildEdgesGlobalRx(
   const effectiveRoots = (wsRoots && wsRoots.length > 0) ? wsRoots : [wsRoot];
   const edgeSet = new Set<string>();
 
-  // isFunc エントリを持つ関数名のみ対象にする
   const funcNames = Array.from(tags.entries())
     .filter(([, entries]) => entries.some(e => e.isFunc))
     .map(([name]) => name);
 
-  // ④ buildPatternBatches で動的長さベース分割 + GLOBAL_RX_PARALLEL 個ずつ並列実行
-  // 旧実装: 固定件数 GLOBAL_RX_BATCH=100 で分割 → 長い C++ テンプレート名で MAX_PATTERN_LENGTH 超過の恐れ
-  // 新実装: buildPatternBatches で長さベース分割 (S-3 完全適用) + アンカー付き (B-2 完全適用)
   const patterns    = buildPatternBatches(funcNames);
   const totalGroups = Math.ceil(patterns.length / GLOBAL_RX_PARALLEL);
 
-  // Warning修正: 同一エラーを集約するための一時セット。
-  // global -rx -e がすべてのバッチで同じ理由（-e 未サポート等）で失敗する場合に
-  // 同一メッセージが N 件 push されるのを防ぐ。
+  // 同一エラーを集約するための一時セット（GNU GLOBAL < 5.0 で -e 未サポートの場合など
+  // 全バッチが同じエラーになる場合に重複を防ぐ）
   const errorMessages = new Set<string>();
 
   for (let gi = 0; gi < patterns.length; gi += GLOBAL_RX_PARALLEL) {
@@ -696,10 +629,6 @@ async function buildEdgesGlobalRx(
           cwd: wsRoot, maxBuffer: 50 * 1024 * 1024, timeout: 60_000,
         }));
       } catch (e) {
-        // Warning修正: エラーを集約 (重複除去)。
-        //   GNU GLOBAL < 5.0 で -e フラグ非サポートの場合は全バッチが同じエラーになるため、
-        //   同一メッセージを1件に絞ってユーザーへの警告量を最小化する。
-        //   キャンセルによる中断は警告として報告しない。
         const ex  = e as NodeJS.ErrnoException & { killed?: boolean };
         const msg = ex instanceof Error ? ex.message : String(ex);
         if (ex.killed || msg.includes('cancel')) { return; }
@@ -729,9 +658,7 @@ async function buildEdgesGlobalRx(
         const refLine    = parseInt(parts[1], 10);
         if (!calleeName || isNaN(refLine)) continue;
         const refFile = sanitizeToAnyWsRoot(parts[2], effectiveRoots);
-        // BUG-4 修正: sanitizeToAnyWsRoot が返すパスと callerFiles のパス形式が
-        // macOS/Windows の大文字小文字・区切り文字の差異で一致しない場合がある。
-        // normalizeFsPath を通した正規化済みパスで比較することで確実に一致させる。
+        // normalizeFsPath を通した正規化済みパスで比較（macOS/Windows の大文字小文字・区切り文字の差異を吸収）
         if (!refFile || !callerFiles.has(normalizeFsPath(refFile))) continue;
         const fileScopeEntry = findScopeMapEntry(scopeMap, refFile);
         if (!fileScopeEntry) continue;
@@ -741,14 +668,10 @@ async function buildEdgesGlobalRx(
           ?.find(e => e.file === refFile && e.isFunc)
           ?? resolveCallee(tags.get(callerScope.name), refFile);
         if (!callerEntry) continue;
-        // BUG-NEW-A 修正: resolveCallee のフォールバックで別ファイルのエントリが返った場合、
-        // callerScope は refFile 上のスコープなのに callerEntry.file が異なる状態になる。
-        // downStartItems で tags.get(nn)?.find(e => e.file === nf) がヒットせず
-        // 下方向 BFS の起点から除外されるため、スキップして安全側に倒す。
+        // resolveCallee のフォールバックで別ファイルのエントリが返った場合はスキップする
         if (callerEntry.file !== refFile) continue;
         const calleeEntry = resolveCallee(tags.get(calleeName), refFile);
         if (!calleeEntry?.isFunc) continue;
-        // Bug④: resolveCalleeScope (findScopeAtLine 優先) で正確なスコープを取得
         const calleeScope = resolveCalleeScope(scopeMap, calleeEntry.file, calleeName, calleeEntry.line);
         if (!calleeScope) continue;
         if (callerScope.name === calleeName && callerEntry.file === calleeEntry.file) continue;
@@ -760,16 +683,15 @@ async function buildEdgesGlobalRx(
       }
     }));
   }
-  // Warning修正: 集約したエラーメッセージを errs に追加する。
-  // ループ内で都度 push すると同一エラーが N 件になるためループ外でまとめて push する。
+  // ループ外でまとめて push（ループ内で都度 push すると同一エラーが N 件になる）
   for (const msg of errorMessages) errs.push(msg);
   return edgeSet;
 }
 
 /**
  * GtagEntry + ScopeEntry から GraphNode を生成する。
- * 【⑥】source をここでは設定しない (クリック時にオンデマンド読み込み)。
- *   代わりに scopeEnd を保持し、webviewPanel の requestSource ハンドラが利用する。
+ * source はクリック時のオンデマンド読み込みで設定するためここでは設定しない。
+ * 代わりに scopeEnd を保持し、webviewPanel の requestSource ハンドラが利用する。
  */
 function gtagsEntryToNode(
   name: string, entry: GtagEntry, scope: ScopeEntry, currentFile: string
@@ -792,7 +714,7 @@ function gtagsEntryToNode(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// gtags バックエンド  ─  実装 (Phase 2: 内部 BFS エンジン使用)
+// gtags バックエンド  ─  内部 BFS エンジン
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── 内部 BFS エンジン ─────────────────────────────────────────────────────────
@@ -813,13 +735,7 @@ interface GtagsBfsDownFullOpts {
   pctRange:   [number, number];
 }
 
-/** gtags 下方向 BFS (全量キャッシュ版)。extractCallsFromLines + resolveCallee で展開する。
- *
- * NOTE: opts.wsRoot はインターフェース上存在するが、この関数内では使用しない。
- * getFileLinesAsync は filePath（絶対パス）で直接読み込むため wsRoot に依存しない。
- * マルチルート対応で将来 wsRoot を利用する場合は、各 entry.file の所属ルートを
- * getWorkspaceRootForFile で動的に解決すること。
- */
+/** gtags 下方向 BFS（全量キャッシュ版）。extractCallsFromLines + resolveCallee で展開する。 */
 async function gtagsBfsDownFull(opts: GtagsBfsDownFullOpts): Promise<void> {
   const { nodes, edgeSet, tags, scopeMap, lineCache, currentFile, startItems, maxHops, token, pct, pctRange } = opts;
   const knownTags = new Set(tags.keys());
@@ -875,8 +791,7 @@ async function gtagsBfsUpFull(opts: GtagsBfsUpFullOpts): Promise<void> {
     const refMap = await runGlobalRxBatch(upCurrentLevel.map(s => s.funcName), wsRoot, errs, wsRoots);
     const upNextLevel: typeof startItems = [];
     for (const { funcName, calleeId } of upCurrentLevel) {
-      // H-1 修正: isSelfRef の比較ファイルは tags の先頭候補ではなく、
-      // 今追いかけている callee 自身のファイル（calleeId から確定）を使う。
+      // isSelfRef の比較ファイルは calleeId から確定した callee 自身のファイルを使う。
       // tags.get(funcName)?.find(...) は同名関数が複数ファイルにある場合に
       // 別ファイルを返すことがあり、正当な caller を誤ってスキップしてしまう。
       const { file: calleeFile } = parseGtagsNodeId(calleeId);
@@ -894,9 +809,8 @@ async function gtagsBfsUpFull(opts: GtagsBfsUpFullOpts): Promise<void> {
           tags.get(callerScope.name)?.find(e => e.file === refFile && e.isFunc)
           ?? resolveCallee(tags.get(callerScope.name), refFile);
         if (!callerEntry) continue;
-        // Bug-1 修正: buildEdgesGlobalRx (737行) と同等のガード。
         // resolveCallee のフォールバックで別ファイルのエントリが返ると
-        // 孤立エッジ（存在しない caller ノード）が生まれるためスキップする。
+        // 孤立エッジが生まれるためスキップする。
         if (callerEntry.file !== refFile) continue;
         const callerId = makeGtagsNodeId(callerEntry.file, callerScope.name, callerEntry.line);
         edgeSet.add(`${callerId}|||${calleeId}`);
@@ -908,8 +822,7 @@ async function gtagsBfsUpFull(opts: GtagsBfsUpFullOpts): Promise<void> {
     upCurrentLevel = upNextLevel;
     hop++;
   }
-  // QUALITY-NEW-1 修正: maxHops=undefined（無制限）時は分母が hop+2 となり
-  // 進捗が 100% に到達しない。ループ終了後に明示的に pctRange[1] まで進める。
+  // ループが maxHops 未満で収束した場合も確実に pctRange[1] まで進める
   pct.to(pctRange[1]);
 }
 
@@ -922,7 +835,7 @@ interface GtagsBfsDownLazyOpts {
   scopeCache:  Map<string, ScopeMapEntry>;
   lineCache:   Map<string, string[]>;
   wsRoot:      string;
-  wsRoots:     string[]; // Bug-A/B 追加: マルチルート対応
+  wsRoots:     string[]; // マルチルート対応
   currentFile: string;
   maxHops:     number;
   token?:      vscode.CancellationToken;
@@ -931,9 +844,8 @@ interface GtagsBfsDownLazyOpts {
 }
 
 /**
- * gtags 下方向 BFS (遅延ローディング版)。
- * knownTags フィルタなしで候補抽出 → runGlobalXNames で後検証するオンデマンド方式。
- * BugFix G: visited (処理完了) と queued (投入済み) を分離して退行バグを防止。
+ * gtags 下方向 BFS（全量キャッシュ版）。
+ * visited（処理完了）と queued（投入済み）を分離してサイクルによる二重処理を防ぐ。
  */
 async function gtagsBfsDownLazy(opts: GtagsBfsDownLazyOpts): Promise<void> {
   const { nodes, edgeSet, errs, startEntry, tagCache, scopeCache, lineCache, wsRoot, wsRoots, currentFile, maxHops, token, pct, pctRange } = opts;
@@ -952,10 +864,7 @@ async function gtagsBfsDownLazy(opts: GtagsBfsDownLazyOpts): Promise<void> {
     const lines = await getFileLinesAsync(entry.file, lineCache);
     nodes.set(nodeId, gtagsEntryToNode(name, entry, scope, currentFile));
 
-    // BUG-NEW-B 修正: hop>=maxHops と通常展開でほぼ同一のコードが重複していた。
-    // 共通処理を processLazyCallees ヘルパーに切り出して重複を解消する。
-    // expandQueue: true なら未訪問 callee をキューに積む（通常展開）、
-    //              false ならノード登録のみでキューに積まない（maxHops 到達時）。
+    // maxHops 到達かどうかでキューに積むかノード登録のみかを切り替える
     const expandQueue = hop < maxHops;
     const rawCandidates = extractCallsFromLines(lines, scope.start, scope.end, name);
     if (rawCandidates.size > 0) {
@@ -984,7 +893,7 @@ async function gtagsBfsDownLazy(opts: GtagsBfsDownLazyOpts): Promise<void> {
           // 通常展開: 未訪問の callee をキューに積む
           if (!queued.has(calleeId)) { queued.add(calleeId); queue.push({ name: callee, entry: calleeEntry, scope: calleeScope, hop: hop + 1 }); }
         } else {
-          // maxHops 到達: キューには積まずノード登録のみ（BUG-3 修正）
+          // maxHops 到達: キューには積まずノード登録のみ
           if (!nodes.has(calleeId)) {
             nodes.set(calleeId, gtagsEntryToNode(callee, calleeEntry, calleeScope, currentFile));
           }
@@ -998,16 +907,8 @@ async function gtagsBfsDownLazy(opts: GtagsBfsDownLazyOpts): Promise<void> {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // gtags バックエンド  ─  遅延ローディング用ヘルパー
+//   BFS を進めながら必要な関数・ファイルだけをオンデマンドでクエリする。
 //   buildFunctionCallGraphGtags / buildPathThroughCallGraphGtags で共用する。
-//
-// 【高速化】全量キャッシュ版 (collectGtagsCached + buildGtagsScopeMap) は
-//   大規模プロジェクトで数分かかることがあった。
-//   遅延版は BFS を進めながら必要な関数・ファイルだけをオンデマンドでクエリする:
-//     runGlobalXNames         : global -x -e 'func1|func2|...' で複数定義を一括取得
-//     buildScopeForFileCached : global -f <file> でそのファイルのスコープだけ構築
-//     extractCallsFromLines   : knownTags フィルタなしで候補抽出 → runGlobalXNames で検証
-//
-//   これにより訪問した関数・ファイル数に比例した処理量に抑え、数秒以内を目指す。
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function runGlobalRxBatch(
@@ -1022,9 +923,7 @@ async function runGlobalRxBatch(
   const effectiveRoots = (wsRoots && wsRoots.length > 0) ? wsRoots : [wsRoot];
   const patterns = buildPatternBatches(funcNames);
   const errorMessages = new Set<string>();
-  // Bug-4 修正: Promise.all による全パターン同時起動を廃止し、
-  // buildEdgesGlobalRx と同様に GLOBAL_RX_PARALLEL 個ずつ逐次バッチ実行する。
-  // 大規模プロジェクトで数百プロセスが同時起動してリソース枯渇するリスクを防ぐ。
+  // GLOBAL_RX_PARALLEL 個ずつ逐次バッチ実行（全パターン同時起動によるリソース枯渇を防ぐ）
   for (let gi = 0; gi < patterns.length; gi += GLOBAL_RX_PARALLEL) {
     await Promise.all(patterns.slice(gi, gi + GLOBAL_RX_PARALLEL).map(async pattern => {
       let stdout = '';
@@ -1045,7 +944,7 @@ async function runGlobalRxBatch(
         const name    = parts[0];
         const refLine = parseInt(parts[1], 10);
         if (!name || isNaN(refLine)) continue;
-        // Sec-1 修正: name にセパレータ文字が含まれる場合はスキップ（runGlobalXAll と統一）
+        // name にセパレータ文字が含まれる場合はスキップ
         if (name.includes('\x00') || name.includes('|||')) continue;
         const refFile = sanitizeToAnyWsRoot(parts[2], effectiveRoots);
         if (!refFile) continue;
@@ -1058,23 +957,23 @@ async function runGlobalRxBatch(
 }
 
 
+// GNU GLOBAL 内部バッファ上限は 512 バイト固定。
+// global -rx に渡すパターンは ^(中身)$ の形式で、オーバーヘッドが 4 バイトあるため
+// 中身の実質上限は 508 バイトになる。
+// 512 バイトを超えると global が buffer overflow で exit 1 する。
+// 400 は 508 バイトに対して十分な余裕を持たせた値。
 const MAX_PATTERN_LENGTH = 400;
 
 /**
- * B-2 + S-3: アンカー付き ERE パターンのバッチ配列を生成する。
- *
- * - ^ と $ アンカーで部分一致を防止する (B-2)。
- *   例: 'func1' が 'func1_helper' にマッチしなくなる。
- * - MAX_PATTERN_LENGTH を超えないよう動的分割することで OS の ARG_MAX 超過を防ぐ (S-3)。
- * - runGlobalXNames と runGlobalRxBatch の両方で共用する。
- *
- * NOTE: ^ と $ アンカーは GNU Global 5.0 以降の POSIX ERE で動作する。
+ * アンカー付き ERE パターンのバッチ配列を生成する。
+ * ^ と $ アンカーで部分一致を防止し（例: 'func1' が 'func1_helper' にマッチしない）、
+ * MAX_PATTERN_LENGTH を超えないよう動的分割する。
+ * runGlobalXNames と runGlobalRxBatch の両方で共用する。
  */
 function buildPatternBatches(names: string[]): string[] {
   if (names.length === 0) return [];
   const batches: string[] = [];
   let batch: string[] = [];
-  // 旧実装は 0 から始めており、生成パターンが MAX_PATTERN_LENGTH を超える可能性があった。
   const WRAPPER_LEN = 4; // '^(' + ')$'
   let len = WRAPPER_LEN;
 
@@ -1103,17 +1002,16 @@ async function runGlobalXNames(
   names:   string[],
   wsRoot:  string,
   errs:    string[] = [],
-  wsRoots?: string[], // Bug-A 追加: マルチルート対応
+  wsRoots?: string[],
 ): Promise<Map<string, GtagEntry[]>> {
   const result = new Map<string, GtagEntry[]>();
   if (names.length === 0) return result;
 
-  // Bug-A 修正: マルチルート時は全ルートを検索対象とする
   const effectiveRoots = (wsRoots && wsRoots.length > 0) ? wsRoots : [wsRoot];
-  const patterns = buildPatternBatches(names); // B-2+S-3
+  const patterns = buildPatternBatches(names);
   const errorMessages = new Set<string>(); // 重複除去
 
-  // Quality-B 修正: runGlobalRxBatch と統一して GLOBAL_RX_PARALLEL 上限付きバッチ並列に変更
+  // GLOBAL_RX_PARALLEL 上限付きバッチ並列（runGlobalRxBatch と統一）
   for (let gi = 0; gi < patterns.length; gi += GLOBAL_RX_PARALLEL) {
     await Promise.all(patterns.slice(gi, gi + GLOBAL_RX_PARALLEL).map(async pattern => {
       let stdout = '';
@@ -1122,7 +1020,6 @@ async function runGlobalXNames(
           cwd: wsRoot, maxBuffer: 10 * 1024 * 1024, timeout: 30_000,
         }));
       } catch (e) {
-        // NEW-1 修正: SIGTERM 文字列マッチ → ex.killed フラグで確実にタイムアウトを検出
         const ex  = e as NodeJS.ErrnoException & { killed?: boolean };
         const msg = ex instanceof Error ? ex.message : String(ex);
         if (ex.killed || msg.includes('cancel')) { return; }
@@ -1138,9 +1035,8 @@ async function runGlobalXNames(
         const [, name, lineStr, fileStr, sourceLine] = m;
         const line = parseInt(lineStr, 10);
         if (isNaN(line)) continue;
-        // Sec-1 修正と統一: name にセパレータが含まれる場合はスキップ
+        // name にセパレータが含まれる場合はスキップ
         if (!name || name.includes('\x00') || name.includes('|||')) continue;
-        // Bug-A 修正: sanitizeToAnyWsRoot でマルチルートに対応
         const file = sanitizeToAnyWsRoot(fileStr, effectiveRoots);
         if (!file) continue;
         const entry: GtagEntry = { name, file, line, sourceLine, isFunc: isLikelyFuncDef(sourceLine) };
@@ -1162,8 +1058,8 @@ async function resolveOrFetchTag(
   name:     string,
   wsRoot:   string,
   tagCache: Map<string, GtagEntry[]>,
-  errs:     string[] = [], // NEW-3: global -x エラーを呼び出し元に伝搬
-  wsRoots?: string[],      // Bug-A 追加: マルチルート対応
+  errs:     string[] = [],
+  wsRoots?: string[],
 ): Promise<GtagEntry[] | undefined> {
   if (tagCache.has(name)) {
     const cached = tagCache.get(name)!;
@@ -1189,24 +1085,22 @@ async function buildScopeForFileCached(
   wsRoot:     string,
   scopeCache: Map<string, ScopeMapEntry>,
   lineCache:  Map<string, string[]>,
-  wsRoots?:   string[], // Bug-B 追加: マルチルート対応
+  wsRoots?:   string[],
 ): Promise<ScopeMapEntry | undefined> {
   const norm = normalizeFsPath(file);
   const hit  = scopeCache.get(norm) ?? scopeCache.get(file);
   if (hit) return hit;
 
-  // Bug-B 修正: file が wsRoot と異なるルートに属する場合、
-  // path.relative(wsRoot, file) が '../other-root/...' になり global -f が空を返す。
-  // getWorkspaceRootForFile で file の実際のルートを動的解決して runGlobalF に渡す。
+  // file が wsRoot と異なるルートに属する場合は getWorkspaceRootForFile で動的解決する。
+  // path.relative(wsRoot, file) が '../other-root/...' になると global -f が空を返すため。
   const effectiveRoot = (wsRoots && wsRoots.length > 0)
     ? (getWorkspaceRootForFile(vscode.Uri.file(file)) ?? wsRoot)
     : wsRoot;
   const tagEntries = await runGlobalF(file, effectiveRoot);
   if (!tagEntries.length) return undefined;
 
-  // ⑤ Performance 修正: fs.readFileSync → getFileLinesAsync で非同期読み込み
   const lines = await getFileLinesAsync(file, lineCache);
-  // B-3: 正規化パスも lineCache に登録してキャッシュヒット率を向上させる
+  // 正規化パスも lineCache に登録してキャッシュヒット率を向上させる
   if (norm !== file && !lineCache.has(norm)) lineCache.set(norm, lines);
   const funcEntries: { name: string; line: number }[] = [];
   for (const { name, line } of tagEntries) {
@@ -1277,7 +1171,7 @@ export async function buildFileCallGraphGtags(
   // global -rx でエッジ構築
   pct.to(20);
   checkCancellation(token);
-  // BUG-4 修正: callerFiles は normalizeFsPath 済みパスのみ格納し、
+  // callerFiles は normalizeFsPath 済みパスのみ格納し、
   // buildEdgesGlobalRx 側の has() 比較と形式を統一する。
   const callerFiles = new Set<string>([currentFileNorm]);
   for (const scope of fileScopes) {
@@ -1387,7 +1281,7 @@ export async function buildFunctionCallGraphGtags(
   };
 }
 
-/** ルートごとに tags / scopeMap / nodes を収集してマージする (buildWorkspaceCallGraphGtags 専用) */
+/** ルートごとに tags / scopeMap / nodes を収集してマージする。buildWorkspaceCallGraphGtags 専用。 */
 async function collectWsTagsAndNodes(
   rootList: [string, vscode.Uri[]][],
   errs:     string[],
@@ -1464,8 +1358,6 @@ export async function buildWorkspaceCallGraphGtags(
   for (let ri = 0; ri < rootList.length; ri++) {
     const [wsRoot, rootUris] = rootList[ri];
     checkCancellation(token);
-    // BUG-4 修正漏れ: buildFileCallGraphGtags 側は修正済みだが、こちらは
-    // 生パスと正規化パスの両方を混在させたままだった。
     // buildEdgesGlobalRx 側で normalizeFsPath(refFile) と比較するため、
     // callerFiles も normalizeFsPath 済みパスのみ格納して形式を統一する。
     const rootCallerFiles = new Set<string>();
@@ -1497,12 +1389,9 @@ export async function buildWorkspaceCallGraphGtags(
     const s = resolveCalleeScope(mergedScopeMap, nf, nn, e.line);
     if (s) downStartItems.push({ name: nn, entry: e, scope: s });
   }
-  // Bug-1 修正: pctRange を [90,95] に縮め、[95,100] を上方向 BFS に割り当てる
   await gtagsBfsDownFull({ nodes, edgeSet, errs, tags: mergedTags, scopeMap: mergedScopeMap, lineCache: bfsLineCache, wsRoot: rootList[0][0], currentFile: '', startItems: downStartItems, token, pct, pctRange: [90, 95] });
 
-  // Bug-1 修正: 上方向 BFS を追加。
-  // buildFileCallGraphGtags / buildPathThroughCallGraphGtags と同様に、
-  // 全登録ノードを起点として caller 方向を遡り、上方向エッジを収集する。
+  // 上方向 BFS: 全登録ノードを起点として caller 方向を遡り上方向エッジを収集する。
   pct.to(95);
   const allWsRootsForUp = rootList.map(([r]) => r);
   const upStartItems: Array<{ funcName: string; calleeId: string }> = [];

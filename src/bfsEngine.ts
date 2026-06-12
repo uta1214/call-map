@@ -1,11 +1,8 @@
 /**
- * bfsEngine.ts  ─  LSP BFS エンジン + 共有ヘルパー (Phase 2)
+ * bfsEngine.ts  ─  LSP BFS エンジン
  *
- * callGraphBuilder.ts に散在していた 4 本の LSP BFS ループを統一した
- * lspBfs() エンジンに置き換える。
- *
- * wsRoots ガード（shouldIncludeCallee / wsRoots.length===0 チェック）は
- * このファイルの lspBfs 内部に 1 箇所だけ記述する。
+ * lspBfs() で outgoing / incoming 両方向の BFS を統一的に処理する。
+ * wsRoots ガード（shouldIncludeCallee）はこの関数内の 1 箇所にのみ記述する。
  */
 
 import * as vscode from 'vscode';
@@ -195,9 +192,7 @@ export async function lspBfs(opts: LspBfsOptions): Promise<BfsResult> {
       for (const call of incoming) {
         let callerId = findExistingCalleeId(nodes, nodeIndex, call.from);
         if (!callerId) {
-          // BUG-3 修正: outgoing と同じく shouldIncludeCallee でガードし、
-          // isInWorkspace + 拡張子チェックを統一する。
-          // 旧実装は isInWorkspace のみで拡張子チェックがなく、非対称だった。
+          // outgoing と同じく shouldIncludeCallee でガード（isInWorkspace + 拡張子チェック）
           if (!shouldIncludeCallee(call.from.uri, wsRoots)) continue;
           callerId = makeNodeId(call.from.uri, call.from.name, call.from.selectionRange.start.line);
         }

@@ -1,13 +1,4 @@
 // src/webview.js
-//
-// 【変更点 (main ← gtags マージ)】
-//  - caller ノード色: #74b9ff / #0984e3 → #00b894 / #00695c
-//  - caller エッジ色: #0984e3 → #00b894
-//  - 引数表示トグル (sig-toggle) を復元
-//    → showFullSig 変数 / getLabel() / applyLabelMode() を追加
-//    → renderGraph の visNodes 生成を getLabel() 経由に変更
-//  - nodeInfoMap は label / labelFull のみ保持 (labelShort は GraphNode から削除済み)
-//
 (function () {
   'use strict';
 
@@ -26,8 +17,8 @@
 
   var DEFAULT_FONT_SIZE = 11;
 
-  // ★ 修正②: hierarchical レイアウトのノード数上限。
-  //   vis-network の hierarchical + sortMethod:'directed' はトポロジカルソートを
+  // hierarchical レイアウトのノード数上限。
+  // vis-network の hierarchical + sortMethod:'directed' はトポロジカルソートを
   //   内部で行うため、この閾値を超えると計算が破綻して全ノードが (0,0) に集まり
   //   白紙グラフになる。閾値を超えた場合は physics ベースのレイアウトにフォールバック。
   var HIERARCHICAL_THRESHOLD = 150;
@@ -41,9 +32,9 @@
   var canvasFontSize       = DEFAULT_FONT_SIZE;
   var currentNode          = null;
   var connectedEdgesOfNode = new Set();
-  var _hadSelection        = false; // PERF-07: ノードが一度でも選択されたかを追跡
+  var _hadSelection        = false; // ノードが一度でも選択されたかを追跡（エッジリセット最適化用）
   var currentSourceNodeId  = null;
-  var pendingSourceNodeId  = null; // ⑥ requestSource 送信済みで応答待ちの nodeId
+  var pendingSourceNodeId  = null; // requestSource 送信済みで応答待ちの nodeId
 
   // ─────────────────────────────────────────────────────────────────────────
   // Extension → WebView メッセージ
@@ -56,7 +47,7 @@
       case 'graphData':  renderGraph(msg);                   break;
       case 'error':      hideLoading(); showErrorInView(msg.message); break;
       case 'sourceData':
-        // ⑥ requestSource の応答: source を nodeInfoMap にキャッシュして表示
+        // requestSource の応答: source を nodeInfoMap にキャッシュして表示
         if (nodeInfoMap[msg.nodeId]) {
           nodeInfoMap[msg.nodeId].source = msg.source;
         }
@@ -81,9 +72,8 @@
     document.getElementById('loading-overlay').style.display = 'none';
   }
 
-  // SEC-04 修正: escapeHtml を5文字エスケープに統一。
-  // webviewPanel.ts の escapeHtmlForTitle と一致させる。
-  // " と ' を追加することで将来この関数を属性値に使っても XSS にならない。
+  // escapeHtml を5文字エスケープ（& < > " '）に統一し、
+  // 属性値に使っても XSS にならないようにする。
   function escapeHtml(s) {
     return String(s)
       .replace(/&/g,  '&amp;')
@@ -93,7 +83,7 @@
       .replace(/'/g,  '&#39;');
   }
 
-  // BUG-05 用: HTML 属性値 (title 等) のエスケープ（escapeHtml と同一）
+  // HTML 属性値（title 等）のエスケープ（escapeHtml と同一）
   var escapeAttr = escapeHtml;
 
   function showErrorInView(msg) {
@@ -123,7 +113,7 @@
         scopeEnd:  n.scopeEnd,
         label:     n.label,
         labelFull: n.labelFull || n.label,
-        source:    n.source || null, // ⑥ 通常 null (スタンドアロン HTML 時のみ設定済み)
+        source:    n.source || null, // スタンドアロン HTML 時のみ設定済み、通常は null
       };
     });
 
@@ -165,12 +155,9 @@
     }
 
     var qi = 0;
-    // V4-6 修正: 相互再帰（A→B→A）などのサイクルグラフで bfsLevel の更新が
-    // 収束するまで同じノードが bfsQueue に大量追加され O(N²) になる問題を修正する。
-    // inQueue セットで「既にキューに積まれているノード」を管理し、重複追加を防ぐ。
-    // ⑥ 追加: サイクルが多数ある場合の bfsQueue 膨張を防ぐため上限を設ける。
-    // 強連結成分（双方向呼び出し）が多いグラフでも正確なレベル計算が行えるよう
-    // * 2 から * 10 に拡張した（深いサイクルでも収束が保証される）。
+    // サイクルグラフで bfsLevel の更新が収束するまで同じノードが bfsQueue に大量追加され
+    // O(N²) になる問題を防ぐため、inQueue セットで重複追加を抑制する。
+    // サイクルが多数ある場合の bfsQueue 膨張を防ぐためキューの上限も設ける。
     var BFS_QUEUE_LIMIT = msg.nodes.length * 10;
     var inQueue = new Set(bfsQueue);
     while (qi < bfsQueue.length) {
@@ -240,15 +227,14 @@
       };
     });
 
-    // ★ 修正①: clear の順序は必ず edges → nodes。
-    //   nodes を先に消すとエッジが存在しないノードを参照する状態になり
-    //   vis-network が内部エラーで描画を中断するため白紙になる。
-    // ★ 修正②: ノード数に応じてレイアウトを切り替える。
-    //   hierarchical は大量ノードで破綻するため閾値を超えたら無効化する。
+    // clear の順序は必ず edges → nodes。
+    // nodes を先に消すとエッジが存在しないノードを参照する状態になり
+    // vis-network が内部エラーで描画を中断するため白紙になる。
+    // ノード数に応じてレイアウトを切り替える:
+    // hierarchical は大量ノードで破綻するため閾値を超えたら無効化する。
     if (network) {
-      // BUG-8 修正: 前回の stabilize が完了していない状態で再レンダリングが呼ばれた場合、
-      // 古い stabilizationIterationsDone ハンドラが先に発火してオーバーレイが消え、
-      // 新しいハンドラが残るという競合が発生する。stopSimulation() で先に停止させる。
+      // 前回の stabilize が完了していない状態で再レンダリングが呼ばれた場合、
+      // 古いハンドラが先に発火して競合が発生するため stopSimulation() で先に停止させる。
       network.stopSimulation();
       var useHierarchical = visNodes.length <= HIERARCHICAL_THRESHOLD;
       network.setOptions({ layout: { hierarchical: { enabled: useHierarchical } } });
@@ -262,9 +248,7 @@
         });
         network.stabilize(200);
       } else {
-        // 🟡 Bug 6 修正: hierarchical モードで再描画したとき network.fit() が呼ばれておらず、
-        //   前回のズーム・スクロール位置が残ったまま新グラフが画面外に出ることがあった。
-        //   physics モードが stabilizationIterationsDone 内で fit() を呼ぶのと対称にする。
+        // hierarchical モードは physics と対称に fit() を呼んでズーム位置をリセットする
         network.fit();
       }
     } else {
@@ -292,14 +276,12 @@
       'Nodes: ' + msg.nodes.length + ' / Edges: ' + msg.edges.length +
       ' / ' + msg.buildTimeMs + 'ms' + layoutNote + errNote;
 
-    // ④ 警告がある場合: hover で詳細を表示、クリックでアラート
+    // 警告がある場合: hover で詳細を表示、クリックでアラート
     if (msg.errors && msg.errors.length > 0) {
       buildInfoEl.style.cursor  = 'pointer';
       buildInfoEl.style.color   = '#e17055';
       buildInfoEl.title = msg.errors.map(escapeAttr).join('\n');
       buildInfoEl.onclick = function () {
-        // QUALITY-5 修正: escapeAttr では title 属性用にエスケープしているが
-        // alert() は別文脈。一貫性のため escapeHtml を適用する。
         alert('Build warnings (' + msg.errors.length + '):\n\n' + msg.errors.map(escapeHtml).join('\n'));
       };
     } else {
@@ -317,15 +299,15 @@
       setControlsCollapsed(msg.controlPanelCollapsed);
     }
 
-    // ★ hierarchical モードは同期描画なのでここで即座にローディングを消す。
-    //   physics モードは initNetwork 内の stabilizationIterationsDone で消す。
+    // hierarchical モードは同期描画なのでここで即座にローディングを消す。
+    // physics モードは initNetwork 内の stabilizationIterationsDone で消す。
     if (visNodes.length <= HIERARCHICAL_THRESHOLD) {
       hideLoading();
     }
   }
 
   function initNetwork(nodeCount) {
-    // ★ 修正②: ノード数が閾値以下なら hierarchical、超えたら physics フォールバック
+    // ノード数が閾値以下なら hierarchical、超えたら physics フォールバック
     var useHierarchical = nodeCount <= HIERARCHICAL_THRESHOLD;
 
     var layoutOpt = useHierarchical
@@ -390,7 +372,7 @@
       }));
     });
 
-    // ★ 修正②: physics フォールバック時はスタビライズ中にローディングを表示する
+    // physics フォールバック時はスタビライズ中にローディングを表示する
     if (!useHierarchical) {
       document.getElementById('loading-overlay').style.display = 'flex';
       network.on('stabilizationProgress', function (params) {
@@ -455,16 +437,14 @@
 
     currentNode          = id;
     connectedEdgesOfNode = new Set(network.getConnectedEdges(id));
-    _hadSelection        = true; // PERF-07: 選択発生を記録
+    _hadSelection        = true;
 
-    // ② 修正: edges.forEach 全スキャン → getConnectedNodes で直接取得 (O(n) → O(k))
     var outgoing = new Set(network.getConnectedNodes(id, 'from')); // callees
     var incoming = new Set(network.getConnectedNodes(id, 'to'));   // callers
 
     nodes.update(nodes.getIds().map(function (nid) {
       if (nid === id)         return { id: nid, color: { background: '#97c2fc', border: '#5a9fd4' }, font: makeFont('#1a3d5c') };
       if (outgoing.has(nid)) return { id: nid, color: { background: '#fab1a0', border: '#e17055' }, font: makeFont('#6d2b1a') };
-      // ★ caller 色変更: #74b9ff / #0984e3 → #00b894 / #00695c
       if (incoming.has(nid)) return { id: nid, color: { background: '#00b894', border: '#00695c' }, font: makeFont('#003d33') };
       return { id: nid, color: { background: '#ececec', border: '#cccccc' }, font: makeFont('#bbbbbb') };
     }));
@@ -472,7 +452,6 @@
     edges.update(edges.getIds().map(function (eid) {
       if (!connectedEdgesOfNode.has(eid)) return { id: eid, color: { color: '#e8e8e8', opacity: 0.3 }, width: 1 };
       var e   = edges.get(eid);
-      // ★ caller エッジ色変更: #0984e3 → #00b894
       var col = (e.from === id) ? '#e17055' : '#00b894';
       return { id: eid, color: { color: col, opacity: 1.0 }, width: 2.5 };
     }));
@@ -503,12 +482,10 @@
     return visited;
   }
 
-  // ★ グローバル公開不要: ボタンのイベントリスナーは下で直接セット済み
   function applyHopFilter(maxHops) {
     if (currentNode === null) return;
 
     var visible  = (maxHops === null) ? new Set(nodes.getIds()) : getNodesWithinHops(currentNode, maxHops);
-    // ② 修正: edges.forEach 全スキャン → getConnectedNodes で直接取得
     var outgoing = new Set(network.getConnectedNodes(currentNode, 'from')); // callees
     var incoming = new Set(network.getConnectedNodes(currentNode, 'to'));   // callers
 
@@ -517,7 +494,6 @@
       if (!visible.has(id))        return { id: id, color: { background: '#f0f0f0', border: '#e0e0e0' }, font: makeFont('#e0e0e0') };
       if (id === currentNode)       return { id: id, color: { background: '#97c2fc', border: '#5a9fd4' }, font: makeFont('#1a3d5c') };
       if (outgoing.has(id))         return { id: id, color: { background: '#fab1a0', border: '#e17055' }, font: makeFont('#6d2b1a') };
-      // ★ caller 色変更: #74b9ff / #0984e3 → #00b894 / #00695c
       if (incoming.has(id))         return { id: id, color: { background: '#00b894', border: '#00695c' }, font: makeFont('#003d33') };
       return { id: id, color: d.color, font: makeFont(d.fontColor || '#2d3436') };
     }));
@@ -527,7 +503,6 @@
       if (!visible.has(e.from) || !visible.has(e.to))
         return { id: id, color: { color: '#eeeeee', opacity: 0.2 }, width: 1 };
       if (connectedEdgesOfNode.has(id)) {
-        // ★ caller エッジ色変更: #0984e3 → #00b894
         var col = (e.from === currentNode) ? '#e17055' : '#00b894';
         return { id: id, color: { color: col, opacity: 1.0 }, width: 2.5 };
       }
@@ -551,7 +526,7 @@
   // ソースコードパネル
   // ─────────────────────────────────────────────────────────────────────────
 
-  // ⑥ ソースパネルの内容を実際に DOM に書き込む (source が既にある場合)
+    // ソースパネルの内容を実際に DOM に書き込む（source が既にある場合）
   function _renderSourceContent(nodeId) {
     var info        = nodeInfoMap[nodeId] || {};
     var placeholder = document.getElementById('source-placeholder');
@@ -561,7 +536,7 @@
     document.getElementById('source-file-info').textContent =
       baseName ? (baseName + ' : line ' + info.line) : '';
     if (info.source !== null && info.source !== undefined) {
-      // ⑤ 行番号を付与して表示 (info.line = スコープ開始行)
+      // 行番号を付与して表示（info.line = スコープ開始行）
       var startLine = info.line || 1;
       var sourceLines = info.source.split('\n');
       var maxNum = startLine + sourceLines.length - 1;
@@ -599,7 +574,7 @@
       return;
     }
 
-    // ⑥ VSCode WebView 環境: requestSource を送って非同期取得
+    // VSCode WebView 環境: requestSource を送って非同期取得
     if (isVscode && info.file && pendingSourceNodeId !== nodeId) {
       pendingSourceNodeId = nodeId;
       // ヘッダ表示だけ先行描画し、ソース部分は "読み込み中..." を表示
@@ -629,8 +604,8 @@
   function closeSrcPanel() {
     document.getElementById('src-toggle').checked         = false;
     document.getElementById('source-panel').style.display = 'none';
-    // ④ 修正: パネルを閉じた後も currentSourceNodeId が残ると
-    //   別ノードクリック時に _renderSourceContent が誤って呼ばれる問題を修正。
+    // パネルを閉じたら currentSourceNodeId をクリアし、
+    // 次のクリック時に _renderSourceContent が正しく呼ばれるようにする
     currentSourceNodeId = null;
   }
 
@@ -703,10 +678,9 @@
     }));
   }
 
-  // PERF-06 修正: applyFontSize のデバウンス版。
+  // applyFontSize のデバウンス版。
   // input イベントはキー押下ごとに連続発火するため、16ms のデバウンスで
-  // 高頻度の全ノード再描画を抑制する。click イベント（+/- ボタン・リセット）は
-  // 1回の操作につき1回しか発火しないためデバウンスなしで applyFontSize を直接呼ぶ。
+  // 高頻度の全ノード再描画を抑制する。click イベントはデバウンスなしで直接呼ぶ。
   var _fontSizeTimer;
   function applyFontSizeDebounced() {
     clearTimeout(_fontSizeTimer);
@@ -725,7 +699,6 @@
   // ＋ / － ボタン: ネイティブスピナーを置き換える
   document.getElementById('font-size-up').addEventListener('click', function () {
     var input = document.getElementById('font-size-input');
-    // NEW-5: input.value が空の場合 parseInt は NaN を返すため DEFAULT_FONT_SIZE にフォールバック
     var cur   = parseInt(input.value, 10);
     if (isNaN(cur)) cur = DEFAULT_FONT_SIZE;
     var val   = Math.min(cur + 1, 64);
@@ -735,7 +708,6 @@
   });
   document.getElementById('font-size-down').addEventListener('click', function () {
     var input = document.getElementById('font-size-input');
-    // NEW-5: input.value が空の場合 parseInt は NaN を返すため DEFAULT_FONT_SIZE にフォールバック
     var cur   = parseInt(input.value, 10);
     if (isNaN(cur)) cur = DEFAULT_FONT_SIZE;
     var val   = Math.max(cur - 1, 6);
@@ -810,11 +782,9 @@
   }());
 
   // ─── 検索インデックス ────────────────────────────────────────────────────
-  // -1 = 未フォーカス（初期値）。Enter で +1、Shift+Enter で -1 して循環。
-  // ポストインクリメント方式を廃止し、index が「現在フォーカス中のノード」を
-  // 常に指すようにすることで Enter → Shift+Enter の 1 回ずれバグを修正。
+  // -1 = 未フォーカス（初期値）。Enter で +1、Shift+Enter で -1 して循環する。
   var searchHitIndex = -1;
-  // ② 修正: matchSet を外スコープで保持し、keydown ハンドラでの全スキャン再実行を廃止。
+  // matchSet を外スコープで保持し、keydown ハンドラでの全スキャン再実行を廃止する。
   var matchSet = new Set();
 
   searchBox.addEventListener('input', function () {
@@ -853,9 +823,7 @@
     if (e.key === 'Enter' && nodes) {
       var hits = Array.from(matchSet);
       if (hits.length) {
-        // フォーカス移動バグ修正: ポストインクリメント廃止 → index が現在位置を常に指す。
-        //   旧実装: 使用後インクリメントのためShift+Enter直後に同ノードを再フォーカスしていた。
-        //   新実装: Enter で +1、Shift+Enter で -1 してから表示するだけ。
+        // Enter で +1、Shift+Enter で -1 して循環（index が常に現在位置を指す）
         if (e.shiftKey) {
           searchHitIndex = (searchHitIndex - 1 + hits.length) % hits.length;
         } else {
@@ -865,8 +833,8 @@
       }
     }
     if (e.key === 'Escape') {
-      // ① 修正: document の keydown ハンドラも Escape を捕捉するため
-      //   stopPropagation で伝播を止めて resetAll の二重呼び出しを防ぐ。
+      // stopPropagation で document の keydown ハンドラへの伝播を止めて
+      // resetAll の二重呼び出しを防ぐ
       e.stopPropagation();
       resetAll();
     }
@@ -882,20 +850,17 @@
   //   synchronous に内部イベントを再発火したとき途中で崩れるため、
   //   resetAll 内部で完結させることで再入性の問題を回避する。
   function resetAll(preserveSearch) {
-    // PERF-07 修正（再修正）: ノードクリック時は接続エッジ「も」非接続エッジ「も」
-    // 両方のスタイルが変更される（接続→ハイライト、非接続→薄灰色 opacity:0.3）。
-    // そのため選択があった場合は必ず全エッジをリセットする必要がある。
-    // 最適化として「一度もノードを選択していない状態の resetAll（Esc 連打など）」のみスキップする。
+    // ノードクリック時は接続・非接続エッジ両方のスタイルが変わるため、
+    // 選択があった場合は必ず全エッジをリセットする。
+    // 一度もノードを選択していない場合（Esc 連打など）はスキップして最適化する。
     var prevHadSelection = _hadSelection;
     currentNode          = null;
     connectedEdgesOfNode = new Set();
     _hadSelection        = false;
-    // High-1 修正: resetAll 後に同じノードを再クリックしても
-    // pendingSourceNodeId が残っていると requestSource が再送されず
-    // ソースパネルが空のまま固まる問題を修正。
+    // resetAll 後に同じノードを再クリックしても requestSource が再送されるよう
+    // pendingSourceNodeId をクリアする
     pendingSourceNodeId  = null;
     if (!preserveSearch) {
-      // 🟡 Bug 9 修正: matchSet / searchHitIndex も明示的にクリア
       matchSet       = new Set();
       searchHitIndex = -1;
     } else {
@@ -920,7 +885,7 @@
         }));
       }
     }
-    // PERF-07: 前回選択がなければエッジは変更されていないのでスキップ
+    // 前回選択がなければエッジは変更されていないのでスキップ（最適化）
     if (edges && prevHadSelection) {
       edges.update(edges.getIds().map(function (id) {
         return { id: id, color: { color: '#aaaaaa', opacity: 0.8 }, width: 1 };
@@ -951,10 +916,9 @@
       var name = item.file.replace(/\\/g, '/').split('/').pop();
       var row  = document.createElement('div');
       row.style.cssText = 'display:flex;align-items:center;gap:6px;margin-bottom:3px;font-size:11px;cursor:default;';
-      row.title = escapeAttr(item.file); // BUG-05 修正: title 属性をエスケープ
+      row.title = escapeAttr(item.file);
       var dot  = document.createElement('span');
-      // SEC-1 修正: cssText への直接連結は CSS インジェクションの経路になるため、
-      // 個別プロパティ代入に変更する。値が不正な CSS であっても無視されるため安全。
+      // cssText への直接連結は CSS インジェクションの経路になるため個別プロパティ代入にする
       dot.style.width        = '10px';
       dot.style.height       = '10px';
       dot.style.borderRadius = '50%';
@@ -962,8 +926,6 @@
       dot.style.background   = item.color;
       dot.style.border       = '1.5px solid ' + item.border;
       var label = document.createElement('span');
-      // SEC-REMAIN-1 修正: dot と同様に cssText 直接代入を個別プロパティ代入に変更。
-      // 値はリテラルのみなので実害はないが、将来的な動的値混入を気づかれにくくしないため統一する。
       label.style.color        = '#2d3436';
       label.style.overflow     = 'hidden';
       label.style.textOverflow = 'ellipsis';
