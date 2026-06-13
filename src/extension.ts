@@ -32,9 +32,9 @@ import {
 } from './callGraphBuilder';
 import { cache } from './cacheManager';
 import { hasCppSourceExtension } from './utils';
-/** ⑩ callmap.warnThreshold 設定値を読み取る。設定変更時も都度参照するため関数化する。 */
+/** ⑩ callatlas.warnThreshold 設定値を読み取る。設定変更時も都度参照するため関数化する。 */
 function getWarnThreshold(): number {
-  return vscode.workspace.getConfiguration('callmap').get<number>('warnThreshold', 30);
+  return vscode.workspace.getConfiguration('callatlas').get<number>('warnThreshold', 30);
 }
 
 type OutputMode = 'webview' | 'html';
@@ -126,10 +126,10 @@ async function findFilesInFolderCached(
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function pickBackend(): Promise<Backend | undefined> {
-  // ⑩ callmap.defaultBackend 設定値を反映する
+  // ⑩ callatlas.defaultBackend 設定値を反映する
   // 'lsp' または 'gtags' に設定されている場合は QuickPick をスキップして即返す。
   // defaultOutputMode と同じ設計。'ask'（デフォルト）なら毎回選択を促す。
-  const defaultBackend = vscode.workspace.getConfiguration('callmap').get<string>('defaultBackend', 'ask');
+  const defaultBackend = vscode.workspace.getConfiguration('callatlas').get<string>('defaultBackend', 'ask');
   if (defaultBackend === 'lsp')   return 'lsp';
   if (defaultBackend === 'gtags') return 'gtags';
   const items = [
@@ -147,12 +147,12 @@ async function pickBackend(): Promise<Backend | undefined> {
   // 🟠 Bug 2 修正: vscode.window.showQuickPick の QuickPickOptions に activeItems は存在しないため
   //   型キャストで誤魔化しても実行時には完全に無視されていた。
   //   createQuickPick() に切り替えることで qp.activeItems が正しく機能し、
-  //   callmap.defaultBackend 設定値が初期選択に反映される。
+  //   callatlas.defaultBackend 設定値が初期選択に反映される。
   type BackendItem = typeof items[number];
   const qp = vscode.window.createQuickPick<BackendItem>();
   qp.items       = items;
   qp.placeholder = 'Select analysis backend';
-  qp.title       = 'Call Map: Backend';
+  qp.title       = 'Call Atlas: Backend';
   qp.activeItems = items.filter(i => i.backend === defaultBackend);
   return new Promise(resolve => {
     // BUG-2 修正: onDidAccept → qp.hide() の順で呼ぶと onDidHide も必ず発火し
@@ -176,8 +176,8 @@ async function pickBackend(): Promise<Backend | undefined> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function pickOutputMode(): Promise<OutputMode | undefined> {
-  // ③ callmap.defaultOutputMode が 'webview' or 'html' なら QuickPick をスキップ
-  const defaultMode = vscode.workspace.getConfiguration('callmap').get<string>('defaultOutputMode', 'ask');
+  // ③ callatlas.defaultOutputMode が 'webview' or 'html' なら QuickPick をスキップ
+  const defaultMode = vscode.workspace.getConfiguration('callatlas').get<string>('defaultOutputMode', 'ask');
   if (defaultMode === 'webview') return 'webview';
   if (defaultMode === 'html')    return 'html';
 
@@ -186,7 +186,7 @@ async function pickOutputMode(): Promise<OutputMode | undefined> {
       { label: '$(callhierarchy-outgoing) Open in WebView',        mode: 'webview' as const },
       { label: '$(browser) Save as HTML and open in browser', mode: 'html'    as const },
     ],
-    { placeHolder: 'Select output mode', title: 'Call Map: Output mode' }
+    { placeHolder: 'Select output mode', title: 'Call Atlas: Output mode' }
   );
   return picked?.mode;
 }
@@ -245,7 +245,7 @@ async function buildAndOutput(
   await vscode.window.withProgress(
     {
       location:    vscode.ProgressLocation.Notification,
-      title:       'Building Call Map',
+      title:       'Building Call Atlas',
       // ★ ④: キャンセル可能にする
       cancellable: true,
     },
@@ -256,12 +256,12 @@ async function buildAndOutput(
         // キャンセル済みの場合はパネルを更新しない
         if (token.isCancellationRequested) return;
 
-        if (data.errors.length > 0) console.warn('[CallMap] Analysis warnings:', data.errors);
+        if (data.errors.length > 0) console.warn('[CallAtlas] Analysis warnings:', data.errors);
 
         if (mode === 'webview') {
           panel!.updateGraph(data);
           vscode.window.setStatusBarMessage(
-            `📞 Call Map: ${data.nodes.length} nodes / ${data.edges.length} edges (${data.buildTimeMs}ms)`,
+            `📞 Call Atlas: ${data.nodes.length} nodes / ${data.edges.length} edges (${data.buildTimeMs}ms)`,
             6000
           );
         } else {
@@ -273,7 +273,7 @@ async function buildAndOutput(
 
         const msg = err instanceof Error ? err.message : String(err);
         if (panel) panel.showError(msg);
-        else vscode.window.showErrorMessage('Call Map error:\n' + msg);
+        else vscode.window.showErrorMessage('Call Atlas error:\n' + msg);
       }
     }
   );
@@ -350,12 +350,12 @@ export function activate(context: vscode.ExtensionContext): void {
       // ★ Fix 2: showFolderGraph と同じ extensions Set ベースの QuickPick に統一
       //   glob ベースの vscode.workspace.findFiles → findFilesInFolder (fs.readDirectory) に変更。
       //   動作の一貫性を保ちつつ、RelativePattern の互換問題も回避する。
-      const extPick = await pickExtensions('Call Map: Workspace analysis'); // ⑦ 共通化
+      const extPick = await pickExtensions('Call Atlas: Workspace analysis'); // ⑦ 共通化
       if (!extPick) return;
 
       const workspaceFolders = vscode.workspace.workspaceFolders;
       if (!workspaceFolders?.length) {
-        vscode.window.showErrorMessage('Call Map: No workspace folder is open.');
+        vscode.window.showErrorMessage('Call Atlas: No workspace folder is open.');
         return;
       }
 
@@ -371,7 +371,7 @@ export function activate(context: vscode.ExtensionContext): void {
       );
       if (!foundUris.length) {
         vscode.window.showErrorMessage(
-          'Call Map: No target files found.\nExtension: ' + extPick.description);
+          'Call Atlas: No target files found.\nExtension: ' + extPick.description);
         return;
       }
 
@@ -432,14 +432,14 @@ export function activate(context: vscode.ExtensionContext): void {
           canSelectFiles:   false,
           canSelectMany:    false,
           openLabel:        'Analyze this folder',
-          title:            'Call Map: Select folder to analyze',
+          title:            'Call Atlas: Select folder to analyze',
           defaultUri,
         });
         if (!result?.length) return;
         folderUri = result[0];
       }
 
-      const extPick = await pickExtensions('Call Map: Folder analysis'); // ⑦ 共通化
+      const extPick = await pickExtensions('Call Atlas: Folder analysis'); // ⑦ 共通化
       if (!extPick) return;
       if (!folderUri) return; // 型ガード (到達しないが TypeScript の安全のため)
 
@@ -452,7 +452,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
       if (!foundUris.length) {
         vscode.window.showErrorMessage(
-          `Call Map: No target files found.\nFolder: ${folderUri.fsPath}\nExtension: ${extPick.description}`);
+          `Call Atlas: No target files found.\nFolder: ${folderUri.fsPath}\nExtension: ${extPick.description}`);
         return;
       }
 
@@ -484,7 +484,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('callgraph.showFileGraph', async () => {
       const editor = vscode.window.activeTextEditor;
       if (!editor) {
-        vscode.window.showErrorMessage('Call Map: Please open a C/C++ file first.');
+        vscode.window.showErrorMessage('Call Atlas: Please open a C/C++ file first.');
         return;
       }
       const backend = await pickBackend();
@@ -505,7 +505,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('callgraph.showFunctionGraph', async () => {
       const editor = vscode.window.activeTextEditor;
       if (!editor) {
-        vscode.window.showErrorMessage('Call Map: Please open a C/C++ file first.');
+        vscode.window.showErrorMessage('Call Atlas: Please open a C/C++ file first.');
         return;
       }
       const backend = await pickBackend();
@@ -517,10 +517,10 @@ export function activate(context: vscode.ExtensionContext): void {
       await warmupDone;
 
       await buildAndOutput(mode, editor.document.fileName, context.extensionUri,
-        // ⑩ callmap.maxHops 設定値を参照する（デフォルト 4）。
+        // ⑩ callatlas.maxHops 設定値を参照する（デフォルト 4）。
         //   旧実装は Number.MAX_SAFE_INTEGER をハードコードしており設定が無視されていた。
         (prog, tok) => {
-          const maxHops = vscode.workspace.getConfiguration('callmap').get<number>('maxHops', 4);
+          const maxHops = vscode.workspace.getConfiguration('callatlas').get<number>('maxHops', 4);
           return buildFunctionCallGraph(editor.document, editor.selection.active, maxHops, backend, prog, tok);
         });
     })
@@ -534,7 +534,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('callgraph.showPathGraph', async () => {
       const editor = vscode.window.activeTextEditor;
       if (!editor) {
-        vscode.window.showErrorMessage('Call Map: Please open a C/C++ file first.');
+        vscode.window.showErrorMessage('Call Atlas: Please open a C/C++ file first.');
         return;
       }
       const backend = await pickBackend();
@@ -545,8 +545,8 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!mode) { await warmupDone; return; }
       await warmupDone;
 
-      // ⑩ callmap.maxHops 設定値を参照する（デフォルト 4）
-      const maxHops = vscode.workspace.getConfiguration('callmap').get<number>('maxHops', 4);
+      // ⑩ callatlas.maxHops 設定値を参照する（デフォルト 4）
+      const maxHops = vscode.workspace.getConfiguration('callatlas').get<number>('maxHops', 4);
       await buildAndOutput(mode, editor.document.fileName, context.extensionUri,
         (prog, tok) => buildPathThroughCallGraph(
           editor.document, editor.selection.active, maxHops, backend, prog, tok));

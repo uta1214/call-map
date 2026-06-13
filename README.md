@@ -1,13 +1,13 @@
-# Call Map
+# Call Atlas
 
-**Call Map** is a VS Code extension that visualizes interactive call graphs of C/C++ projects.  
+**Call Atlas** is a VS Code extension that visualizes interactive call graphs of C/C++ projects.  
 It supports two analysis backends: **LSP** (using the Call Hierarchy API) for high accuracy, and **gtags** (using GNU GLOBAL) for speed.
 
 ---
 
 ## Key Features
 
-![Call Map demo](images/demo.gif)
+![Call Atlas demo](images/demo.gif)
 
 ### Call Graph Analysis
 - **File Graph**: Analyze all functions in the current file and display their call relationships
@@ -33,7 +33,7 @@ It supports two analysis backends: **LSP** (using the Call Hierarchy API) for hi
 ## Installation
 
 ### Visual Studio Code Marketplace
-https://marketplace.visualstudio.com/items?itemName=uta-orange-1214.call-map
+https://marketplace.visualstudio.com/items?itemName=uta-orange-1214.call-atlas
 
 ### Manual Installation
 1. Clone or download this repository
@@ -54,11 +54,11 @@ https://marketplace.visualstudio.com/items?itemName=uta-orange-1214.call-map
 ### Commands
 | Command | Description |
 |---------|-------------|
-| `Call Map: Analyze Workspace` | Cross-file analysis across the workspace |
-| `Call Map: Analyze Folder` | Analyze all C/C++ files in a selected folder |
-| `Call Map: Show File Call Graph` | Analyze all functions in the current file |
-| `Call Map: Show Function Graph (BFS)` | Expand from the function at the cursor position |
-| `Call Map: Show Path-Through Graph` | Bidirectional graph centered on the cursor function (LSP and gtags) |
+| `Call Atlas: Analyze Workspace` | Cross-file analysis across the workspace |
+| `Call Atlas: Analyze Folder` | Analyze all C/C++ files in a selected folder |
+| `Call Atlas: Show File Call Graph` | Analyze all functions in the current file |
+| `Call Atlas: Show Function Graph (BFS)` | Expand from the function at the cursor position |
+| `Call Atlas: Show Path-Through Graph` | Bidirectional graph centered on the cursor function (LSP and gtags) |
 
 ### Keybindings
 | Feature | Key |
@@ -90,23 +90,23 @@ https://marketplace.visualstudio.com/items?itemName=uta-orange-1214.call-map
 ### Main Settings
 
 #### Analysis Settings
-- `callmap.defaultBackend`: Default backend for call graph analysis
+- `callatlas.defaultBackend`: Default backend for call graph analysis
   - `lsp`: Use LSP (clangd / C/C++ extension) — high accuracy
   - `gtags`: Use GNU GLOBAL (gtags) — fast, no LSP required
   - Default: `ask`
-- `callmap.maxHops`: Maximum number of BFS hops for Function Graph
+- `callatlas.maxHops`: Maximum number of BFS hops for Function Graph
   - Default: `4`
 
 #### Output Settings
-- `callmap.defaultOutputMode`: Default output mode
+- `callatlas.defaultOutputMode`: Default output mode
   - `webview`: Always open in WebView without asking
   - `html`: Always save as HTML without asking
   - Default: `ask`
 
 #### Display Settings
-- `callmap.warnThreshold`: Warn when the number of files to analyze exceeds this value
+- `callatlas.warnThreshold`: Warn when the number of files to analyze exceeds this value
   - Default: `30`
-- `callmap.initialControlPanel`: Initial visibility of the control panel when the graph opens
+- `callatlas.initialControlPanel`: Initial visibility of the control panel when the graph opens
   - `expanded`: Show the control panel (default)
   - `collapsed`: Hide the control panel to maximize the graph area
 
@@ -169,22 +169,22 @@ uta
 
 ## Repository
 
-https://github.com/uta1214/call-map
+https://github.com/uta1214/call-atlas
 
 ---
 
 # 日本語版 (Japanese)
 
-# Call Map
+# Call Atlas
 
-**Call Map** は C/C++ プロジェクト向けのインタラクティブコールグラフ VSCode 拡張機能です。  
+**Call Atlas** は C/C++ プロジェクト向けのインタラクティブコールグラフ VSCode 拡張機能です。  
 **LSP**（Call Hierarchy API 使用）による高精度解析と、**gtags**（GNU GLOBAL 使用）による高速解析の2バックエンドに対応しています。
 
 ---
 
 ## 主な機能
 
-![Call Map demo](images/demo.gif)
+![Call Atlas demo](images/demo.gif)
 
 ### コールグラフ解析
 - **ファイルグラフ**: 現在のファイル内の全関数を解析し、コール関係を可視化
@@ -210,7 +210,7 @@ https://github.com/uta1214/call-map
 ## インストール方法
 
 ### Visual Studio Code Marketplace
-https://marketplace.visualstudio.com/items?itemName=uta-orange-1214.call-map
+https://marketplace.visualstudio.com/items?itemName=uta-orange-1214.call-atlas
 
 ### 手動インストール
 1. このリポジトリをクローンまたはダウンロード
@@ -231,11 +231,11 @@ https://marketplace.visualstudio.com/items?itemName=uta-orange-1214.call-map
 ### コマンド一覧
 | コマンド | 説明 |
 |---------|------|
-| `Call Map: Analyze Workspace` | ワークスペース全体を横断解析 |
-| `Call Map: Analyze Folder` | 選択フォルダ内の全 C/C++ ファイルを解析 |
-| `Call Map: Show File Call Graph` | ファイル内の全関数を解析 |
-| `Call Map: Show Function Graph (BFS)` | カーソル位置の関数から BFS で展開 |
-| `Call Map: Show Path-Through Graph` | カーソル位置の関数を中心に双方向グラフを表示（LSP・gtags 両対応） |
+| `Call Atlas: Analyze Workspace` | ワークスペース全体を横断解析 |
+| `Call Atlas: Analyze Folder` | 選択フォルダ内の全 C/C++ ファイルを解析 |
+| `Call Atlas: Show File Call Graph` | ファイル内の全関数を解析 |
+| `Call Atlas: Show Function Graph (BFS)` | カーソル位置の関数から BFS で展開 |
+| `Call Atlas: Show Path-Through Graph` | カーソル位置の関数を中心に双方向グラフを表示（LSP・gtags 両対応） |
 
 ### キーバインド
 | 機能 | キー |
@@ -267,23 +267,23 @@ https://marketplace.visualstudio.com/items?itemName=uta-orange-1214.call-map
 ### 主な設定項目
 
 #### 解析設定
-- `callmap.defaultBackend`: コールグラフ解析のデフォルトバックエンド
+- `callatlas.defaultBackend`: コールグラフ解析のデフォルトバックエンド
   - `lsp`：LSP（clangd / C/C++ 拡張）を使用 — 高精度
   - `gtags`：GNU GLOBAL（gtags）を使用 — 高速、LSP 不要
   - デフォルト: `ask`
-- `callmap.maxHops`: Function Graph の BFS 最大ホップ数
+- `callatlas.maxHops`: Function Graph の BFS 最大ホップ数
   - デフォルト: `4`
 
 #### 出力設定
-- `callmap.defaultOutputMode`: デフォルト出力モード
+- `callatlas.defaultOutputMode`: デフォルト出力モード
   - `webview`：毎回確認せず常に WebView で開く
   - `html`：毎回確認せず常に HTML として保存する
   - デフォルト: `ask`
 
 #### 表示設定
-- `callmap.warnThreshold`: 解析対象ファイル数がこの値を超えると警告を表示する
+- `callatlas.warnThreshold`: 解析対象ファイル数がこの値を超えると警告を表示する
   - デフォルト: `30`
-- `callmap.initialControlPanel`: グラフ表示時のコントロールパネルの初期表示状態
+- `callatlas.initialControlPanel`: グラフ表示時のコントロールパネルの初期表示状態
   - `expanded`：コントロールパネルを表示する（デフォルト）
   - `collapsed`：コントロールパネルを非表示にしてグラフ表示領域を最大化する
 
@@ -347,4 +347,4 @@ uta
 
 ## リポジトリ
 
-https://github.com/uta1214/call-map
+https://github.com/uta1214/call-atlas

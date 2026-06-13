@@ -293,7 +293,7 @@
 
     resetAll();
 
-    // 設定値 callmap.initialControlPanel に従って初期パネル状態を適用する。
+    // 設定値 callatlas.initialControlPanel に従って初期パネル状態を適用する。
     // グラフ表示のたびに設定値を参照するため、再描画時も反映される。
     if (typeof msg.controlPanelCollapsed === 'boolean') {
       setControlsCollapsed(msg.controlPanelCollapsed);

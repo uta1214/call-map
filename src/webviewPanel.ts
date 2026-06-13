@@ -140,9 +140,9 @@ function buildGraphMsg(data: GraphData): object {
     })),
     edges: data.edges, fileLegend,
     buildTimeMs: data.buildTimeMs, errors: data.errors,
-    // callmap.initialControlPanel 設定値をメッセージに含める。
+    // callatlas.initialControlPanel 設定値をメッセージに含める。
     // webview.js の renderGraph で setControlsCollapsed() に渡して初期状態を適用する。
-    controlPanelCollapsed: vscode.workspace.getConfiguration('callmap')
+    controlPanelCollapsed: vscode.workspace.getConfiguration('callatlas')
       .get<string>('initialControlPanel', 'expanded') === 'collapsed',
   };
 }
@@ -278,7 +278,7 @@ export class CallGraphPanel {
     const column = vscode.window.activeTextEditor ? vscode.ViewColumn.Beside : vscode.ViewColumn.One;
     if (CallGraphPanel.currentPanel) { CallGraphPanel.currentPanel._panel.reveal(column); return CallGraphPanel.currentPanel; }
     const panel = vscode.window.createWebviewPanel(
-      'callGraphViewer', 'Call Map', column,
+      'callGraphViewer', 'Call Atlas', column,
       { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [extensionUri] }
     );
     CallGraphPanel.currentPanel = new CallGraphPanel(panel, extensionUri);
@@ -286,13 +286,13 @@ export class CallGraphPanel {
   }
 
   public setLoading(fileName: string): void {
-    this._panel.title = 'Call Map — Analyzing...';
+    this._panel.title = 'Call Atlas — Analyzing...';
     this._postOrQueue({ type: 'loading', fileName });
   }
 
   public updateGraph(data: GraphData): void {
     this._lastGraphData = data;
-    this._panel.title   = `Call Map — ${data.fileName}`;
+    this._panel.title   = `Call Atlas — ${data.fileName}`;
     this._allowedFiles = new Set(
       data.nodes.map(n => resolveAndNormalize(n.file)).filter((p): p is string => p !== null)
     );
@@ -300,7 +300,7 @@ export class CallGraphPanel {
   }
 
   public showError(message: string): void {
-    this._panel.title = 'Call Map — Error';
+    this._panel.title = 'Call Atlas — Error';
     this._postOrQueue({ type: 'error', message });
   }
 
@@ -351,7 +351,7 @@ export class CallGraphPanel {
     const wsRoots = (vscode.workspace.workspaceFolders ?? []).map(f => f.uri.fsPath);
     if (!isPathInWorkspace(filePath, wsRoots, this._allowedFiles)) {
       vscode.window.showErrorMessage(
-        `Call Map: Cannot open file outside workspace:\n${filePath}`);
+        `Call Atlas: Cannot open file outside workspace:\n${filePath}`);
       return;
     }
     // TOCTOU 対策: 検証済みの実パスで URI を生成する
@@ -365,7 +365,7 @@ export class CallGraphPanel {
     // 解決後のパスで再チェック（シンボリックリンクが変更された場合の二重確認）
     if (!isPathInWorkspace(resolvedPath, wsRoots, this._allowedFiles)) {
       vscode.window.showErrorMessage(
-        `Call Map: Cannot open file outside workspace:\n${resolvedPath}`);
+        `Call Atlas: Cannot open file outside workspace:\n${resolvedPath}`);
       return;
     }
     try {
@@ -486,7 +486,7 @@ div.vis-network div.vis-navigation div.vis-button.vis-zoomOut     { left: 122px 
 
 <div id="controls">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-    <b style="font-size:13px;">📞 Call Map</b>
+    <b style="font-size:13px;">📞 Call Atlas</b>
     <button id="controls-toggle" title="Collapse panel">▼</button>
   </div>
   <div id="controls-body">

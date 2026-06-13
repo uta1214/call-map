@@ -1,12 +1,12 @@
 {
-  "name": "call-map",
-  "displayName": "Call Map",
+  "name": "call-atlas",
+  "displayName": "Call Atlas",
   "publisher": "uta-orange-1214",
   "description": "Interactive C/C++ call graph viewer using LSP Call Hierarchy or GNU GLOBAL (gtags). / LSP または GNU GLOBAL (gtags) を使った C/C++ インタラクティブコールグラフビューア。",
   "version": "0.0.1",
   "repository": {
     "type": "git",
-    "url": "https://github.com/uta1214/call-map"
+    "url": "https://github.com/uta1214/call-atlas"
   },
   "icon": "icon.png",
   "keywords": [
@@ -52,27 +52,27 @@
     "commands": [
       {
         "command": "callgraph.showWorkspaceGraph",
-        "title": "Call Map: Analyze Workspace",
+        "title": "Call Atlas: Analyze Workspace",
         "icon": "$(search)"
       },
       {
         "command": "callgraph.showFolderGraph",
-        "title": "Call Map: Analyze Folder",
+        "title": "Call Atlas: Analyze Folder",
         "icon": "$(folder-opened)"
       },
       {
         "command": "callgraph.showFileGraph",
-        "title": "Call Map: Show File Call Graph",
+        "title": "Call Atlas: Show File Call Graph",
         "icon": "$(type-hierarchy)"
       },
       {
         "command": "callgraph.showFunctionGraph",
-        "title": "Call Map: Show Function Graph (BFS)",
+        "title": "Call Atlas: Show Function Graph (BFS)",
         "icon": "$(type-hierarchy-sub)"
       },
       {
         "command": "callgraph.showPathGraph",
-        "title": "Call Map: Show Path-Through Graph",
+        "title": "Call Atlas: Show Path-Through Graph",
         "icon": "$(git-merge)"
       }
     ],
@@ -158,9 +158,9 @@
     },
     "configuration": {
       "type": "object",
-      "title": "Call Map Settings",
+      "title": "Call Atlas Settings",
       "properties": {
-        "callmap.defaultOutputMode": {
+        "callatlas.defaultOutputMode": {
           "type": "string",
           "enum": [
             "ask",
@@ -175,7 +175,7 @@
           ],
           "description": "Default output mode. Set to 'webview' or 'html' to skip the QuickPick prompt. / デフォルト出力モード。'webview' または 'html' に設定すると選択ダイアログをスキップします。"
         },
-        "callmap.defaultBackend": {
+        "callatlas.defaultBackend": {
           "type": "string",
           "enum": [
             "ask",
@@ -190,17 +190,17 @@
           ],
           "description": "Default backend for call graph analysis. Set to 'lsp' or 'gtags' to skip the selection prompt. / コールグラフ解析のデフォルトバックエンド。'lsp' または 'gtags' に設定すると選択ダイアログをスキップします。"
         },
-        "callmap.maxHops": {
+        "callatlas.maxHops": {
           "type": "number",
           "default": 4,
           "description": "Maximum number of BFS hops for Function Graph. / Function Graph の BFS 最大ホップ数。"
         },
-        "callmap.warnThreshold": {
+        "callatlas.warnThreshold": {
           "type": "number",
           "default": 30,
           "description": "Warn when the number of files to analyze exceeds this threshold. / 解析対象ファイル数がこの閾値を超えたときに警告を表示する。"
         },
-        "callmap.initialControlPanel": {
+        "callatlas.initialControlPanel": {
           "type": "string",
           "enum": [
             "expanded",
